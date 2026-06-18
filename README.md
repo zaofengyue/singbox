@@ -77,12 +77,6 @@ bash <(wget -qO- https://raw.githubusercontent.com/zaofengyue/singbox/main/insta
 | `REALITY_DOMAIN` | Reality 伪装域名 | 默认 `www.iij.ad.jp` |
 | `SS_PORT` | Shadowsocks 2022 端口 | TCP |
 
-## 节点查看
-
-部署成功后节点链接会输出到日志，同时写入 `sub.txt` 文件：
-
-- **方式一/二（Docker / 直接运行）**：`$HOME/singbox/sub.txt`
-- **方式三（一键脚本）**：`~/singbox/sub.txt`，或直接运行 `sb-sub`
 
 ## 注意事项
 
