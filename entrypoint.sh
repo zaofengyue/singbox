@@ -27,7 +27,8 @@ UUID_FILE="$HOME_DIR/uuid.txt"
 CONFIG_FILE="$HOME_DIR/sb-config.json"
 REALITY_KEY_FILE="$HOME_DIR/reality-keys.txt"
 CERT_DIR="$HOME_DIR/certs"
-SUB_FILE="$(pwd)/sub.txt"
+SUB_FILE="${HOME:-/tmp}/singbox/sub.txt"
+mkdir -p "$(dirname "$SUB_FILE")"
 
 # 二进制优先落在 /tmp，避免 $HOME noexec 问题
 BIN_DIR="/tmp/sb-bin"
