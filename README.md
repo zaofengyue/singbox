@@ -56,7 +56,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/zaofengyue/singbox/main/insta
 |--------|------|--------|
 | `UUID` | 节点唯一 ID | 自动生成 |
 | `PORT` | 对外监听端口 | 3000 |
-| `NAME` | 节点名称前缀 | 自动识别（国家-运营商）|
+| `NAME` | 节点名称前缀 | 自动识别|
 
 ### Argo 隧道
 
