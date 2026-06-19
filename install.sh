@@ -21,8 +21,8 @@ mkdir -p "$APP_DIR" && cd "$APP_DIR"
 
 BASE_URL="https://raw.githubusercontent.com/zaofengyue/singbox/main"
 echo -e "${GREEN}正在拉取源码...${NC}"
-$DL "$BASE_URL/entrypoint.sh" $DL_O entrypoint.sh
-chmod +x entrypoint.sh
+$DL "$BASE_URL/singbox.sh" $DL_O singbox.sh
+chmod +x singbox.sh
 echo -e "${GREEN}文件拉取完成${NC}"
 
 # ── 环境变量收集 ──────────────────────────────────────────────────────────────
@@ -111,7 +111,7 @@ check_status() {
 
 restart_service() {
   echo -e "${YELLOW}正在重启服务...${RESET}"
-  pkill -f "singbox/entrypoint.sh" 2>/dev/null || true
+  pkill -f "singbox/singbox.sh" 2>/dev/null || true
   pkill -f "sing-box"              2>/dev/null || true
   pkill -f "cloudflared"           2>/dev/null || true
   sleep 1
@@ -522,7 +522,7 @@ systemctl --user stop    singbox 2>/dev/null || true
 systemctl --user disable singbox 2>/dev/null || true
 rm -f "\$HOME/.config/systemd/user/singbox.service"
 systemctl --user daemon-reload 2>/dev/null || true
-pkill -f "singbox/entrypoint.sh" 2>/dev/null || true
+pkill -f "singbox/singbox.sh" 2>/dev/null || true
 pkill -f "sing-box"              2>/dev/null || true
 pkill -f "cloudflared"           2>/dev/null || true
 for RC in "\$HOME/.bashrc" "\$HOME/.profile" "\$HOME/.bash_profile" "\$HOME/.zshrc"; do
@@ -619,7 +619,7 @@ export REALITY_PORT="$NEW_REALITY_PORT"
 export REALITY_DOMAIN="$NEW_REALITY_DOMAIN"
 export SS_PORT="$NEW_SS_PORT"
 cd "$APP_DIR"
-nohup bash "$APP_DIR/entrypoint.sh" >> "$APP_DIR/run.log" 2>&1 &
+nohup bash "$APP_DIR/singbox.sh" >> "$APP_DIR/run.log" 2>&1 &
 echo \$! > "$APP_DIR/singbox.pid"
 WRAPEOF
 chmod +x "$WRAPPER"
@@ -641,7 +641,7 @@ if [ -f "$SVCFILE" ]; then
   systemctl --user restart singbox
   echo -e "${GREEN}配置已更新，systemd 服务已重启${NC}"
 else
-  pkill -f "singbox/entrypoint.sh" 2>/dev/null || true
+  pkill -f "singbox/singbox.sh" 2>/dev/null || true
   pkill -f "sing-box"              2>/dev/null || true
   pkill -f "cloudflared"           2>/dev/null || true
   sleep 1
@@ -678,7 +678,7 @@ export REALITY_PORT="$INPUT_REALITY_PORT"
 export REALITY_DOMAIN="$INPUT_REALITY_DOMAIN"
 export SS_PORT="$INPUT_SS_PORT"
 cd "$APP_DIR"
-nohup bash "$APP_DIR/entrypoint.sh" >> "$APP_DIR/run.log" 2>&1 &
+nohup bash "$APP_DIR/singbox.sh" >> "$APP_DIR/run.log" 2>&1 &
 echo \$! > "$APP_DIR/singbox.pid"
 WRAPEOF
 chmod +x "$WRAPPER"
@@ -711,7 +711,7 @@ Environment=TUIC_PORT=$INPUT_TUIC_PORT
 Environment=REALITY_PORT=$INPUT_REALITY_PORT
 Environment=REALITY_DOMAIN=$INPUT_REALITY_DOMAIN
 Environment=SS_PORT=$INPUT_SS_PORT
-ExecStart=/bin/bash $APP_DIR/entrypoint.sh
+ExecStart=/bin/bash $APP_DIR/singbox.sh
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -730,7 +730,7 @@ else
   bash "$WRAPPER"
   for RC in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.zshrc"; do
     if [ -f "$RC" ] && ! grep -q "# singbox autostart" "$RC" 2>/dev/null; then
-      printf '\n# singbox autostart\nif ! pgrep -f "singbox/entrypoint.sh" >/dev/null 2>&1; then\n  bash "%s" >/dev/null 2>&1\nfi\n' "$WRAPPER" >> "$RC"
+      printf '\n# singbox autostart\nif ! pgrep -f "singbox/singbox.sh" >/dev/null 2>&1; then\n  bash "%s" >/dev/null 2>&1\nfi\n' "$WRAPPER" >> "$RC"
     fi
   done
   echo ""
