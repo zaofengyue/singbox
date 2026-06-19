@@ -220,8 +220,23 @@ download_singbox() {
   SB_VER="${SB_VER:-v1.11.6}"
   SB_VER_NUM="${SB_VER#v}"
   log "下载 sing-box ${SB_VER} (${SB_ARCH})..."
-  dl "https://github.com/SagerNet/sing-box/releases/download/${SB_VER}/sing-box-${SB_VER_NUM}-linux-${SB_ARCH}.tar.gz" \
-     /tmp/sing-box.tar.gz
+
+  DOWNLOAD_URL="https://github.com/SagerNet/sing-box/releases/download/${SB_VER}/sing-box-${SB_VER_NUM}-linux-${SB_ARCH}.tar.gz"
+  log "下载地址: $DOWNLOAD_URL"
+  dl "$DOWNLOAD_URL" /tmp/sing-box.tar.gz
+
+  if [ ! -s /tmp/sing-box.tar.gz ]; then
+    die "sing-box 下载失败，文件为空：$DOWNLOAD_URL"
+  fi
+
+  log "文件大小: $(wc -c < /tmp/sing-box.tar.gz) bytes"
+
+  if ! tar -tzf /tmp/sing-box.tar.gz >/dev/null 2>&1; then
+    log "下载的文件内容（前200字符，用于排查）："
+    head -c 200 /tmp/sing-box.tar.gz
+    die "sing-box 压缩包损坏，可能下载失败或被拦截"
+  fi
+
   tar -xzf /tmp/sing-box.tar.gz -C "$SB_DIR" --strip-components=1
   chmod +x "$SB_BIN"
   rm -f /tmp/sing-box.tar.gz
