@@ -28,7 +28,7 @@ package.json
 index.html（可选）
 ```
 
-或直接下载 [Releases](https://github.com/zaofengyue/singbox/releases) 里的 `singbox.zip` 解压后上传。
+或直接下载 [Releases](https://github.com/zaofengyue/singbox/releases) 里的 `sbx.zip` 解压后上传。
 
 ### 方式三：一键脚本（含管理面板）
 
