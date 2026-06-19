@@ -20,11 +20,15 @@ docker run -d \
 
 ### 方式二：上传文件部署
 
-上传 `singbox.sh` 到平台，设置启动命令为：
+上传以下文件即可：
 
-```bash
-bash singbox.sh
 ```
+index.js
+package.json
+index.html（可选）
+```
+
+或直接下载 [Releases](https://github.com/zaofengyue/singbox/releases) 里的 `singbox.zip` 解压后上传。
 
 ### 方式三：一键脚本（含管理面板）
 
