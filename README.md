@@ -20,10 +20,10 @@ docker run -d \
 
 ### 方式二：上传文件部署
 
-上传 `singbox.sh` 到平台，设置启动命令为：
+上传 `entrypoint.sh` 到平台，设置启动命令为：
 
 ```bash
-bash singbox.sh
+bash entrypoint.sh
 ```
 
 ### 方式三：一键脚本（含管理面板）

@@ -21,8 +21,8 @@ mkdir -p "$APP_DIR" && cd "$APP_DIR"
 
 BASE_URL="https://raw.githubusercontent.com/zaofengyue/singbox/main"
 echo -e "${GREEN}正在拉取源码...${NC}"
-$DL "$BASE_URL/singbox.sh" $DL_O singbox.sh
-chmod +x singbox.sh
+$DL "$BASE_URL/entrypoint.sh" $DL_O entrypoint.sh
+chmod +x entrypoint.sh
 echo -e "${GREEN}文件拉取完成${NC}"
 
 # ── 环境变量收集 ──────────────────────────────────────────────────────────────
@@ -49,52 +49,22 @@ done
 
 if ! $HAS_ENV; then
   echo ""
-  echo -e "${YELLOW}========== 基础配置 ==========${NC}"
-
+  echo -e "${YELLOW}========== 基础配置（留空使用默认值）==========${NC}"
   read -p "UUID（留空自动生成）: "              INPUT_UUID
+  read -p "PORT（留空默认 3000）: "             INPUT_PORT
   read -p "NAME/节点名称前缀（留空自动识别）: " INPUT_NAME
-
   echo ""
-  echo -e "${YELLOW}--- Argo 隧道 ---${NC}"
-  read -p "是否启用 Argo 隧道？[Y/n]: " _ARGO_CHOICE
-  _ARGO_CHOICE="$(echo "$_ARGO_CHOICE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-  if [ "$_ARGO_CHOICE" = "n" ]; then
-    INPUT_DISABLE_ARGO="true"
-    echo -e "${YELLOW}Argo 已禁用${NC}"
-  else
-    INPUT_DISABLE_ARGO=""
-    echo -e "${GREEN}Argo 已启用（临时隧道），如需固定隧道可通过管理面板 sb 配置${NC}"
-  fi
-
+  echo -e "${YELLOW}--- Argo 隧道（留空使用临时隧道）---${NC}"
+  read -p "ARGO_DOMAIN/固定隧道域名: "  INPUT_ARGO_DOMAIN
+  read -p "ARGO_AUTH/固定隧道 Token: "  INPUT_ARGO_AUTH
+  read -p "DISABLE_ARGO/禁用 Argo（填 true 禁用，留空启用）: " INPUT_DISABLE_ARGO
   echo ""
-  echo -e "${YELLOW}--- 可选协议（留空跳过）---${NC}"
-  echo -e "  ${GREEN}a${NC}. Hysteria2    (UDP)"
-  echo -e "  ${GREEN}b${NC}. TUIC v5      (UDP)"
-  echo -e "  ${GREEN}c${NC}. VLESS Reality(TCP)"
-  echo -e "  ${GREEN}d${NC}. Shadowsocks  (TCP)"
-  read -p "选择协议（如 ac 表示启用 a 和 c，留空跳过）: " _PROTO_CHOICE
-
-  if echo "$_PROTO_CHOICE" | grep -qi "a"; then
-    read -p "HY2_PORT/Hysteria2 端口(UDP): " INPUT_HY2_PORT
-    INPUT_HY2_PORT="$(echo "$INPUT_HY2_PORT" | tr -d '[:space:]')"
-  fi
-
-  if echo "$_PROTO_CHOICE" | grep -qi "b"; then
-    read -p "TUIC_PORT/TUIC v5 端口(UDP): " INPUT_TUIC_PORT
-    INPUT_TUIC_PORT="$(echo "$INPUT_TUIC_PORT" | tr -d '[:space:]')"
-  fi
-
-  if echo "$_PROTO_CHOICE" | grep -qi "c"; then
-    read -p "REALITY_PORT/VLESS Reality 端口(TCP): " INPUT_REALITY_PORT
-    INPUT_REALITY_PORT="$(echo "$INPUT_REALITY_PORT" | tr -d '[:space:]')"
-    read -p "REALITY_DOMAIN/Reality 伪装域名（留空默认 www.iij.ad.jp）: " INPUT_REALITY_DOMAIN
-    INPUT_REALITY_DOMAIN="$(echo "$INPUT_REALITY_DOMAIN" | tr -d '[:space:]')"
-  fi
-
-  if echo "$_PROTO_CHOICE" | grep -qi "d"; then
-    read -p "SS_PORT/Shadowsocks 端口(TCP): " INPUT_SS_PORT
-    INPUT_SS_PORT="$(echo "$INPUT_SS_PORT" | tr -d '[:space:]')"
-  fi
+  echo -e "${YELLOW}--- 可选协议（留空不启用）---${NC}"
+  read -p "HY2_PORT/Hysteria2 端口(UDP): "          INPUT_HY2_PORT
+  read -p "TUIC_PORT/TUIC v5 端口(UDP): "           INPUT_TUIC_PORT
+  read -p "REALITY_PORT/VLESS Reality 端口(TCP): "  INPUT_REALITY_PORT
+  read -p "REALITY_DOMAIN/Reality 伪装域名（留空默认 www.iij.ad.jp）: " INPUT_REALITY_DOMAIN
+  read -p "SS_PORT/Shadowsocks 2022 端口(TCP): "    INPUT_SS_PORT
 fi
 
 # ── 快捷命令目录 ──────────────────────────────────────────────────────────────
@@ -141,7 +111,7 @@ check_status() {
 
 restart_service() {
   echo -e "${YELLOW}正在重启服务...${RESET}"
-  pkill -f "singbox/singbox.sh" 2>/dev/null || true
+  pkill -f "singbox/entrypoint.sh" 2>/dev/null || true
   pkill -f "sing-box"              2>/dev/null || true
   pkill -f "cloudflared"           2>/dev/null || true
   sleep 1
@@ -552,7 +522,7 @@ systemctl --user stop    singbox 2>/dev/null || true
 systemctl --user disable singbox 2>/dev/null || true
 rm -f "\$HOME/.config/systemd/user/singbox.service"
 systemctl --user daemon-reload 2>/dev/null || true
-pkill -f "singbox/singbox.sh" 2>/dev/null || true
+pkill -f "singbox/entrypoint.sh" 2>/dev/null || true
 pkill -f "sing-box"              2>/dev/null || true
 pkill -f "cloudflared"           2>/dev/null || true
 for RC in "\$HOME/.bashrc" "\$HOME/.profile" "\$HOME/.bash_profile" "\$HOME/.zshrc"; do
@@ -606,6 +576,7 @@ echo -e "${YELLOW}直接回车保留当前值，输入新值后回车修改${NC}
 echo ""
 echo -e "${YELLOW}--- 基础配置 ---${NC}"
 read -p "UUID         [${CUR_UUID:-自动生成}]: "          IN_UUID
+read -p "PORT         [${CUR_PORT:-3000}]: "              IN_PORT
 read -p "NAME         [${CUR_NAME:-自动识别}]: "          IN_NAME
 echo ""
 echo -e "${YELLOW}--- Argo 隧道 ---${NC}"
@@ -648,7 +619,7 @@ export REALITY_PORT="$NEW_REALITY_PORT"
 export REALITY_DOMAIN="$NEW_REALITY_DOMAIN"
 export SS_PORT="$NEW_SS_PORT"
 cd "$APP_DIR"
-nohup bash "$APP_DIR/singbox.sh" >> "$APP_DIR/run.log" 2>&1 &
+nohup bash "$APP_DIR/entrypoint.sh" >> "$APP_DIR/run.log" 2>&1 &
 echo \$! > "$APP_DIR/singbox.pid"
 WRAPEOF
 chmod +x "$WRAPPER"
@@ -670,7 +641,7 @@ if [ -f "$SVCFILE" ]; then
   systemctl --user restart singbox
   echo -e "${GREEN}配置已更新，systemd 服务已重启${NC}"
 else
-  pkill -f "singbox/singbox.sh" 2>/dev/null || true
+  pkill -f "singbox/entrypoint.sh" 2>/dev/null || true
   pkill -f "sing-box"              2>/dev/null || true
   pkill -f "cloudflared"           2>/dev/null || true
   sleep 1
@@ -707,7 +678,7 @@ export REALITY_PORT="$INPUT_REALITY_PORT"
 export REALITY_DOMAIN="$INPUT_REALITY_DOMAIN"
 export SS_PORT="$INPUT_SS_PORT"
 cd "$APP_DIR"
-nohup bash "$APP_DIR/singbox.sh" >> "$APP_DIR/run.log" 2>&1 &
+nohup bash "$APP_DIR/entrypoint.sh" >> "$APP_DIR/run.log" 2>&1 &
 echo \$! > "$APP_DIR/singbox.pid"
 WRAPEOF
 chmod +x "$WRAPPER"
@@ -740,7 +711,7 @@ Environment=TUIC_PORT=$INPUT_TUIC_PORT
 Environment=REALITY_PORT=$INPUT_REALITY_PORT
 Environment=REALITY_DOMAIN=$INPUT_REALITY_DOMAIN
 Environment=SS_PORT=$INPUT_SS_PORT
-ExecStart=/bin/bash $APP_DIR/singbox.sh
+ExecStart=/bin/bash $APP_DIR/entrypoint.sh
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -759,7 +730,7 @@ else
   bash "$WRAPPER"
   for RC in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.zshrc"; do
     if [ -f "$RC" ] && ! grep -q "# singbox autostart" "$RC" 2>/dev/null; then
-      printf '\n# singbox autostart\nif ! pgrep -f "singbox/singbox.sh" >/dev/null 2>&1; then\n  bash "%s" >/dev/null 2>&1\nfi\n' "$WRAPPER" >> "$RC"
+      printf '\n# singbox autostart\nif ! pgrep -f "singbox/entrypoint.sh" >/dev/null 2>&1; then\n  bash "%s" >/dev/null 2>&1\nfi\n' "$WRAPPER" >> "$RC"
     fi
   done
   echo ""
