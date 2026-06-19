@@ -238,9 +238,11 @@ download_singbox() {
   fi
 
   tar -xzf /tmp/sing-box.tar.gz -C "$SB_DIR" --strip-components=1
-  chmod +x "$SB_BIN"
-  rm -f /tmp/sing-box.tar.gz
-  log "sing-box 下载完成"
+log "解压后目录内容："
+ls -la "$SB_DIR"
+chmod +x "$SB_BIN" 2>/dev/null || warn "chmod 失败，$SB_BIN 可能不存在"
+rm -f /tmp/sing-box.tar.gz
+log "sing-box 下载完成"
 }
 
 # ── 下载 cloudflared ──────────────────────────────────────────────────────────
