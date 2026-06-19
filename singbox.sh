@@ -375,7 +375,7 @@ if [ "${DISABLE_ARGO:-}" != "true" ]; then
       \"tag\": \"vmess-in\",
       \"listen\": \"127.0.0.1\",
       \"listen_port\": ${ARGO_PORT},
-      \"users\": [{ \"uuid\": \"${UUID}\", \"alterId\": 0 }],
+      \"users\": [{ \"uuid\": \"${UUID}\" }],
       \"transport\": { \"type\": \"ws\", \"path\": \"${WS_PATH}\" }
     }"
   _sep=","
