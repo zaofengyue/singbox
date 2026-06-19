@@ -460,7 +460,7 @@ printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n 
   "$_inbounds" > "$CONFIG_FILE"
 
 # 校验配置
-if ! "$SB_BIN" check -c "$CONFIG_FILE" 2>/dev/null; then
+if ! "$SB_BIN" check -c "$CONFIG_FILE"; then
   warn "sing-box 配置校验失败，尝试输出配置内容以供排查："
   cat "$CONFIG_FILE"
   die "配置无效，终止启动"
