@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>node-sb 部署面板</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg-base:#0f1416;
+    --bg-panel:#161d20;
+    --bg-elevated:#1d2528;
+    --accent:#f2b35c;
+    --accent-2:#5fd3c4;
+    --text:#e9e5d6;
+    --text-muted:#7c8a8d;
+    --border:#2a3336;
+    --success:#8bc78a;
+    --danger:#e8836f;
+    --radius:10px;
+    --mono:'IBM Plex Mono','SF Mono',Consolas,monospace;
+    --sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  html{-webkit-font-smoothing:antialiased;}
+  body{background:var(--bg-base);color:var(--text);font-family:var(--sans);line-height:1.5;min-height:100vh;padding:40px 20px 90px;}
+  .wrap{max-width:1100px;margin:0 auto;}
+
+  .header{margin-bottom:36px;}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent-2);margin-bottom:12px;}
+  .header h1{font-family:var(--mono);font-size:clamp(26px,4vw,38px);font-weight:600;letter-spacing:-.01em;margin-bottom:14px;}
+  .header p{color:var(--text-muted);max-width:640px;font-size:14.5px;}
+
+  .layout{display:grid;grid-template-columns:1fr;gap:24px;}
+  @media (min-width:960px){
+    .layout{grid-template-columns:1.3fr 1fr;align-items:start;}
+    .preview-col{position:sticky;top:24px;}
+  }
+
+  .section{background:var(--bg-panel);border:1px solid var(--border);border-radius:var(--radius);padding:22px 22px 26px;margin-bottom:20px;}
+  .section-label{font-family:var(--mono);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin-bottom:6px;}
+  .section-label .tag{color:var(--accent);}
+  .section-label .tag-blue{color:var(--accent-2);}
+  .section h2{font-size:16px;font-weight:600;margin-bottom:16px;}
+
+  .field-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:16px;}
+  .field{display:flex;flex-direction:column;gap:6px;}
+  .field label{font-size:13px;font-weight:500;}
+  .field .desc{font-size:12px;color:var(--text-muted);font-family:var(--mono);}
+  .field-hint{font-size:11.5px;color:var(--text-muted);font-family:var(--mono);margin-top:1px;}
+  .field-input-row{display:flex;gap:8px;}
+  input[type=text],input[type=number]{
+    background:var(--bg-elevated);border:1px solid var(--border);border-radius:7px;
+    padding:10px 12px;color:var(--text);font-family:var(--mono);font-size:13px;width:100%;
+  }
+  input[type=number]::-webkit-inner-spin-button,
+  input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0;}
+  input[type=number]{-moz-appearance:textfield;}
+  input::placeholder{color:#52605f;}
+  input:focus{outline:2px solid var(--accent-2);outline-offset:1px;border-color:var(--accent-2);}
+  .btn-mini{
+    font-family:var(--sans);font-size:12px;padding:0 12px;border-radius:7px;
+    border:1px solid var(--border);background:var(--bg-elevated);color:var(--accent-2);
+    cursor:pointer;white-space:nowrap;
+  }
+  .btn-mini:hover{border-color:var(--accent-2);}
+
+  /* toggle */
+  .toggle-list{display:flex;flex-direction:column;gap:16px;}
+  .toggle-row{display:flex;align-items:center;justify-content:space-between;gap:16px;}
+  .toggle-row .name{font-size:14px;font-weight:500;}
+  .toggle-row .desc{font-size:12px;color:var(--text-muted);font-family:var(--mono);}
+  /* 修复开关：用 label 包裹，pointer-events 正确响应 */
+  .switch{position:relative;width:44px;height:24px;flex-shrink:0;cursor:pointer;}
+  .switch input{position:absolute;inset:0;width:100%;height:100%;opacity:0;margin:0;cursor:pointer;z-index:2;}
+  .switch .track{position:absolute;inset:0;background:var(--bg-elevated);border:1px solid var(--border);border-radius:999px;transition:background .15s,border-color .15s;z-index:1;}
+  .switch .thumb{position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:var(--text-muted);transition:transform .15s,background .15s;}
+  .switch input:checked ~ .track{background:rgba(95,211,196,.15);border-color:var(--accent-2);}
+  .switch input:checked ~ .track .thumb{transform:translateX(20px);background:var(--accent-2);}
+
+  .proto-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;}
+  .proto-card{
+    background:var(--bg-elevated);border:1px solid var(--border);border-radius:8px;
+    padding:14px 16px;display:flex;flex-direction:column;gap:10px;
+    transition:border-color .15s;
+  }
+  .proto-card.active{border-color:var(--accent-2);}
+  .proto-card-header{display:flex;align-items:center;justify-content:space-between;}
+  .proto-name{font-size:13px;font-weight:600;}
+  .proto-var{font-family:var(--mono);font-size:11px;color:var(--text-muted);}
+
+  .terminal{background:#0a0e10;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;}
+  .terminal-bar{display:flex;align-items:center;gap:8px;padding:10px 14px;background:var(--bg-panel);border-bottom:1px solid var(--border);}
+  .dot{width:10px;height:10px;border-radius:50%;}
+  .dot-red{background:var(--danger);}
+  .dot-yellow{background:var(--accent);}
+  .dot-green{background:var(--success);}
+  .terminal-title{margin-left:6px;font-family:var(--mono);font-size:12px;color:var(--text-muted);}
+  .terminal-body{padding:20px 18px;font-family:var(--mono);font-size:13px;line-height:1.7;min-height:120px;white-space:pre-wrap;word-break:break-all;}
+  .prompt{color:var(--accent-2);margin-right:8px;}
+  #command-output .var{color:var(--accent);}
+  .cursor{display:inline-block;color:var(--accent-2);animation:blink 1s step-end infinite;}
+  @media (prefers-reduced-motion:reduce){.cursor{animation:none;}}
+  @keyframes blink{50%{opacity:0;}}
+  .terminal-actions{display:flex;align-items:center;gap:10px;padding:14px 18px;border-top:1px solid var(--border);flex-wrap:wrap;}
+  .segmented{display:inline-flex;border:1px solid var(--border);border-radius:7px;overflow:hidden;}
+  .seg-btn{font-family:var(--mono);font-size:12px;padding:7px 14px;background:var(--bg-elevated);color:var(--text-muted);border:none;cursor:pointer;}
+  .seg-btn.active{background:var(--accent);color:#1a1303;font-weight:600;}
+  .btn{font-family:var(--sans);font-size:13px;font-weight:600;padding:9px 16px;border-radius:7px;border:1px solid transparent;cursor:pointer;}
+  .btn-accent{background:var(--accent);color:#1a1303;}
+  .btn-accent:hover{filter:brightness(1.08);}
+  .btn-accent.copied{background:var(--success);}
+  .btn-ghost{background:transparent;border-color:var(--border);color:var(--text-muted);}
+  .btn-ghost:hover{color:var(--text);border-color:var(--text-muted);}
+  .terminal-note{padding:0 18px 16px;font-size:12px;color:var(--text-muted);}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="header">
+    <div class="eyebrow">One-line Install · 配置生成器</div>
+    <h1>node-sb 部署面板</h1>
+    <p>调整下方选项，右侧命令实时更新；复制后粘贴到服务器终端回车即可。所有字段留空则使用脚本内置默认值。</p>
+  </div>
+
+  <div class="layout">
+    <div class="form-col">
+
+      <div class="section">
+        <div class="section-label"><span class="tag">基础</span> · 核心配置</div>
+        <h2>全局参数</h2>
+        <div class="field-row">
+          <div class="field">
+            <label for="field-uuid">UUID</label>
+            <div class="field-input-row">
+              <input type="text" id="field-uuid" placeholder="自动生成并持久化">
+              <button type="button" class="btn-mini" id="gen-uuid">随机</button>
+            </div>
+            <span class="desc">UUID</span>
+          </div>
+          <div class="field">
+            <label for="field-port">主端口</label>
+            <div class="field-input-row">
+              <input type="number" id="field-port" placeholder="自动分配">
+              <button type="button" class="btn-mini" id="gen-port">生成</button>
+            </div>
+            <span class="desc">PORT</span>
+          </div>
+          <div class="field">
+            <label for="field-name">节点名称</label>
+            <input type="text" id="field-name" placeholder="自动识别">
+            <span class="desc">NAME</span>
+          </div>
+          <div class="field">
+            <label for="field-sub">订阅路径</label>
+            <input type="text" id="field-sub" placeholder="默认 sub（即 /sub）">
+            <span class="desc">SUB</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-label"><span class="tag-blue">Argo</span> · 隧道配置</div>
+        <h2>Argo 隧道参数</h2>
+        <div class="field-row">
+          <div class="field">
+            <label for="field-argo-port">Argo 端口</label>
+            <div class="field-input-row">
+              <input type="number" id="field-argo-port" placeholder="固定隧道默认 8001，临时随机">
+              <button type="button" class="btn-mini" id="gen-argo-port">生成</button>
+            </div>
+            <span class="desc">ARGO_PORT</span>
+          </div>
+          <div class="field">
+            <label for="field-argo-domain">Argo 域名</label>
+            <input type="text" id="field-argo-domain" placeholder="空则使用临时隧道">
+            <span class="desc">ARGO_DOMAIN</span>
+          </div>
+          <div class="field">
+            <label for="field-argo-auth">Argo Token / JSON</label>
+            <input type="text" id="field-argo-auth" placeholder="空则使用临时隧道">
+            <span class="desc">ARGO_AUTH</span>
+          </div>
+        </div>
+        <div style="margin-top:20px;">
+          <div class="toggle-list">
+            <div class="toggle-row">
+              <div>
+                <div class="name">禁用 Argo</div>
+                <div class="desc">DISABLE_ARGO=true</div>
+              </div>
+              <!-- 修复：input 在前，track/thumb 在后，用 ~ 选择器 -->
+              <label class="switch">
+                <input type="checkbox" id="toggle-disable-argo">
+                <div class="track"><div class="thumb"></div></div>
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-label"><span class="tag">可选</span> · 协议端口</div>
+        <h2>协议端口</h2>
+        <div class="proto-grid">
+
+          <div class="proto-card" id="card-hy2">
+            <div class="proto-card-header">
+              <span class="proto-name">Hysteria2</span>
+              <span class="proto-var">HY2_PORT</span>
+            </div>
+            <div class="field-input-row">
+              <input type="number" id="input-hy2" placeholder="留空不启用">
+              <button type="button" class="btn-mini btn-proto-rand" data-key="hy2">生成</button>
+            </div>
+          </div>
+
+          <div class="proto-card" id="card-tuic">
+            <div class="proto-card-header">
+              <span class="proto-name">TUIC</span>
+              <span class="proto-var">TUIC_PORT</span>
+            </div>
+            <div class="field-input-row">
+              <input type="number" id="input-tuic" placeholder="留空不启用">
+              <button type="button" class="btn-mini btn-proto-rand" data-key="tuic">生成</button>
+            </div>
+          </div>
+
+          <div class="proto-card" id="card-reality">
+            <div class="proto-card-header">
+              <span class="proto-name">Reality</span>
+              <span class="proto-var">REALITY_PORT</span>
+            </div>
+            <div class="field-input-row">
+              <input type="number" id="input-reality" placeholder="留空不启用">
+              <button type="button" class="btn-mini btn-proto-rand" data-key="reality">生成</button>
+            </div>
+          </div>
+
+          <div class="proto-card" id="card-ss">
+            <div class="proto-card-header">
+              <span class="proto-name">Shadowsocks</span>
+              <span class="proto-var">SS_PORT</span>
+            </div>
+            <div class="field-input-row">
+              <input type="number" id="input-ss" placeholder="留空不启用">
+              <button type="button" class="btn-mini btn-proto-rand" data-key="ss">生成</button>
+            </div>
+          </div>
+
+          <div class="proto-card" style="grid-column:span 2;">
+            <div class="proto-card-header" style="margin-bottom:8px;">
+              <span class="proto-name">Reality 伪装域名</span>
+              <span class="proto-var">REALITY_DOMAIN</span>
+            </div>
+            <input type="text" id="field-reality-domain" placeholder="默认 www.iij.ad.jp">
+          </div>
+
+        </div>
+      </div>
+
+    </div>
+
+    <div class="preview-col">
+      <div class="terminal">
+        <div class="terminal-bar">
+          <span class="dot dot-red"></span>
+          <span class="dot dot-yellow"></span>
+          <span class="dot dot-green"></span>
+          <span class="terminal-title">deploy.sh</span>
+        </div>
+        <div class="terminal-body">
+          <span class="prompt">$</span><span id="command-output"></span><span class="cursor">▌</span>
+        </div>
+        <div class="terminal-actions">
+          <div class="segmented">
+            <button type="button" class="seg-btn active" data-type="curl">curl</button>
+            <button type="button" class="seg-btn" data-type="wget">wget</button>
+          </div>
+          <button type="button" class="btn btn-accent" id="copy-btn">复制命令</button>
+          <button type="button" class="btn btn-ghost" id="reset-btn">重置</button>
+        </div>
+        <div class="terminal-note">服务器没有 curl 时，切到 wget 再复制。</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+<script>
+(function(){
+  const SCRIPT_URL = 'https://raw.githubusercontent.com/zaofengyue/node-sb/main/install.sh';
+
+  const state = {
+    uuid:'', port:'', name:'', sub:'',
+    argoPort:'', argoDomain:'', argoAuth:'', disableArgo:false,
+    hy2:'', tuic:'', reality:'', realityDomain:'', ss:'',
+    cmdType:'curl'
+  };
+
+  function randPort(){ return String(10000 + Math.floor(Math.random() * 55535)); }
+
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  function buildPairs(){
+    const p=[];
+    if(state.uuid)          p.push(['UUID',           state.uuid,         false]);
+    if(state.port)          p.push(['PORT',           state.port,         false]);
+    if(state.name)          p.push(['NAME',           state.name,         false]);
+    if(state.sub)           p.push(['SUB',            state.sub,          false]);
+    if(state.argoPort)      p.push(['ARGO_PORT',      state.argoPort,     false]);
+    if(state.argoDomain)    p.push(['ARGO_DOMAIN',    state.argoDomain,   false]);
+    if(state.argoAuth)      p.push(['ARGO_AUTH',      state.argoAuth,     true]);  // 强制引号
+    if(state.disableArgo)   p.push(['DISABLE_ARGO',   'true',             false]);
+    if(state.hy2)           p.push(['HY2_PORT',       state.hy2,          false]);
+    if(state.tuic)          p.push(['TUIC_PORT',      state.tuic,         false]);
+    if(state.reality)       p.push(['REALITY_PORT',   state.reality,      false]);
+    if(state.realityDomain) p.push(['REALITY_DOMAIN', state.realityDomain,false]);
+    if(state.ss)            p.push(['SS_PORT',        state.ss,           false]);
+    return p;
+  }
+
+  function formatVal(v, forceQuote){
+    // 强制引号 或 含空格/特殊字符时加引号
+    if(forceQuote || /[\s"'\\`$|&;()<>]/.test(v)) return `"${v}"`;
+    return v;
+  }
+  function formatValHtml(v, forceQuote){
+    if(forceQuote || /[\s"'\\`$|&;()<>]/.test(v)) return `"${escapeHtml(v)}"`;
+    return escapeHtml(v);
+  }
+
+  function fetcherPlain(){
+    return state.cmdType === 'curl'
+      ? `bash <(curl -sL ${SCRIPT_URL})`
+      : `bash <(wget -qO- ${SCRIPT_URL})`;
+  }
+  function fetcherHtml(){
+    const lt = '&lt;';
+    return state.cmdType === 'curl'
+      ? `bash ${lt}(curl -sL ${escapeHtml(SCRIPT_URL)})`
+      : `bash ${lt}(wget -qO- ${escapeHtml(SCRIPT_URL)})`;
+  }
+
+  function plainCommand(){
+    const pairs = buildPairs();
+    const v = pairs.map(([k,v,q]) => `${k}=${formatVal(v,q)}`).join(' ');
+    return (v ? v + ' ' : '') + fetcherPlain();
+  }
+
+  function render(){
+    const pairs = buildPairs();
+    const html = pairs.map(([k,v,q]) =>
+      `<span class="var">${escapeHtml(k)}</span>=${formatValHtml(v,q)}`
+    ).join(' ');
+    document.getElementById('command-output').innerHTML =
+      (html ? html + ' ' : '') + fetcherHtml();
+  }
+
+  const protoKeys = ['hy2','tuic','reality','ss'];
+  function updateProtoCard(key){
+    document.getElementById('card-'+key).classList.toggle('active', !!state[key]);
+  }
+
+  document.querySelectorAll('.btn-proto-rand').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const key = btn.dataset.key;
+      const p = randPort();
+      state[key] = p;
+      document.getElementById('input-'+key).value = p;
+      updateProtoCard(key); render();
+    });
+  });
+
+  protoKeys.forEach(key => {
+    document.getElementById('input-'+key).addEventListener('input', e => {
+      state[key] = e.target.value.trim();
+      updateProtoCard(key); render();
+    });
+  });
+
+  document.getElementById('gen-port').addEventListener('click', () => {
+    const p = randPort(); document.getElementById('field-port').value = p; state.port = p; render();
+  });
+  document.getElementById('gen-argo-port').addEventListener('click', () => {
+    const p = randPort(); document.getElementById('field-argo-port').value = p; state.argoPort = p; render();
+  });
+  document.getElementById('gen-uuid').addEventListener('click', () => {
+    const b = new Uint8Array(16); crypto.getRandomValues(b);
+    b[6]=(b[6]&0x0f)|0x40; b[8]=(b[8]&0x3f)|0x80;
+    const h = Array.from(b, x => x.toString(16).padStart(2,'0'));
+    const uuid = `${h.slice(0,4).join('')}-${h.slice(4,6).join('')}-${h.slice(6,8).join('')}-${h.slice(8,10).join('')}-${h.slice(10).join('')}`;
+    document.getElementById('field-uuid').value = uuid; state.uuid = uuid; render();
+  });
+
+  [
+    ['field-uuid','uuid'],['field-port','port'],['field-name','name'],['field-sub','sub'],
+    ['field-argo-port','argoPort'],['field-argo-domain','argoDomain'],['field-argo-auth','argoAuth'],
+    ['field-reality-domain','realityDomain'],
+  ].forEach(([id,key]) => {
+    document.getElementById(id).addEventListener('input', e => { state[key] = e.target.value.trim(); render(); });
+  });
+
+  // 开关：监听 change 事件
+  document.getElementById('toggle-disable-argo').addEventListener('change', e => {
+    state.disableArgo = e.target.checked; render();
+  });
+
+  document.querySelectorAll('.seg-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.cmdType = btn.dataset.type;
+      document.querySelectorAll('.seg-btn').forEach(b => b.classList.toggle('active', b===btn));
+      render();
+    });
+  });
+
+  document.getElementById('copy-btn').addEventListener('click', async () => {
+    const text = plainCommand();
+    try { await navigator.clipboard.writeText(text); }
+    catch(e) {
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.style.cssText = 'position:fixed;opacity:0';
+      document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+    }
+    const btn = document.getElementById('copy-btn');
+    btn.textContent = '✓ 已复制'; btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = '复制命令'; btn.classList.remove('copied'); }, 1600);
+  });
+
+  document.getElementById('reset-btn').addEventListener('click', () => {
+    Object.keys(state).forEach(k => { state[k] = k==='cmdType'?'curl': k==='disableArgo'?false:''; });
+    ['field-uuid','field-port','field-name','field-sub','field-argo-port','field-argo-domain','field-argo-auth','field-reality-domain']
+      .forEach(id => { document.getElementById(id).value = ''; });
+    document.getElementById('toggle-disable-argo').checked = false;
+    protoKeys.forEach(k => { document.getElementById('input-'+k).value = ''; updateProtoCard(k); });
+    document.querySelectorAll('.seg-btn').forEach((b,i) => b.classList.toggle('active', i===0));
+    render();
+  });
+
+  render();
+})();
+</script>
+</body>
+</html>
