@@ -12,9 +12,9 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 
-COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+COPY singbox.sh /app/singbox.sh
+RUN chmod +x /app/singbox.sh
 
 EXPOSE 3000
 
-CMD ["/app/entrypoint.sh"]
+CMD ["/app/singbox.sh"]
