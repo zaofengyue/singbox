@@ -26,6 +26,7 @@ HOME_DIR="${HOME:-/tmp}"
 UUID_FILE="$HOME_DIR/uuid.txt"
 CONFIG_FILE="$HOME_DIR/sb-config.json"
 REALITY_KEY_FILE="$HOME_DIR/reality-keys.txt"
+OUTBOUND_FILE="$HOME_DIR/outbound.conf"
 CERT_DIR="$HOME_DIR/certs"
 SUB_FILE="${HOME:-/tmp}/singbox/sub.txt"
 mkdir -p "$(dirname "$SUB_FILE")"
@@ -76,6 +77,14 @@ url_encode() {
     -e 's/=/%3D/g' \
     -e 's/?/%3F/g' \
     -e 's/@/%40/g'
+}
+
+# IPv6 地址加方括号包裹，IPv4 原样返回
+format_addr() {
+  case "$1" in
+    *:*) printf '[%s]' "$1" ;;
+    *)   printf '%s' "$1" ;;
+  esac
 }
 
 # 端口合法性检查（参数：端口值，协议 tcp/udp，已用端口列表文件）
@@ -279,6 +288,11 @@ PUBLIC_IP=""
 if [ -n "$HY2_PORT" ] || [ -n "$TUIC_PORT" ] || [ -n "$REALITY_PORT" ] || [ -n "$SS_PORT" ]; then
   PUBLIC_IP="$(http_get 'https://ipinfo.io/ip' | tr -d '[:space:]')"
   [ -z "$PUBLIC_IP" ] && PUBLIC_IP="$(http_get 'https://ifconfig.co/ip' | tr -d '[:space:]')"
+  # IPv4 获取失败（纯 IPv6 服务器），尝试 IPv6 接口
+  if [ -z "$PUBLIC_IP" ]; then
+    PUBLIC_IP="$(http_get 'https://api64.ipify.org' | tr -d '[:space:]')"
+    [ -z "$PUBLIC_IP" ] && PUBLIC_IP="$(http_get 'https://v6.ident.me' | tr -d '[:space:]')"
+  fi
 fi
 
 # ── 自签证书（HY2 / TUIC 用）─────────────────────────────────────────────────
@@ -344,6 +358,52 @@ if [ -n "$REALITY_PORT" ]; then
   fi
 fi
 
+# ── 自定义出口（SOCKS/HTTP）──────────────────────────────────────────────────
+CUSTOM_OUT_TYPE=""
+CUSTOM_OUT_ADDR=""
+CUSTOM_OUT_PORT=""
+CUSTOM_OUT_USER=""
+CUSTOM_OUT_PASS=""
+DETOUR_JSON=""
+EXTRA_OUTBOUND_JSON=""
+
+if [ -f "$OUTBOUND_FILE" ]; then
+  CUSTOM_OUT_TYPE="$(grep '^TYPE=' "$OUTBOUND_FILE" | sed 's/^TYPE=//')"
+  CUSTOM_OUT_ADDR="$(grep '^ADDR=' "$OUTBOUND_FILE" | sed 's/^ADDR=//')"
+  CUSTOM_OUT_PORT="$(grep '^PORT=' "$OUTBOUND_FILE" | sed 's/^PORT=//')"
+  CUSTOM_OUT_USER="$(grep '^USER=' "$OUTBOUND_FILE" | sed 's/^USER=//')"
+  CUSTOM_OUT_PASS="$(grep '^PASS=' "$OUTBOUND_FILE" | sed 's/^PASS=//')"
+fi
+
+if [ "$CUSTOM_OUT_TYPE" = "socks" ] || [ "$CUSTOM_OUT_TYPE" = "http" ]; then
+  if [ -n "$CUSTOM_OUT_ADDR" ] && [ -n "$CUSTOM_OUT_PORT" ]; then
+    log "检测到自定义出口配置: ${CUSTOM_OUT_TYPE}://${CUSTOM_OUT_ADDR}:${CUSTOM_OUT_PORT}"
+    if [ -n "$CUSTOM_OUT_USER" ]; then
+      EXTRA_OUTBOUND_JSON=",
+    {
+      \"type\": \"${CUSTOM_OUT_TYPE}\",
+      \"tag\": \"custom-out\",
+      \"server\": \"${CUSTOM_OUT_ADDR}\",
+      \"server_port\": ${CUSTOM_OUT_PORT},
+      \"username\": \"${CUSTOM_OUT_USER}\",
+      \"password\": \"${CUSTOM_OUT_PASS}\"
+    }"
+    else
+      EXTRA_OUTBOUND_JSON=",
+    {
+      \"type\": \"${CUSTOM_OUT_TYPE}\",
+      \"tag\": \"custom-out\",
+      \"server\": \"${CUSTOM_OUT_ADDR}\",
+      \"server_port\": ${CUSTOM_OUT_PORT}
+    }"
+    fi
+    DETOUR_JSON=",
+      \"detour\": \"custom-out\""
+  else
+    warn "outbound.conf 配置不完整，自定义出口已跳过"
+  fi
+fi
+
 # ── 端口合法性检查 ────────────────────────────────────────────────────────────
 HY2_ACTIVE=0; TUIC_ACTIVE=0; REALITY_ACTIVE=0; SS_ACTIVE=0
 
@@ -376,7 +436,7 @@ if [ "${DISABLE_ARGO:-}" != "true" ]; then
       \"listen\": \"127.0.0.1\",
       \"listen_port\": ${ARGO_PORT},
       \"users\": [{ \"uuid\": \"${UUID}\", \"alterId\": 0 }],
-      \"transport\": { \"type\": \"ws\", \"path\": \"${WS_PATH}\" }
+      \"transport\": { \"type\": \"ws\", \"path\": \"${WS_PATH}\" }${DETOUR_JSON}
     }"
   _sep=","
 else
@@ -397,7 +457,7 @@ if [ "$HY2_ACTIVE" = "1" ]; then
         \"alpn\": [\"h3\"],
         \"certificate_path\": \"${CERT_PATH}\",
         \"key_path\": \"${KEY_PATH}\"
-      }
+      }${DETOUR_JSON}
     }"
   _sep=","
 fi
@@ -416,7 +476,7 @@ if [ "$TUIC_ACTIVE" = "1" ]; then
         \"alpn\": [\"h3\"],
         \"certificate_path\": \"${CERT_PATH}\",
         \"key_path\": \"${KEY_PATH}\"
-      }
+      }${DETOUR_JSON}
     }"
   _sep=","
 fi
@@ -438,7 +498,7 @@ if [ "$REALITY_ACTIVE" = "1" ]; then
           \"private_key\": \"${REALITY_PRIV}\",
           \"short_id\": [\"\"]
         }
-      }
+      }${DETOUR_JSON}
     }"
   _sep=","
 fi
@@ -452,12 +512,12 @@ if [ "$SS_ACTIVE" = "1" ]; then
       \"listen_port\": ${SS_PORT},
       \"network\": \"tcp\",
       \"method\": \"2022-blake3-aes-128-gcm\",
-      \"password\": \"${SS_PASS}\"
+      \"password\": \"${SS_PASS}\"${DETOUR_JSON}
     }"
 fi
 
-printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct" }]\n}\n' \
-  "$_inbounds" > "$CONFIG_FILE"
+printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct" }%s]\n}\n' \
+  "$_inbounds" "$EXTRA_OUTBOUND_JSON" > "$CONFIG_FILE"
 
 # 校验配置
 if ! "$SB_BIN" check -c "$CONFIG_FILE" 2>/dev/null; then
@@ -528,26 +588,26 @@ if [ "${DISABLE_ARGO:-}" != "true" ]; then
 fi
 
 if [ "$HY2_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-  _link="hysteria2://${UUID}@${PUBLIC_IP}:${HY2_PORT}?sni=www.bing.com&insecure=1&alpn=h3&obfs=none#${NAME_ENCODED}"
+  _link="hysteria2://${UUID}@$(format_addr "$PUBLIC_IP"):${HY2_PORT}?sni=www.bing.com&insecure=1&alpn=h3&obfs=none#${NAME_ENCODED}"
   ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
 fi
 
 if [ "$TUIC_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-  _link="tuic://${UUID}:${UUID}@${PUBLIC_IP}:${TUIC_PORT}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${NAME_ENCODED}"
+  _link="tuic://${UUID}:${UUID}@$(format_addr "$PUBLIC_IP"):${TUIC_PORT}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${NAME_ENCODED}"
   ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
 fi
 
 if [ "$REALITY_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ] && [ -n "$REALITY_PUB" ]; then
-  _link="vless://${UUID}@${PUBLIC_IP}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=firefox&pbk=${REALITY_PUB}&type=tcp&headerType=none#${NAME_ENCODED}"
+  _link="vless://${UUID}@$(format_addr "$PUBLIC_IP"):${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=firefox&pbk=${REALITY_PUB}&type=tcp&headerType=none#${NAME_ENCODED}"
   ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
 fi
 
 if [ "$SS_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
   SS_USERINFO="$(b64 "2022-blake3-aes-128-gcm:${SS_PASS}")"
-  _link="ss://${SS_USERINFO}@${PUBLIC_IP}:${SS_PORT}#${NAME_ENCODED}"
+  _link="ss://${SS_USERINFO}@$(format_addr "$PUBLIC_IP"):${SS_PORT}#${NAME_ENCODED}"
   ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
 fi
@@ -567,6 +627,7 @@ log "============== 已启用协议 =============="
 [ "$TUIC_ACTIVE"    = "1" ] && log "✓ TUIC v5       端口 $TUIC_PORT (UDP)"
 [ "$REALITY_ACTIVE" = "1" ] && log "✓ VLESS Reality 端口 $REALITY_PORT  PubKey: $REALITY_PUB"
 [ "$SS_ACTIVE"      = "1" ] && log "✓ Shadowsocks   端口 $SS_PORT (TCP)"
+[ -n "$EXTRA_OUTBOUND_JSON" ] && log "✓ 自定义出口    ${CUSTOM_OUT_TYPE}://${CUSTOM_OUT_ADDR}:${CUSTOM_OUT_PORT}"
 log "========================================"
 
 # ── 守护循环：sing-box 崩溃自动重启，同时清理孤儿进程 ────────────────────────

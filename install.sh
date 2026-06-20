@@ -118,6 +118,7 @@ WRAPPER="$APP_DIR/start.sh"
 SUB_FILE="$APP_DIR/sub.txt"
 LOG_FILE="$APP_DIR/run.log"
 SB_BIN_PATH="/tmp/sb-bin/singbox/sing-box"
+OUTBOUND_FILE="$HOME/outbound.conf"
 
 get_val() {
   grep "^export $1=" "$WRAPPER" 2>/dev/null | sed 's/.*="\(.*\)"/\1/' | head -1
@@ -173,6 +174,7 @@ main_menu() {
     echo -e "${WHITE}4. 重启服务${RESET}"
     echo -e "${WHITE}5. 更新 sing-box${RESET}"
     echo -e "${WHITE}6. 彻底删除${RESET}"
+    echo -e "${WHITE}7. 自定义出口 (SOCKS/HTTP)${RESET}"
     echo -e "${WHITE}0. 退出${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -ne "${GRAY}请输入选项: ${RESET}"
@@ -184,6 +186,7 @@ main_menu() {
       4) restart_service ;;
       5) menu_update ;;
       6) menu_delete ;;
+      7) menu_outbound ;;
       0) exit 0 ;;
       *) ;;
     esac
@@ -497,6 +500,121 @@ menu_update() {
   press_any_key
 }
 
+# ── 自定义出口 (SOCKS/HTTP) ───────────────────────────────────────────────────
+get_outbound_val() {
+  grep "^$1=" "$OUTBOUND_FILE" 2>/dev/null | sed "s/^$1=//" | head -1
+}
+
+test_outbound() {
+  local type="$1" addr="$2" port="$3" user="$4" pass="$5"
+  local proxy_url=""
+  if [ -n "$user" ]; then
+    proxy_url="${type}://${user}:${pass}@${addr}:${port}"
+  else
+    proxy_url="${type}://${addr}:${port}"
+  fi
+  echo -e "${GRAY}正在测试连通性...${RESET}"
+  local code
+  code=$(curl -s --connect-timeout 5 -x "$proxy_url" https://www.google.com -o /dev/null -w "%{http_code}" 2>/dev/null)
+  if [ "$code" = "200" ] || [ "$code" = "204" ] || [ "$code" = "301" ] || [ "$code" = "302" ]; then
+    echo -e "${GREEN}✓ 连接测试成功 (HTTP $code)${RESET}"
+    return 0
+  else
+    echo -e "${RED}✗ 连接测试失败或超时 (返回: ${code:-无响应})${RESET}"
+    return 1
+  fi
+}
+
+set_outbound() {
+  local type="$1"
+  echo ""
+  echo -e "${GRAY}→ 设置 ${type} 出口:${RESET}"
+  echo -ne "${WHITE}地址 (ADDR): ${RESET}"
+  read -r addr
+  echo -ne "${WHITE}端口 (PORT): ${RESET}"
+  read -r port
+  echo -ne "${WHITE}用户名（留空则无认证）: ${RESET}"
+  read -r user
+  local pass=""
+  if [ -n "$user" ]; then
+    echo -ne "${WHITE}密码: ${RESET}"
+    read -r pass
+  fi
+
+  if [ -z "$addr" ] || [ -z "$port" ]; then
+    echo -e "${RED}地址或端口不能为空，已取消${RESET}"
+    sleep 1
+    return
+  fi
+
+  echo ""
+  if test_outbound "$type" "$addr" "$port" "$user" "$pass"; then
+    echo -ne "${GRAY}测试通过，确认保存并重启? [y/N]: ${RESET}"
+  else
+    echo -e "${YELLOW}⚠ 测试未通过，但检测结果不一定准确${RESET}"
+    echo -ne "${GRAY}仍然保存并重启? [y/N]: ${RESET}"
+  fi
+  read -r confirm
+  if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+    cat > "$OUTBOUND_FILE" << EOF
+TYPE=${type}
+ADDR=${addr}
+PORT=${port}
+USER=${user}
+PASS=${pass}
+EOF
+    restart_service
+    echo -e "${GREEN}出口已设置${RESET}"
+    press_any_key
+  else
+    echo -e "${YELLOW}已取消${RESET}"
+    sleep 1
+  fi
+}
+
+menu_outbound() {
+  while true; do
+    clear
+    echo -e "${GREEN}======= 自定义出口 (SOCKS/HTTP) =======${RESET}"
+    local cur_type cur_addr cur_port
+    cur_type=$(get_outbound_val TYPE)
+    cur_addr=$(get_outbound_val ADDR)
+    cur_port=$(get_outbound_val PORT)
+
+    if [ -n "$cur_type" ] && [ "$cur_type" != "none" ]; then
+      echo -e "${GRAY}当前: ${CYAN}${cur_type}://${cur_addr}:${cur_port}${RESET}"
+    else
+      echo -e "${GRAY}当前: ${CYAN}直连 (未启用自定义出口)${RESET}"
+    fi
+
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}1. 设置 SOCKS5 出口${RESET}"
+    echo -e "${WHITE}2. 设置 HTTP 出口${RESET}"
+    echo -e "${WHITE}3. 恢复直连${RESET}"
+    echo -e "${WHITE}0. 返回${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -ne "${GRAY}请输入选项: ${RESET}"
+    read -r opt
+
+    case "$opt" in
+      1) set_outbound socks ;;
+      2) set_outbound http ;;
+      3)
+        echo -ne "${GRAY}确认恢复直连并重启? [y/N]: ${RESET}"
+        read -r confirm
+        if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+          rm -f "$OUTBOUND_FILE"
+          restart_service
+          echo -e "${GREEN}已恢复直连${RESET}"
+          press_any_key
+        fi
+        ;;
+      0) return ;;
+      *) ;;
+    esac
+  done
+}
+
 # ── 彻底删除 ──────────────────────────────────────────────────────────────────
 menu_delete() {
   clear
@@ -561,7 +679,7 @@ for RC in "\$HOME/.bashrc" "\$HOME/.profile" "\$HOME/.bash_profile" "\$HOME/.zsh
 done
 rm -rf "\$HOME/singbox"
 rm -rf /tmp/sb-bin
-rm -f "\$HOME/uuid.txt" "\$HOME/sb-config.json" "\$HOME/reality-keys.txt"
+rm -f "\$HOME/uuid.txt" "\$HOME/sb-config.json" "\$HOME/reality-keys.txt" "\$HOME/outbound.conf"
 rm -rf "\$HOME/certs"
 rm -f "$LOCAL_BIN/sb" "$LOCAL_BIN/sb-sub" "$LOCAL_BIN/sb-log" "$LOCAL_BIN/sb-del" "$LOCAL_BIN/sb-edit"
 echo "删除完成"
