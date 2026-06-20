@@ -174,7 +174,7 @@ main_menu() {
     echo -e "${WHITE}4. 重启服务${RESET}"
     echo -e "${WHITE}5. 更新 sing-box${RESET}"
     echo -e "${WHITE}6. 彻底删除${RESET}"
-    echo -e "${WHITE}7. 自定义出口 (SOCKS/HTTP)${RESET}"
+    echo -e "${WHITE}7. 自定义出口${RESET}"
     echo -e "${WHITE}0. 退出${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -ne "${GRAY}请输入选项: ${RESET}"
@@ -500,7 +500,7 @@ menu_update() {
   press_any_key
 }
 
-# ── 自定义出口 (SOCKS/HTTP) ───────────────────────────────────────────────────
+# ── 自定义出口 ───────────────────────────────────────────────────
 get_outbound_val() {
   grep "^$1=" "$OUTBOUND_FILE" 2>/dev/null | sed "s/^$1=//" | head -1
 }
@@ -575,7 +575,7 @@ EOF
 menu_outbound() {
   while true; do
     clear
-    echo -e "${GREEN}======= 自定义出口 (SOCKS/HTTP) =======${RESET}"
+    echo -e "${GREEN}======= 自定义出口 =======${RESET}"
     local cur_type cur_addr cur_port
     cur_type=$(get_outbound_val TYPE)
     cur_addr=$(get_outbound_val ADDR)
