@@ -436,7 +436,7 @@ if [ "${DISABLE_ARGO:-}" != "true" ]; then
       \"listen\": \"127.0.0.1\",
       \"listen_port\": ${ARGO_PORT},
       \"users\": [{ \"uuid\": \"${UUID}\", \"alterId\": 0 }],
-      \"transport\": { \"type\": \"ws\", \"path\": \"${WS_PATH}\" }${DETOUR_JSON}
+      \"transport\": { \"type\": \"ws\", \"path\": \"${WS_PATH}\" }
     }"
   _sep=","
 else
@@ -457,7 +457,7 @@ if [ "$HY2_ACTIVE" = "1" ]; then
         \"alpn\": [\"h3\"],
         \"certificate_path\": \"${CERT_PATH}\",
         \"key_path\": \"${KEY_PATH}\"
-      }${DETOUR_JSON}
+      }
     }"
   _sep=","
 fi
@@ -476,7 +476,7 @@ if [ "$TUIC_ACTIVE" = "1" ]; then
         \"alpn\": [\"h3\"],
         \"certificate_path\": \"${CERT_PATH}\",
         \"key_path\": \"${KEY_PATH}\"
-      }${DETOUR_JSON}
+      }
     }"
   _sep=","
 fi
