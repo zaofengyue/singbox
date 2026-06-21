@@ -507,6 +507,7 @@ get_outbound_val() {
 
 test_outbound() {
   local type="$1" addr="$2" port="$3" user="$4" pass="$5"
+  [ "$type" = "socks" ] && type="socks5"
   local proxy_url=""
   if [ -n "$user" ]; then
     proxy_url="${type}://${user}:${pass}@${addr}:${port}"
