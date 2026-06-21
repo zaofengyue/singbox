@@ -364,7 +364,7 @@ CUSTOM_OUT_ADDR=""
 CUSTOM_OUT_PORT=""
 CUSTOM_OUT_USER=""
 CUSTOM_OUT_PASS=""
-DETOUR_JSON=""
+ROUTE_RULE_JSON=""
 EXTRA_OUTBOUND_JSON=""
 
 if [ -f "$OUTBOUND_FILE" ]; then
@@ -375,6 +375,7 @@ if [ -f "$OUTBOUND_FILE" ]; then
   CUSTOM_OUT_PASS="$(grep '^PASS=' "$OUTBOUND_FILE" | sed 's/^PASS=//')"
 fi
 
+CUSTOM_OUT_ENABLED=0
 if [ "$CUSTOM_OUT_TYPE" = "socks" ] || [ "$CUSTOM_OUT_TYPE" = "http" ]; then
   if [ -n "$CUSTOM_OUT_ADDR" ] && [ -n "$CUSTOM_OUT_PORT" ]; then
     log "检测到自定义出口配置: ${CUSTOM_OUT_TYPE}://${CUSTOM_OUT_ADDR}:${CUSTOM_OUT_PORT}"
@@ -397,8 +398,7 @@ if [ "$CUSTOM_OUT_TYPE" = "socks" ] || [ "$CUSTOM_OUT_TYPE" = "http" ]; then
       \"server_port\": ${CUSTOM_OUT_PORT}
     }"
     fi
-    DETOUR_JSON=",
-      \"detour\": \"custom-out\""
+    CUSTOM_OUT_ENABLED=1
   else
     warn "outbound.conf 配置不完整，自定义出口已跳过"
   fi
@@ -498,7 +498,7 @@ if [ "$REALITY_ACTIVE" = "1" ]; then
           \"private_key\": \"${REALITY_PRIV}\",
           \"short_id\": [\"\"]
         }
-      }${DETOUR_JSON}
+      }
     }"
   _sep=","
 fi
@@ -512,12 +512,35 @@ if [ "$SS_ACTIVE" = "1" ]; then
       \"listen_port\": ${SS_PORT},
       \"network\": \"tcp\",
       \"method\": \"2022-blake3-aes-128-gcm\",
-      \"password\": \"${SS_PASS}\"${DETOUR_JSON}
+      \"password\": \"${SS_PASS}\"
     }"
 fi
 
-printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct" }%s]\n}\n' \
-  "$_inbounds" "$EXTRA_OUTBOUND_JSON" > "$CONFIG_FILE"
+ROUTE_RULE_JSON=""
+if [ "$CUSTOM_OUT_ENABLED" = "1" ]; then
+  _route_inbounds=""
+  _route_sep=""
+  [ "${DISABLE_ARGO:-}" != "true" ] && _route_inbounds="${_route_inbounds}${_route_sep}\"vmess-in\"" && _route_sep=","
+  [ "$HY2_ACTIVE" = "1" ]     && _route_inbounds="${_route_inbounds}${_route_sep}\"hy2-in\"" && _route_sep=","
+  [ "$TUIC_ACTIVE" = "1" ]    && _route_inbounds="${_route_inbounds}${_route_sep}\"tuic-in\"" && _route_sep=","
+  [ "$REALITY_ACTIVE" = "1" ] && _route_inbounds="${_route_inbounds}${_route_sep}\"reality-in\"" && _route_sep=","
+  [ "$SS_ACTIVE" = "1" ]      && _route_inbounds="${_route_inbounds}${_route_sep}\"ss-in\"" && _route_sep=","
+
+  if [ -n "$_route_inbounds" ]; then
+    ROUTE_RULE_JSON=",
+  \"route\": {
+    \"rules\": [
+      {
+        \"inbound\": [${_route_inbounds}],
+        \"outbound\": \"custom-out\"
+      }
+    ]
+  }"
+  fi
+fi
+
+printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct" }%s]%s\n}\n' \
+  "$_inbounds" "$EXTRA_OUTBOUND_JSON" "$ROUTE_RULE_JSON" > "$CONFIG_FILE"
 
 # 校验配置
 if ! "$SB_BIN" check -c "$CONFIG_FILE" 2>/dev/null; then
