@@ -708,6 +708,8 @@ systemctl --user daemon-reload 2>/dev/null || true
 pkill -f "singbox/singbox.sh" 2>/dev/null || true
 pkill -f "sing-box"              2>/dev/null || true
 pkill -f "cloudflared"           2>/dev/null || true
+# 清理 cron 里的开机自启条目
+(crontab -l 2>/dev/null | grep -v "singbox autostart") | crontab - 2>/dev/null || true
 for RC in "\$HOME/.bashrc" "\$HOME/.profile" "\$HOME/.bash_profile" "\$HOME/.zshrc"; do
   sed -i '/# singbox/d'  "\$RC" 2>/dev/null || true
   sed -i '/singbox/d'    "\$RC" 2>/dev/null || true
@@ -895,7 +897,8 @@ if $USER_SYSTEMD_OK; then
   cat > "$SYSTEMD_DIR/singbox.service" << SVCEOF
 [Unit]
 Description=singbox service
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -927,17 +930,18 @@ SVCEOF
   systemctl --user enable singbox
   systemctl --user start singbox
   loginctl enable-linger "$USER" 2>/dev/null || true
+  # cron @reboot 双保险，延迟 20 秒等网络就绪
+  (crontab -l 2>/dev/null | grep -v "singbox autostart"; \
+   echo "@reboot sleep 20 && bash $WRAPPER >/dev/null 2>&1") | crontab -
   echo ""
   echo -e "${GREEN}服务已通过用户级 systemd 启动并设置开机自启${NC}"
 else
   bash "$WRAPPER"
-  for RC in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.zshrc"; do
-    if [ -f "$RC" ] && ! grep -q "# singbox autostart" "$RC" 2>/dev/null; then
-      printf '\n# singbox autostart\nif ! pgrep -f "singbox/singbox.sh" >/dev/null 2>&1; then\n  bash "%s" >/dev/null 2>&1\nfi\n' "$WRAPPER" >> "$RC"
-    fi
-  done
+  # 用 cron @reboot 替代写 RC 文件，避免只在登录时才触发
+  (crontab -l 2>/dev/null | grep -v "singbox autostart"; \
+   echo "@reboot sleep 20 && bash $WRAPPER >/dev/null 2>&1") | crontab -
   echo ""
-  echo -e "${GREEN}服务已通过 nohup 后台启动${NC}"
+  echo -e "${GREEN}服务已通过 nohup 后台启动，开机自启已写入 cron${NC}"
 fi
 
 echo ""
