@@ -228,17 +228,6 @@
             </div>
           </div>
 
-          <div class="proto-card" id="card-reality">
-            <div class="proto-card-header">
-              <span class="proto-name">Reality</span>
-              <span class="proto-var">REALITY_PORT</span>
-            </div>
-            <div class="field-input-row">
-              <input type="number" id="input-reality" placeholder="留空不启用">
-              <button type="button" class="btn-mini btn-proto-rand" data-key="reality">生成</button>
-            </div>
-          </div>
-
           <div class="proto-card" id="card-ss">
             <div class="proto-card-header">
               <span class="proto-name">Shadowsocks</span>
@@ -250,12 +239,59 @@
             </div>
           </div>
 
+          <div class="proto-card" id="card-trojan">
+            <div class="proto-card-header">
+              <span class="proto-name">Trojan</span>
+              <span class="proto-var">TROJAN_PORT</span>
+            </div>
+            <div class="field-input-row">
+              <input type="number" id="input-trojan" placeholder="留空不启用">
+              <button type="button" class="btn-mini btn-proto-rand" data-key="trojan">生成</button>
+            </div>
+          </div>
+
+          <div class="proto-card" id="card-anytls">
+            <div class="proto-card-header">
+              <span class="proto-name">AnyTLS</span>
+              <span class="proto-var">ANYTLS_PORT</span>
+            </div>
+            <div class="field-input-row">
+              <input type="number" id="input-anytls" placeholder="留空不启用">
+              <button type="button" class="btn-mini btn-proto-rand" data-key="anytls">生成</button>
+            </div>
+          </div>
+
+          <div class="proto-card" id="card-s5">
+            <div class="proto-card-header">
+              <span class="proto-name">SOCKS5</span>
+              <span class="proto-var">SOCKS5_PORT</span>
+            </div>
+            <div class="field-input-row">
+              <input type="number" id="input-s5" placeholder="留空不启用">
+              <button type="button" class="btn-mini btn-proto-rand" data-key="s5">生成</button>
+            </div>
+          </div>
+
+          <div class="proto-card" id="card-reality">
+            <div class="proto-card-header">
+              <span class="proto-name">Reality</span>
+              <span class="proto-var">REALITY_PORT</span>
+            </div>
+            <div class="field-input-row">
+              <input type="number" id="input-reality" placeholder="留空不启用">
+              <button type="button" class="btn-mini btn-proto-rand" data-key="reality">生成</button>
+            </div>
+          </div>
+
           <div class="proto-card" style="grid-column:span 2;">
             <div class="proto-card-header" style="margin-bottom:8px;">
               <span class="proto-name">Reality 伪装域名</span>
               <span class="proto-var">REALITY_DOMAIN</span>
             </div>
-            <input type="text" id="field-reality-domain" placeholder="默认 www.iij.ad.jp">
+            <div class="field-input-row">
+              <input type="text" id="field-reality-domain" placeholder="默认 www.iij.ad.jp">
+              <button type="button" class="btn-mini" id="gen-reality-domain">随机</button>
+            </div>
           </div>
 
         </div>
@@ -291,11 +327,15 @@
 <script>
 (function(){
   const SCRIPT_URL = 'https://raw.githubusercontent.com/zaofengyue/singbox/main/install.sh';
+  const REALITY_DOMAIN_POOL = [
+    'addons.mozilla.org','azure.microsoft.com','aws.amazon.com',
+    'apps.apple.com','ftp.jaist.ac.jp','www.visa.com'
+  ];
 
   const state = {
     uuid:'', port:'', name:'', sub:'',
     argoPort:'', argoDomain:'', argoAuth:'', disableArgo:false,
-    hy2:'', tuic:'', reality:'', realityDomain:'', ss:'',
+    hy2:'', tuic:'', ss:'', trojan:'', anytls:'', s5:'', reality:'', realityDomain:'',
     cmdType:'curl'
   };
 
@@ -317,9 +357,12 @@
     if(state.disableArgo)   p.push(['DISABLE_ARGO',   'true',             false]);
     if(state.hy2)           p.push(['HY2_PORT',       state.hy2,          false]);
     if(state.tuic)          p.push(['TUIC_PORT',      state.tuic,         false]);
+    if(state.ss)            p.push(['SS_PORT',        state.ss,           false]);
+    if(state.trojan)        p.push(['TROJAN_PORT',    state.trojan,       false]);
+    if(state.anytls)        p.push(['ANYTLS_PORT',    state.anytls,       false]);
+    if(state.s5)            p.push(['SOCKS5_PORT',    state.s5,           false]);
     if(state.reality)       p.push(['REALITY_PORT',   state.reality,      false]);
     if(state.realityDomain) p.push(['REALITY_DOMAIN', state.realityDomain,false]);
-    if(state.ss)            p.push(['SS_PORT',        state.ss,           false]);
     return p;
   }
 
@@ -360,7 +403,7 @@
       (html ? html + ' ' : '') + fetcherHtml();
   }
 
-  const protoKeys = ['hy2','tuic','reality','ss'];
+  const protoKeys = ['hy2','tuic','ss','trojan','anytls','s5','reality'];
   function updateProtoCard(key){
     document.getElementById('card-'+key).classList.toggle('active', !!state[key]);
   }
@@ -388,6 +431,17 @@
   document.getElementById('gen-argo-port').addEventListener('click', () => {
     const p = randPort(); document.getElementById('field-argo-port').value = p; state.argoPort = p; render();
   });
+  document.getElementById('gen-reality-domain').addEventListener('click', () => {
+    let pool = REALITY_DOMAIN_POOL;
+    if(state.realityDomain){
+      const filtered = pool.filter(d => d !== state.realityDomain);
+      if(filtered.length) pool = filtered;
+    }
+    const d = pool[Math.floor(Math.random() * pool.length)];
+    document.getElementById('field-reality-domain').value = d;
+    state.realityDomain = d; render();
+  });
+
   document.getElementById('gen-uuid').addEventListener('click', () => {
     const b = new Uint8Array(16); crypto.getRandomValues(b);
     b[6]=(b[6]&0x0f)|0x40; b[8]=(b[8]&0x3f)|0x80;
