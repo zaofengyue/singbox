@@ -17,6 +17,9 @@ TUIC_PORT="${TUIC_PORT:-}"
 REALITY_PORT="${REALITY_PORT:-}"
 REALITY_DOMAIN="${REALITY_DOMAIN:-www.iij.ad.jp}"
 SS_PORT="${SS_PORT:-}"
+SOCKS5_PORT="${SOCKS5_PORT:-}"
+TROJAN_PORT="${TROJAN_PORT:-}"
+ANYTLS_PORT="${ANYTLS_PORT:-}"
 # 优选地址
 CF_PREFER_HOST="${CF_PREFER_HOST:-cdns.doon.eu.org}"
 WS_PATH="${WS_PATH:-/fengyue}"
@@ -226,7 +229,7 @@ download_singbox() {
   log "正在获取 sing-box 最新版本..."
   SB_VER="$(http_get 'https://api.github.com/repos/SagerNet/sing-box/releases/latest' \
     | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
-  SB_VER="${SB_VER:-v1.11.6}"
+  SB_VER="${SB_VER:-v1.12.0}"
   SB_VER_NUM="${SB_VER#v}"
   log "下载 sing-box ${SB_VER} (${SB_ARCH})..."
   dl "https://github.com/SagerNet/sing-box/releases/download/${SB_VER}/sing-box-${SB_VER_NUM}-linux-${SB_ARCH}.tar.gz" \
@@ -285,7 +288,7 @@ NAME_ENCODED="$(url_encode "$NAME")"
 
 # ── 公网 IP ───────────────────────────────────────────────────────────────────
 PUBLIC_IP=""
-if [ -n "$HY2_PORT" ] || [ -n "$TUIC_PORT" ] || [ -n "$REALITY_PORT" ] || [ -n "$SS_PORT" ]; then
+if [ -n "$HY2_PORT" ] || [ -n "$TUIC_PORT" ] || [ -n "$REALITY_PORT" ] || [ -n "$SS_PORT" ] || [ -n "$SOCKS5_PORT" ] || [ -n "$TROJAN_PORT" ] || [ -n "$ANYTLS_PORT" ]; then
   PUBLIC_IP="$(http_get 'https://ipinfo.io/ip' | tr -d '[:space:]')"
   [ -z "$PUBLIC_IP" ] && PUBLIC_IP="$(http_get 'https://ifconfig.co/ip' | tr -d '[:space:]')"
   # IPv4 获取失败（纯 IPv6 服务器），尝试 IPv6 接口
@@ -298,7 +301,7 @@ fi
 # ── 自签证书（HY2 / TUIC 用）─────────────────────────────────────────────────
 CERT_PATH=""
 KEY_PATH=""
-if [ -n "$HY2_PORT" ] || [ -n "$TUIC_PORT" ]; then
+if [ -n "$HY2_PORT" ] || [ -n "$TUIC_PORT" ] || [ -n "$TROJAN_PORT" ] || [ -n "$ANYTLS_PORT" ]; then
   mkdir -p "$CERT_DIR"
   CERT_PATH="$CERT_DIR/cert.pem"
   KEY_PATH="$CERT_DIR/key.pem"
@@ -364,7 +367,6 @@ CUSTOM_OUT_ADDR=""
 CUSTOM_OUT_PORT=""
 CUSTOM_OUT_USER=""
 CUSTOM_OUT_PASS=""
-ROUTE_RULE_JSON=""
 EXTRA_OUTBOUND_JSON=""
 
 if [ -f "$OUTBOUND_FILE" ]; then
@@ -375,7 +377,6 @@ if [ -f "$OUTBOUND_FILE" ]; then
   CUSTOM_OUT_PASS="$(grep '^PASS=' "$OUTBOUND_FILE" | sed 's/^PASS=//')"
 fi
 
-CUSTOM_OUT_ENABLED=0
 if [ "$CUSTOM_OUT_TYPE" = "socks" ] || [ "$CUSTOM_OUT_TYPE" = "http" ]; then
   if [ -n "$CUSTOM_OUT_ADDR" ] && [ -n "$CUSTOM_OUT_PORT" ]; then
     log "检测到自定义出口配置: ${CUSTOM_OUT_TYPE}://${CUSTOM_OUT_ADDR}:${CUSTOM_OUT_PORT}"
@@ -398,14 +399,13 @@ if [ "$CUSTOM_OUT_TYPE" = "socks" ] || [ "$CUSTOM_OUT_TYPE" = "http" ]; then
       \"server_port\": ${CUSTOM_OUT_PORT}
     }"
     fi
-    CUSTOM_OUT_ENABLED=1
   else
     warn "outbound.conf 配置不完整，自定义出口已跳过"
   fi
 fi
 
 # ── 端口合法性检查 ────────────────────────────────────────────────────────────
-HY2_ACTIVE=0; TUIC_ACTIVE=0; REALITY_ACTIVE=0; SS_ACTIVE=0
+HY2_ACTIVE=0; TUIC_ACTIVE=0; REALITY_ACTIVE=0; SS_ACTIVE=0; SOCKS5_ACTIVE=0; TROJAN_ACTIVE=0; ANYTLS_ACTIVE=0
 
 if [ -n "$HY2_PORT" ]; then
   if port_ok "$HY2_PORT"; then HY2_ACTIVE=1;
@@ -422,6 +422,18 @@ fi
 if [ -n "$SS_PORT" ] && [ -n "$SS_PASS" ]; then
   if port_ok "$SS_PORT"; then SS_ACTIVE=1;
   else warn "SS_PORT(${SS_PORT}) 无效或冲突，Shadowsocks 已跳过"; fi
+fi
+if [ -n "$SOCKS5_PORT" ]; then
+  if port_ok "$SOCKS5_PORT"; then SOCKS5_ACTIVE=1;
+  else warn "SOCKS5_PORT(${SOCKS5_PORT}) 无效或冲突，SOCKS5 已跳过"; fi
+fi
+if [ -n "$TROJAN_PORT" ]; then
+  if port_ok "$TROJAN_PORT"; then TROJAN_ACTIVE=1;
+  else warn "TROJAN_PORT(${TROJAN_PORT}) 无效或冲突，Trojan 已跳过"; fi
+fi
+if [ -n "$ANYTLS_PORT" ]; then
+  if port_ok "$ANYTLS_PORT"; then ANYTLS_ACTIVE=1;
+  else warn "ANYTLS_PORT(${ANYTLS_PORT}) 无效或冲突，AnyTLS 已跳过"; fi
 fi
 
 # ── 生成 sing-box 配置 ────────────────────────────────────────────────────────
@@ -514,33 +526,60 @@ if [ "$SS_ACTIVE" = "1" ]; then
       \"method\": \"2022-blake3-aes-128-gcm\",
       \"password\": \"${SS_PASS}\"
     }"
+  _sep=","
 fi
 
-ROUTE_RULE_JSON=""
-if [ "$CUSTOM_OUT_ENABLED" = "1" ]; then
-  _route_inbounds=""
-  _route_sep=""
-  [ "${DISABLE_ARGO:-}" != "true" ] && _route_inbounds="${_route_inbounds}${_route_sep}\"vmess-in\"" && _route_sep=","
-  [ "$HY2_ACTIVE" = "1" ]     && _route_inbounds="${_route_inbounds}${_route_sep}\"hy2-in\"" && _route_sep=","
-  [ "$TUIC_ACTIVE" = "1" ]    && _route_inbounds="${_route_inbounds}${_route_sep}\"tuic-in\"" && _route_sep=","
-  [ "$REALITY_ACTIVE" = "1" ] && _route_inbounds="${_route_inbounds}${_route_sep}\"reality-in\"" && _route_sep=","
-  [ "$SS_ACTIVE" = "1" ]      && _route_inbounds="${_route_inbounds}${_route_sep}\"ss-in\"" && _route_sep=","
+if [ "$SOCKS5_ACTIVE" = "1" ]; then
+  _inbounds="${_inbounds}${_sep}
+    {
+      \"type\": \"socks\",
+      \"tag\": \"socks5-in\",
+      \"listen\": \"::\",
+      \"listen_port\": ${SOCKS5_PORT},
+      \"users\": [{ \"username\": \"singbox\", \"password\": \"${UUID}\" }]
+    }"
+  _sep=","
+fi
 
-  if [ -n "$_route_inbounds" ]; then
-    ROUTE_RULE_JSON=",
-  \"route\": {
-    \"rules\": [
-      {
-        \"inbound\": [${_route_inbounds}],
-        \"outbound\": \"custom-out\"
+if [ "$TROJAN_ACTIVE" = "1" ]; then
+  _inbounds="${_inbounds}${_sep}
+    {
+      \"type\": \"trojan\",
+      \"tag\": \"trojan-in\",
+      \"listen\": \"::\",
+      \"listen_port\": ${TROJAN_PORT},
+      \"users\": [{ \"password\": \"${UUID}\" }],
+      \"tls\": {
+        \"enabled\": true,
+        \"certificate_path\": \"${CERT_PATH}\",
+        \"key_path\": \"${KEY_PATH}\"
       }
-    ]
-  }"
-  fi
+    }"
+  _sep=","
 fi
+
+if [ "$ANYTLS_ACTIVE" = "1" ]; then
+  _inbounds="${_inbounds}${_sep}
+    {
+      \"type\": \"anytls\",
+      \"tag\": \"anytls-in\",
+      \"listen\": \"::\",
+      \"listen_port\": ${ANYTLS_PORT},
+      \"users\": [{ \"password\": \"${UUID}\" }],
+      \"tls\": {
+        \"enabled\": true,
+        \"certificate_path\": \"${CERT_PATH}\",
+        \"key_path\": \"${KEY_PATH}\"
+      }
+    }"
+fi
+
+ROUTE_JSON=""
+[ -n "$EXTRA_OUTBOUND_JSON" ] && ROUTE_JSON=',
+  "route": { "final": "custom-out" }'
 
 printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct" }%s]%s\n}\n' \
-  "$_inbounds" "$EXTRA_OUTBOUND_JSON" "$ROUTE_RULE_JSON" > "$CONFIG_FILE"
+  "$_inbounds" "$EXTRA_OUTBOUND_JSON" "$ROUTE_JSON" > "$CONFIG_FILE"
 
 # 校验配置
 if ! "$SB_BIN" check -c "$CONFIG_FILE" 2>/dev/null; then
@@ -635,6 +674,24 @@ if [ "$SS_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
 }${_link}"
 fi
 
+if [ "$SOCKS5_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+  _link="socks5://singbox:${UUID}@$(format_addr "$PUBLIC_IP"):${SOCKS5_PORT}#${NAME_ENCODED}"
+  ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
+}${_link}"
+fi
+
+if [ "$TROJAN_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+  _link="trojan://${UUID}@$(format_addr "$PUBLIC_IP"):${TROJAN_PORT}?security=tls&sni=bing.com&allowInsecure=1&fp=firefox#${NAME_ENCODED}"
+  ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
+}${_link}"
+fi
+
+if [ "$ANYTLS_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+  _link="anytls://${UUID}@$(format_addr "$PUBLIC_IP"):${ANYTLS_PORT}?sni=bing.com&insecure=1#${NAME_ENCODED}"
+  ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
+}${_link}"
+fi
+
 SUB_BASE64="$(b64 "$ALL_LINKS")"
 echo "$SUB_BASE64" > "$SUB_FILE"
 
@@ -650,6 +707,9 @@ log "============== 已启用协议 =============="
 [ "$TUIC_ACTIVE"    = "1" ] && log "✓ TUIC v5       端口 $TUIC_PORT (UDP)"
 [ "$REALITY_ACTIVE" = "1" ] && log "✓ VLESS Reality 端口 $REALITY_PORT  PubKey: $REALITY_PUB"
 [ "$SS_ACTIVE"      = "1" ] && log "✓ Shadowsocks   端口 $SS_PORT (TCP)"
+[ "$SOCKS5_ACTIVE"  = "1" ] && log "✓ SOCKS5        端口 $SOCKS5_PORT (TCP/UDP)  用户: singbox"
+[ "$TROJAN_ACTIVE"  = "1" ] && log "✓ Trojan        端口 $TROJAN_PORT (TCP)"
+[ "$ANYTLS_ACTIVE"  = "1" ] && log "✓ AnyTLS        端口 $ANYTLS_PORT (TCP)"
 [ -n "$EXTRA_OUTBOUND_JSON" ] && log "✓ 自定义出口    ${CUSTOM_OUT_TYPE}://${CUSTOM_OUT_ADDR}:${CUSTOM_OUT_PORT}"
 log "========================================"
 

@@ -38,12 +38,16 @@ INPUT_TUIC_PORT="${TUIC_PORT:-}"
 INPUT_REALITY_PORT="${REALITY_PORT:-}"
 INPUT_REALITY_DOMAIN="${REALITY_DOMAIN:-}"
 INPUT_SS_PORT="${SS_PORT:-}"
+INPUT_SOCKS5_PORT="${SOCKS5_PORT:-}"
+INPUT_TROJAN_PORT="${TROJAN_PORT:-}"
+INPUT_ANYTLS_PORT="${ANYTLS_PORT:-}"
 
 HAS_ENV=false
 for v in "$INPUT_UUID" "$INPUT_PORT" "$INPUT_ARGO_PORT" "$INPUT_NAME" \
           "$INPUT_ARGO_DOMAIN" "$INPUT_ARGO_AUTH" "$INPUT_DISABLE_ARGO" \
           "$INPUT_HY2_PORT" "$INPUT_TUIC_PORT" "$INPUT_REALITY_PORT" \
-          "$INPUT_REALITY_DOMAIN" "$INPUT_SS_PORT"; do
+          "$INPUT_REALITY_DOMAIN" "$INPUT_SS_PORT" "$INPUT_SOCKS5_PORT" \
+          "$INPUT_TROJAN_PORT" "$INPUT_ANYTLS_PORT"; do
   [ -n "$v" ] && HAS_ENV=true && break
 done
 
@@ -72,6 +76,9 @@ if ! $HAS_ENV; then
   echo -e "  ${GREEN}b${NC}. TUIC v5      (UDP)"
   echo -e "  ${GREEN}c${NC}. VLESS Reality(TCP)"
   echo -e "  ${GREEN}d${NC}. Shadowsocks  (TCP)"
+  echo -e "  ${GREEN}e${NC}. SOCKS5       (TCP/UDP)"
+  echo -e "  ${GREEN}f${NC}. Trojan       (TCP)"
+  echo -e "  ${GREEN}g${NC}. AnyTLS       (TCP)"
   read -p "选择协议（如 ac 表示启用 a 和 c，留空跳过）: " _PROTO_CHOICE
 
   if echo "$_PROTO_CHOICE" | grep -qi "a"; then
@@ -94,6 +101,21 @@ if ! $HAS_ENV; then
   if echo "$_PROTO_CHOICE" | grep -qi "d"; then
     read -p "SS_PORT/Shadowsocks 端口(TCP): " INPUT_SS_PORT
     INPUT_SS_PORT="$(echo "$INPUT_SS_PORT" | tr -d '[:space:]')"
+  fi
+
+  if echo "$_PROTO_CHOICE" | grep -qi "e"; then
+    read -p "SOCKS5_PORT/SOCKS5 端口(TCP/UDP): " INPUT_SOCKS5_PORT
+    INPUT_SOCKS5_PORT="$(echo "$INPUT_SOCKS5_PORT" | tr -d '[:space:]')"
+  fi
+
+  if echo "$_PROTO_CHOICE" | grep -qi "f"; then
+    read -p "TROJAN_PORT/Trojan 端口(TCP): " INPUT_TROJAN_PORT
+    INPUT_TROJAN_PORT="$(echo "$INPUT_TROJAN_PORT" | tr -d '[:space:]')"
+  fi
+
+  if echo "$_PROTO_CHOICE" | grep -qi "g"; then
+    read -p "ANYTLS_PORT/AnyTLS 端口(TCP): " INPUT_ANYTLS_PORT
+    INPUT_ANYTLS_PORT="$(echo "$INPUT_ANYTLS_PORT" | tr -d '[:space:]')"
   fi
 fi
 
@@ -213,11 +235,14 @@ menu_sub() {
   echo -e "${GRAY}已启用协议:${RESET}"
   echo "$decoded" | while IFS= read -r line; do
     case "$line" in
-      vmess://*)     echo -e "${GREEN}  ✓ VMess + WS + Argo TLS${RESET}" ;;
+      vmess://*)      echo -e "${GREEN}  ✓ VMess + WS + Argo TLS${RESET}" ;;
       hysteria2://*)  echo -e "${GREEN}  ✓ Hysteria2${RESET}" ;;
       tuic://*)       echo -e "${GREEN}  ✓ TUIC v5${RESET}" ;;
       vless://*)      echo -e "${GREEN}  ✓ VLESS Reality${RESET}" ;;
       ss://*)         echo -e "${GREEN}  ✓ Shadowsocks${RESET}" ;;
+      socks5://*)     echo -e "${GREEN}  ✓ SOCKS5${RESET}" ;;
+      trojan://*)     echo -e "${GREEN}  ✓ Trojan${RESET}" ;;
+      anytls://*)     echo -e "${GREEN}  ✓ AnyTLS${RESET}" ;;
     esac
   done
 
@@ -389,12 +414,15 @@ config_proto() {
   while true; do
     clear
     echo -e "${GREEN}======= 可选协议端口 =======${RESET}"
-    local hy2 tuic reality reality_domain ss
+    local hy2 tuic reality reality_domain ss socks5 trojan anytls
     hy2=$(get_val HY2_PORT)
     tuic=$(get_val TUIC_PORT)
     reality=$(get_val REALITY_PORT)
     reality_domain=$(get_val REALITY_DOMAIN)
     ss=$(get_val SS_PORT)
+    socks5=$(get_val SOCKS5_PORT)
+    trojan=$(get_val TROJAN_PORT)
+    anytls=$(get_val ANYTLS_PORT)
 
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -e "${WHITE}1. Hysteria2    (UDP) [${CYAN}${hy2:-未启用}${WHITE}]${RESET}"
@@ -402,6 +430,9 @@ config_proto() {
     echo -e "${WHITE}3. VLESS Reality(TCP) [${CYAN}${reality:-未启用}${WHITE}]${RESET}"
     echo -e "${WHITE}4. Reality 伪装域名   [${CYAN}${reality_domain:-www.iij.ad.jp}${WHITE}]${RESET}"
     echo -e "${WHITE}5. Shadowsocks  (TCP) [${CYAN}${ss:-未启用}${WHITE}]${RESET}"
+    echo -e "${WHITE}6. SOCKS5  (TCP/UDP)  [${CYAN}${socks5:-未启用}${WHITE}]${RESET}"
+    echo -e "${WHITE}7. Trojan       (TCP) [${CYAN}${trojan:-未启用}${WHITE}]${RESET}"
+    echo -e "${WHITE}8. AnyTLS       (TCP) [${CYAN}${anytls:-未启用}${WHITE}]${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -e "${WHITE}0. 确认并重启${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
@@ -438,7 +469,10 @@ config_proto() {
         fi
         sleep 1
         ;;
-      5) _set_port SS_PORT "$ss" "Shadowsocks" ;;
+      5) _set_port SS_PORT     "$ss"     "Shadowsocks" ;;
+      6) _set_port SOCKS5_PORT "$socks5" "SOCKS5" ;;
+      7) _set_port TROJAN_PORT "$trojan" "Trojan" ;;
+      8) _set_port ANYTLS_PORT "$anytls" "AnyTLS" ;;
       0)
         echo -ne "${GRAY}确认修改并重启? [y/N]: ${RESET}"
         read -r confirm
@@ -719,6 +753,9 @@ CUR_TUIC_PORT=$(get_val TUIC_PORT)
 CUR_REALITY_PORT=$(get_val REALITY_PORT)
 CUR_REALITY_DOMAIN=$(get_val REALITY_DOMAIN)
 CUR_SS_PORT=$(get_val SS_PORT)
+CUR_SOCKS5_PORT=$(get_val SOCKS5_PORT)
+CUR_TROJAN_PORT=$(get_val TROJAN_PORT)
+CUR_ANYTLS_PORT=$(get_val ANYTLS_PORT)
 
 echo -e "${GREEN}========== singbox 配置修改 ==========${NC}"
 echo -e "${YELLOW}直接回车保留当前值，输入新值后回车修改${NC}"
@@ -738,6 +775,9 @@ read -p "TUIC_PORT    [${CUR_TUIC_PORT:-未启用}]: "       IN_TUIC_PORT
 read -p "REALITY_PORT [${CUR_REALITY_PORT:-未启用}]: "    IN_REALITY_PORT
 read -p "REALITY_DOMAIN [${CUR_REALITY_DOMAIN:-www.iij.ad.jp}]: " IN_REALITY_DOMAIN
 read -p "SS_PORT      [${CUR_SS_PORT:-未启用}]: "         IN_SS_PORT
+read -p "SOCKS5_PORT  [${CUR_SOCKS5_PORT:-未启用}]: "     IN_SOCKS5_PORT
+read -p "TROJAN_PORT  [${CUR_TROJAN_PORT:-未启用}]: "     IN_TROJAN_PORT
+read -p "ANYTLS_PORT  [${CUR_ANYTLS_PORT:-未启用}]: "     IN_ANYTLS_PORT
 
 # 空格输入视为清空，直接回车保留原值
 trim() { echo "$1" | tr -d '[:space:]'; }
@@ -752,6 +792,9 @@ NEW_TUIC_PORT=$([ -n "$IN_TUIC_PORT" ] && trim "$IN_TUIC_PORT" || echo "$CUR_TUI
 NEW_REALITY_PORT=$([ -n "$IN_REALITY_PORT" ] && trim "$IN_REALITY_PORT" || echo "$CUR_REALITY_PORT")
 NEW_REALITY_DOMAIN=$([ -n "$(trim "$IN_REALITY_DOMAIN")" ] && trim "$IN_REALITY_DOMAIN" || echo "$CUR_REALITY_DOMAIN")
 NEW_SS_PORT=$([ -n "$IN_SS_PORT" ] && trim "$IN_SS_PORT" || echo "$CUR_SS_PORT")
+NEW_SOCKS5_PORT=$([ -n "$IN_SOCKS5_PORT" ] && trim "$IN_SOCKS5_PORT" || echo "$CUR_SOCKS5_PORT")
+NEW_TROJAN_PORT=$([ -n "$IN_TROJAN_PORT" ] && trim "$IN_TROJAN_PORT" || echo "$CUR_TROJAN_PORT")
+NEW_ANYTLS_PORT=$([ -n "$IN_ANYTLS_PORT" ] && trim "$IN_ANYTLS_PORT" || echo "$CUR_ANYTLS_PORT")
 
 cat > "$WRAPPER" << WRAPEOF
 #!/bin/bash
@@ -766,6 +809,9 @@ export TUIC_PORT="$NEW_TUIC_PORT"
 export REALITY_PORT="$NEW_REALITY_PORT"
 export REALITY_DOMAIN="$NEW_REALITY_DOMAIN"
 export SS_PORT="$NEW_SS_PORT"
+export SOCKS5_PORT="$NEW_SOCKS5_PORT"
+export TROJAN_PORT="$NEW_TROJAN_PORT"
+export ANYTLS_PORT="$NEW_ANYTLS_PORT"
 cd "$APP_DIR"
 nohup bash "$APP_DIR/singbox.sh" >> "$APP_DIR/run.log" 2>&1 &
 echo \$! > "$APP_DIR/singbox.pid"
@@ -785,6 +831,9 @@ if [ -f "$SVCFILE" ]; then
   sed -i "s|^Environment=REALITY_PORT=.*|Environment=REALITY_PORT=$NEW_REALITY_PORT|" "$SVCFILE"
   sed -i "s|^Environment=REALITY_DOMAIN=.*|Environment=REALITY_DOMAIN=$NEW_REALITY_DOMAIN|" "$SVCFILE"
   sed -i "s|^Environment=SS_PORT=.*|Environment=SS_PORT=$NEW_SS_PORT|" "$SVCFILE"
+  sed -i "s|^Environment=SOCKS5_PORT=.*|Environment=SOCKS5_PORT=$NEW_SOCKS5_PORT|" "$SVCFILE"
+  sed -i "s|^Environment=TROJAN_PORT=.*|Environment=TROJAN_PORT=$NEW_TROJAN_PORT|" "$SVCFILE"
+  sed -i "s|^Environment=ANYTLS_PORT=.*|Environment=ANYTLS_PORT=$NEW_ANYTLS_PORT|" "$SVCFILE"
   systemctl --user daemon-reload
   systemctl --user restart singbox
   echo -e "${GREEN}配置已更新，systemd 服务已重启${NC}"
@@ -825,6 +874,9 @@ export TUIC_PORT="$INPUT_TUIC_PORT"
 export REALITY_PORT="$INPUT_REALITY_PORT"
 export REALITY_DOMAIN="$INPUT_REALITY_DOMAIN"
 export SS_PORT="$INPUT_SS_PORT"
+export SOCKS5_PORT="$INPUT_SOCKS5_PORT"
+export TROJAN_PORT="$INPUT_TROJAN_PORT"
+export ANYTLS_PORT="$INPUT_ANYTLS_PORT"
 cd "$APP_DIR"
 nohup bash "$APP_DIR/singbox.sh" >> "$APP_DIR/run.log" 2>&1 &
 echo \$! > "$APP_DIR/singbox.pid"
@@ -859,6 +911,9 @@ Environment=TUIC_PORT=$INPUT_TUIC_PORT
 Environment=REALITY_PORT=$INPUT_REALITY_PORT
 Environment=REALITY_DOMAIN=$INPUT_REALITY_DOMAIN
 Environment=SS_PORT=$INPUT_SS_PORT
+Environment=SOCKS5_PORT=$INPUT_SOCKS5_PORT
+Environment=TROJAN_PORT=$INPUT_TROJAN_PORT
+Environment=ANYTLS_PORT=$INPUT_ANYTLS_PORT
 ExecStart=/bin/bash $APP_DIR/singbox.sh
 Restart=always
 RestartSec=10
