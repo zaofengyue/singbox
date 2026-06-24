@@ -1,6 +1,6 @@
 # singbox
 
-基于 sing-box + Cloudflare Argo 隧道的轻量代理工具，支持 VMess、Hysteria2、TUIC、VLESS Reality、Shadowsocks 协议。
+基于 sing-box + Cloudflare Argo 隧道的轻量代理工具，支持 VMess、Hysteria2、TUIC、VLESS Reality、Trojan、Shadowsocks、Socks5、Anytls 协议。
 
 ## 部署方式
 
