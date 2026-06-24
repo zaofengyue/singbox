@@ -212,7 +212,7 @@ async function downloadSingBox() {
 
   // 兜底版本必须 >= 1.12.0，否则 AnyTLS 协议类型无法被识别，
   // sing-box 会在配置校验阶段整体拒绝启动（影响全部协议，不仅是AnyTLS）
-  let version = 'v1.13.13';
+  let version = 'v1.12.0';
   try {
     const data = await httpGet('https://api.github.com/repos/SagerNet/sing-box/releases');
     if (data) {
