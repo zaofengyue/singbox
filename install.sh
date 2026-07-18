@@ -930,9 +930,9 @@ SVCEOF
   systemctl --user enable singbox
   systemctl --user start singbox
   loginctl enable-linger "$USER" 2>/dev/null || true
-  # cron @reboot 双保险，延迟 20 秒等网络就绪
-  (crontab -l 2>/dev/null | grep -v "singbox autostart"; \
-   echo "@reboot sleep 20 && bash $WRAPPER >/dev/null 2>&1") | crontab -
+  # 有 systemd 就只用 systemd 自启，不再叠加 cron @reboot（否则重启后会启动两份进程）。
+  # 顺便清掉旧版本安装脚本可能残留的 cron 条目。
+  (crontab -l 2>/dev/null | grep -v "singbox autostart") | crontab - 2>/dev/null || true
   echo ""
   echo -e "${GREEN}服务已通过用户级 systemd 启动并设置开机自启${NC}"
 else

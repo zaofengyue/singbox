@@ -437,12 +437,37 @@ if [ -n "$ANYTLS_PORT" ]; then
 fi
 
 # ── 生成 sing-box 配置 ────────────────────────────────────────────────────────
-# 用 printf 拼接，避免 heredoc 变量展开歧义；最后用 sing-box check 校验
+# 逐协议增量校验：每加入一个 inbound 就用 sing-box check 单独验证一次，
+# 校验失败只跳过该协议（并关闭其 _ACTIVE 标记，保证后续订阅/日志展示一致），
+# 不再因为某一个协议不兼容当前 sing-box 版本就让整个脚本直接退出。
 _inbounds=""
+_sep=""
+
+# $1=协议标签(用于日志)  $2=该协议的 inbound JSON 片段（不带前导逗号）
+try_add_inbound() {
+  _label="$1"
+  _snippet="$2"
+  _trial="${_inbounds}${_sep}
+    ${_snippet}"
+  _tc="/tmp/sb-trycfg-$$.json"
+  _tl="/tmp/sb-trylog-$$.log"
+  printf '{\n  "log": { "level": "warn" },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct" }]\n}\n' "$_trial" > "$_tc"
+  if "$SB_BIN" check -c "$_tc" >"$_tl" 2>&1; then
+    _inbounds="$_trial"
+    _sep=","
+    rm -f "$_tc" "$_tl"
+    return 0
+  else
+    warn "${_label} 配置校验未通过，已跳过该协议（不影响其他协议启动）:"
+    sed 's/^/    /' "$_tl" 2>/dev/null
+    rm -f "$_tc" "$_tl"
+    return 1
+  fi
+}
 
 # Argo VMess inbound
 if [ "${DISABLE_ARGO:-}" != "true" ]; then
-  _inbounds="$(printf '%s' "$_inbounds"){
+  _vmess_json="{
       \"type\": \"vmess\",
       \"tag\": \"vmess-in\",
       \"listen\": \"127.0.0.1\",
@@ -450,14 +475,14 @@ if [ "${DISABLE_ARGO:-}" != "true" ]; then
       \"users\": [{ \"uuid\": \"${UUID}\", \"alterId\": 0 }],
       \"transport\": { \"type\": \"ws\", \"path\": \"${WS_PATH}\" }
     }"
-  _sep=","
-else
-  _sep=""
+  if ! try_add_inbound "VMess/Argo" "$_vmess_json"; then
+    warn "VMess 基础入口校验失败，Argo 隧道本次将不启动"
+    DISABLE_ARGO="true"
+  fi
 fi
 
 if [ "$HY2_ACTIVE" = "1" ]; then
-  _inbounds="${_inbounds}${_sep}
-    {
+  _hy2_json="{
       \"type\": \"hysteria2\",
       \"tag\": \"hy2-in\",
       \"listen\": \"::\",
@@ -471,12 +496,11 @@ if [ "$HY2_ACTIVE" = "1" ]; then
         \"key_path\": \"${KEY_PATH}\"
       }
     }"
-  _sep=","
+  try_add_inbound "Hysteria2" "$_hy2_json" || HY2_ACTIVE=0
 fi
 
 if [ "$TUIC_ACTIVE" = "1" ]; then
-  _inbounds="${_inbounds}${_sep}
-    {
+  _tuic_json="{
       \"type\": \"tuic\",
       \"tag\": \"tuic-in\",
       \"listen\": \"::\",
@@ -490,12 +514,11 @@ if [ "$TUIC_ACTIVE" = "1" ]; then
         \"key_path\": \"${KEY_PATH}\"
       }
     }"
-  _sep=","
+  try_add_inbound "TUIC" "$_tuic_json" || TUIC_ACTIVE=0
 fi
 
 if [ "$REALITY_ACTIVE" = "1" ]; then
-  _inbounds="${_inbounds}${_sep}
-    {
+  _reality_json="{
       \"type\": \"vless\",
       \"tag\": \"reality-in\",
       \"listen\": \"::\",
@@ -512,12 +535,11 @@ if [ "$REALITY_ACTIVE" = "1" ]; then
         }
       }
     }"
-  _sep=","
+  try_add_inbound "VLESS Reality" "$_reality_json" || REALITY_ACTIVE=0
 fi
 
 if [ "$SS_ACTIVE" = "1" ]; then
-  _inbounds="${_inbounds}${_sep}
-    {
+  _ss_json="{
       \"type\": \"shadowsocks\",
       \"tag\": \"ss-in\",
       \"listen\": \"::\",
@@ -526,24 +548,22 @@ if [ "$SS_ACTIVE" = "1" ]; then
       \"method\": \"2022-blake3-aes-128-gcm\",
       \"password\": \"${SS_PASS}\"
     }"
-  _sep=","
+  try_add_inbound "Shadowsocks" "$_ss_json" || SS_ACTIVE=0
 fi
 
 if [ "$SOCKS5_ACTIVE" = "1" ]; then
-  _inbounds="${_inbounds}${_sep}
-    {
+  _socks5_json="{
       \"type\": \"socks\",
       \"tag\": \"socks5-in\",
       \"listen\": \"::\",
       \"listen_port\": ${SOCKS5_PORT},
       \"users\": [{ \"username\": \"singbox\", \"password\": \"${UUID}\" }]
     }"
-  _sep=","
+  try_add_inbound "SOCKS5" "$_socks5_json" || SOCKS5_ACTIVE=0
 fi
 
 if [ "$TROJAN_ACTIVE" = "1" ]; then
-  _inbounds="${_inbounds}${_sep}
-    {
+  _trojan_json="{
       \"type\": \"trojan\",
       \"tag\": \"trojan-in\",
       \"listen\": \"::\",
@@ -555,12 +575,11 @@ if [ "$TROJAN_ACTIVE" = "1" ]; then
         \"key_path\": \"${KEY_PATH}\"
       }
     }"
-  _sep=","
+  try_add_inbound "Trojan" "$_trojan_json" || TROJAN_ACTIVE=0
 fi
 
 if [ "$ANYTLS_ACTIVE" = "1" ]; then
-  _inbounds="${_inbounds}${_sep}
-    {
+  _anytls_json="{
       \"type\": \"anytls\",
       \"tag\": \"anytls-in\",
       \"listen\": \"::\",
@@ -572,6 +591,11 @@ if [ "$ANYTLS_ACTIVE" = "1" ]; then
         \"key_path\": \"${KEY_PATH}\"
       }
     }"
+  try_add_inbound "AnyTLS" "$_anytls_json" || ANYTLS_ACTIVE=0
+fi
+
+if [ -z "$_inbounds" ]; then
+  die "所有协议均校验失败，没有任何可用入口，终止启动（请检查 sing-box 版本是否过旧）"
 fi
 
 ROUTE_JSON=""
@@ -581,12 +605,30 @@ ROUTE_JSON=""
 printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct" }%s]%s\n}\n' \
   "$_inbounds" "$EXTRA_OUTBOUND_JSON" "$ROUTE_JSON" > "$CONFIG_FILE"
 
-# 校验配置
-if ! "$SB_BIN" check -c "$CONFIG_FILE" 2>/dev/null; then
-  warn "sing-box 配置校验失败，尝试输出配置内容以供排查："
-  cat "$CONFIG_FILE"
-  die "配置无效，终止启动"
+# 最终整体校验：单个 inbound 都已验证过，这一步主要防的是出站/路由部分的问题
+# （比如自定义出口配置有误）。如果失败，先尝试去掉自定义出口再试一次，仍失败才终止。
+if ! "$SB_BIN" check -c "$CONFIG_FILE" 2>/tmp/sb-finalcheck.log; then
+  warn "整体配置校验失败，尝试去除自定义出口后重试："
+  sed 's/^/    /' /tmp/sb-finalcheck.log
+  if [ -n "$EXTRA_OUTBOUND_JSON" ]; then
+    EXTRA_OUTBOUND_JSON=""
+    ROUTE_JSON=""
+    printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct" }]\n}\n' \
+      "$_inbounds" > "$CONFIG_FILE"
+    if "$SB_BIN" check -c "$CONFIG_FILE" 2>/dev/null; then
+      warn "已回退为直连出口，自定义出口本次未生效"
+    else
+      warn "sing-box 配置校验仍然失败，尝试输出配置内容以供排查："
+      cat "$CONFIG_FILE"
+      die "配置无效，终止启动"
+    fi
+  else
+    warn "sing-box 配置校验仍然失败，尝试输出配置内容以供排查："
+    cat "$CONFIG_FILE"
+    die "配置无效，终止启动"
+  fi
 fi
+rm -f /tmp/sb-finalcheck.log
 
 # ── 启动 sing-box（守护循环）─────────────────────────────────────────────────
 start_singbox() {
@@ -606,15 +648,21 @@ start_singbox() {
 
 start_singbox || die "sing-box 首次启动失败"
 
-# ── 启动 Argo 隧道 ────────────────────────────────────────────────────────────
+# ── Argo 隧道启动/重连函数 ────────────────────────────────────────────────────
+# 临时隧道每次(重新)连接都会拿到一个新的随机 trycloudflare.com 域名，
+# 所以这个函数封装了"启动 cloudflared + 解析新域名"，并在结尾统一调用
+# generate_sub 用新域名重写订阅文件。看门狗每次重启 cloudflared 都会调用它，
+# 而不再是只在脚本启动时解析一次域名。
 ARGO_HOST=""
 CF_LOG="$HOME_DIR/cf.log"
+CF_PID=""
 
-if [ "${DISABLE_ARGO:-}" != "true" ]; then
+start_cloudflared() {
   if [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_AUTH" ]; then
     log "启动固定 Argo 隧道..."
     "$CF_BIN" tunnel --edge-ip-version auto --no-autoupdate \
       run --token "$ARGO_AUTH" >/dev/null 2>&1 &
+    CF_PID=$!
     sleep 3
     ARGO_HOST="$ARGO_DOMAIN"
   else
@@ -623,82 +671,101 @@ if [ "${DISABLE_ARGO:-}" != "true" ]; then
     "$CF_BIN" tunnel --edge-ip-version auto --no-autoupdate \
       --url "http://127.0.0.1:${ARGO_PORT}" \
       --logfile "$CF_LOG" >/dev/null 2>&1 &
+    CF_PID=$!
+    _new_host=""
     i=0
     while [ $i -lt 30 ]; do
-      ARGO_HOST="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$CF_LOG" 2>/dev/null \
+      _new_host="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$CF_LOG" 2>/dev/null \
         | head -1 | sed 's|https://||')"
-      [ -n "$ARGO_HOST" ] && break
+      [ -n "$_new_host" ] && break
       sleep 1
       i=$((i+1))
     done
+    if [ -n "$_new_host" ]; then
+      ARGO_HOST="$_new_host"
+    else
+      warn "隧道域名获取失败，沿用上一次的域名（如果有），订阅可能暂时无法使用"
+      [ -z "$ARGO_HOST" ] && ARGO_HOST="your-domain.com"
+    fi
   fi
 
-  if [ -z "$ARGO_HOST" ]; then
-    warn "隧道域名获取失败，订阅链接将使用占位符 your-domain.com"
-    ARGO_HOST="your-domain.com"
+  if [ "$ARGO_HOST" = "your-domain.com" ]; then
+    warn "隧道域名仍为占位符，订阅链接将暂时无效"
   else
     log "隧道域名: $ARGO_HOST"
   fi
-fi
 
-# ── 生成订阅链接 ──────────────────────────────────────────────────────────────
-ALL_LINKS=""
+  # 每次(重新)拿到域名后都要重写订阅文件，这是修复"重启后订阅永久失效"的关键
+  generate_sub
+}
+
+# ── 生成订阅链接（可重复调用，用于隧道重连后刷新 sub.txt）────────────────────
+generate_sub() {
+  ALL_LINKS=""
+
+  if [ "${DISABLE_ARGO:-}" != "true" ]; then
+    VMESS_JSON="{\"v\":\"2\",\"ps\":\"${NAME}\",\"add\":\"cdns.doon.eu.org\",\"port\":\"443\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${ARGO_HOST}\",\"path\":\"${WS_PATH}\",\"tls\":\"tls\",\"sni\":\"${ARGO_HOST}\"}"
+    ALL_LINKS="vmess://$(b64 "$VMESS_JSON")"
+  fi
+
+  if [ "$HY2_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+    _link="hysteria2://${UUID}@$(format_addr "$PUBLIC_IP"):${HY2_PORT}?sni=www.bing.com&insecure=1&alpn=h3&obfs=none#${NAME_ENCODED}"
+    ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
+}${_link}"
+  fi
+
+  if [ "$TUIC_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+    _link="tuic://${UUID}:${UUID}@$(format_addr "$PUBLIC_IP"):${TUIC_PORT}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${NAME_ENCODED}"
+    ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
+}${_link}"
+  fi
+
+  if [ "$REALITY_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ] && [ -n "$REALITY_PUB" ]; then
+    _link="vless://${UUID}@$(format_addr "$PUBLIC_IP"):${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=firefox&pbk=${REALITY_PUB}&type=tcp&headerType=none#${NAME_ENCODED}"
+    ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
+}${_link}"
+  fi
+
+  if [ "$SS_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+    SS_USERINFO="$(b64 "2022-blake3-aes-128-gcm:${SS_PASS}")"
+    _link="ss://${SS_USERINFO}@$(format_addr "$PUBLIC_IP"):${SS_PORT}#${NAME_ENCODED}"
+    ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
+}${_link}"
+  fi
+
+  if [ "$SOCKS5_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+    _link="socks5://singbox:${UUID}@$(format_addr "$PUBLIC_IP"):${SOCKS5_PORT}#${NAME_ENCODED}"
+    ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
+}${_link}"
+  fi
+
+  if [ "$TROJAN_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+    _link="trojan://${UUID}@$(format_addr "$PUBLIC_IP"):${TROJAN_PORT}?security=tls&sni=bing.com&allowInsecure=1&fp=firefox#${NAME_ENCODED}"
+    ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
+}${_link}"
+  fi
+
+  if [ "$ANYTLS_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+    _link="anytls://${UUID}@$(format_addr "$PUBLIC_IP"):${ANYTLS_PORT}?sni=bing.com&insecure=1#${NAME_ENCODED}"
+    ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
+}${_link}"
+  fi
+
+  SUB_BASE64="$(b64 "$ALL_LINKS")"
+  echo "$SUB_BASE64" > "$SUB_FILE"
+
+  log "================= 订阅内容 (已刷新) ================="
+  echo "$SUB_BASE64"
+  log "======================================================"
+  log "节点文件: $SUB_FILE"
+}
 
 if [ "${DISABLE_ARGO:-}" != "true" ]; then
-  VMESS_JSON="{\"v\":\"2\",\"ps\":\"${NAME}\",\"add\":\"cdns.doon.eu.org\",\"port\":\"443\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${ARGO_HOST}\",\"path\":\"${WS_PATH}\",\"tls\":\"tls\",\"sni\":\"${ARGO_HOST}\"}"
-  ALL_LINKS="vmess://$(b64 "$VMESS_JSON")"
+  start_cloudflared
+else
+  # Argo 被禁用时也要生成一次订阅（只含直连协议的节点）
+  generate_sub
 fi
-
-if [ "$HY2_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-  _link="hysteria2://${UUID}@$(format_addr "$PUBLIC_IP"):${HY2_PORT}?sni=www.bing.com&insecure=1&alpn=h3&obfs=none#${NAME_ENCODED}"
-  ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
-}${_link}"
-fi
-
-if [ "$TUIC_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-  _link="tuic://${UUID}:${UUID}@$(format_addr "$PUBLIC_IP"):${TUIC_PORT}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${NAME_ENCODED}"
-  ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
-}${_link}"
-fi
-
-if [ "$REALITY_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ] && [ -n "$REALITY_PUB" ]; then
-  _link="vless://${UUID}@$(format_addr "$PUBLIC_IP"):${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=firefox&pbk=${REALITY_PUB}&type=tcp&headerType=none#${NAME_ENCODED}"
-  ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
-}${_link}"
-fi
-
-if [ "$SS_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-  SS_USERINFO="$(b64 "2022-blake3-aes-128-gcm:${SS_PASS}")"
-  _link="ss://${SS_USERINFO}@$(format_addr "$PUBLIC_IP"):${SS_PORT}#${NAME_ENCODED}"
-  ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
-}${_link}"
-fi
-
-if [ "$SOCKS5_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-  _link="socks5://singbox:${UUID}@$(format_addr "$PUBLIC_IP"):${SOCKS5_PORT}#${NAME_ENCODED}"
-  ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
-}${_link}"
-fi
-
-if [ "$TROJAN_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-  _link="trojan://${UUID}@$(format_addr "$PUBLIC_IP"):${TROJAN_PORT}?security=tls&sni=bing.com&allowInsecure=1&fp=firefox#${NAME_ENCODED}"
-  ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
-}${_link}"
-fi
-
-if [ "$ANYTLS_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-  _link="anytls://${UUID}@$(format_addr "$PUBLIC_IP"):${ANYTLS_PORT}?sni=bing.com&insecure=1#${NAME_ENCODED}"
-  ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
-}${_link}"
-fi
-
-SUB_BASE64="$(b64 "$ALL_LINKS")"
-echo "$SUB_BASE64" > "$SUB_FILE"
-
-log "================= 订阅内容 ================="
-echo "$SUB_BASE64"
-log "============================================="
-log "节点文件: $SUB_FILE"
 
 log "============== 已启用协议 =============="
 [ "${DISABLE_ARGO:-}" != "true" ] && log "✓ VMess + WS + Argo TLS  (域名: $ARGO_HOST)"
@@ -713,27 +780,27 @@ log "============== 已启用协议 =============="
 [ -n "$EXTRA_OUTBOUND_JSON" ] && log "✓ 自定义出口    ${CUSTOM_OUT_TYPE}://${CUSTOM_OUT_ADDR}:${CUSTOM_OUT_PORT}"
 log "========================================"
 
-# ── 守护循环：sing-box 崩溃自动重启，同时清理孤儿进程 ────────────────────────
+# ── 守护循环 ──────────────────────────────────────────────────────────────────
+# sing-box 和 cloudflared 分别独立检测、独立重启，互不依赖：
+# 以前 cloudflared 崩溃只有在 sing-box 也一起崩溃时才会被顺带重拉，
+# 现在两者各自都有存活检查。cloudflared 每次重启都会重新调用
+# start_cloudflared，临时隧道的新域名会被重新解析并写回 sub.txt。
 log "进入守护模式..."
 while true; do
   if ! kill -0 $SB_PID 2>/dev/null; then
     warn "sing-box 意外退出，5 秒后重启..."
-    # 清理可能残留的 cloudflared
-    pkill -f "$CF_BIN" 2>/dev/null || true
     sleep 5
     start_singbox || { warn "重启失败，继续等待..."; sleep 10; continue; }
-    # cloudflared 如果也挂了一并重拉
-    if [ "${DISABLE_ARGO:-}" != "true" ] && ! pgrep -f "$CF_BIN" >/dev/null 2>&1; then
-      warn "cloudflared 也已退出，尝试重启..."
-      if [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_AUTH" ]; then
-        "$CF_BIN" tunnel --edge-ip-version auto --no-autoupdate \
-          run --token "$ARGO_AUTH" >/dev/null 2>&1 &
-      else
-        "$CF_BIN" tunnel --edge-ip-version auto --no-autoupdate \
-          --url "http://127.0.0.1:${ARGO_PORT}" \
-          --logfile "$CF_LOG" >/dev/null 2>&1 &
-      fi
+  fi
+
+  if [ "${DISABLE_ARGO:-}" != "true" ]; then
+    if [ -z "$CF_PID" ] || ! kill -0 "$CF_PID" 2>/dev/null; then
+      warn "cloudflared 意外退出（或未运行），5 秒后重启..."
+      pkill -f "$CF_BIN" 2>/dev/null || true
+      sleep 5
+      start_cloudflared
     fi
   fi
+
   sleep 10
 done
