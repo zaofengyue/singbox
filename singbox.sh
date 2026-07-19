@@ -26,13 +26,33 @@ WS_PATH="${WS_PATH:-/fengyue}"
 # ==============================
 
 HOME_DIR="${HOME:-/tmp}"
-UUID_FILE="$HOME_DIR/uuid.txt"
-CONFIG_FILE="$HOME_DIR/sb-config.json"
-REALITY_KEY_FILE="$HOME_DIR/reality-keys.txt"
-OUTBOUND_FILE="$HOME_DIR/outbound.conf"
-CERT_DIR="$HOME_DIR/certs"
-SUB_FILE="${HOME:-/tmp}/singbox/sub.txt"
-mkdir -p "$(dirname "$SUB_FILE")"
+APP_DIR="$HOME_DIR/singbox"
+# 所有含密钥/密码的文件集中放这一个目录下，目录本身 chmod 700，
+# 不再散落在 $HOME 根目录（uuid.txt / sb-config.json / reality-keys.txt / outbound.conf / certs 到处都是）。
+STATE_DIR="$APP_DIR/state"
+mkdir -p "$STATE_DIR" "$APP_DIR"
+chmod 700 "$STATE_DIR" 2>/dev/null || true
+
+UUID_FILE="$STATE_DIR/uuid.txt"
+CONFIG_FILE="$STATE_DIR/sb-config.json"
+REALITY_KEY_FILE="$STATE_DIR/reality-keys.txt"
+OUTBOUND_FILE="$STATE_DIR/outbound.conf"
+CERT_DIR="$STATE_DIR/certs"
+SUB_FILE="$APP_DIR/sub.txt"
+CF_LOG="$APP_DIR/cf.log"
+
+# 兼容旧版本：把之前散落在 $HOME 根目录下的文件自动迁移到新位置，避免升级后 UUID/密钥丢失
+for _pair in "uuid.txt:$UUID_FILE" "sb-config.json:$CONFIG_FILE" \
+             "reality-keys.txt:$REALITY_KEY_FILE" "outbound.conf:$OUTBOUND_FILE"; do
+  _legacy_src="$HOME_DIR/${_pair%%:*}"
+  _legacy_dst="${_pair#*:}"
+  if [ -f "$_legacy_src" ] && [ ! -f "$_legacy_dst" ]; then
+    mv "$_legacy_src" "$_legacy_dst" 2>/dev/null || true
+  fi
+done
+if [ -d "$HOME_DIR/certs" ] && [ ! -d "$CERT_DIR" ]; then
+  mv "$HOME_DIR/certs" "$CERT_DIR" 2>/dev/null || true
+fi
 
 # 二进制优先落在 /tmp，避免 $HOME noexec 问题
 BIN_DIR="/tmp/sb-bin"
@@ -46,6 +66,36 @@ log()  { echo "[INFO] $*"; }
 warn() { echo "[WARN] $*"; }
 die()  { echo "[ERROR] $*"; exit 1; }
 
+# 在 Alpine/musl 等极简发行版上，curl/tar 甚至 openssl 都可能没预装。
+# 这里尝试自动装（仅在识别到 apk/apt 且是 root 时），装不了就明确报错退出，
+# 而不是让脚本在后面某个 http_get/dl 调用里悄悄返回空字符串、最后死得不明不白。
+try_install_pkg() {
+  _pkg="$1"
+  if command -v apk >/dev/null 2>&1; then
+    [ "$(id -u)" = "0" ] && apk add --no-cache "$_pkg" >/dev/null 2>&1
+  elif command -v apt-get >/dev/null 2>&1; then
+    [ "$(id -u)" = "0" ] && { apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq "$_pkg" >/dev/null 2>&1; }
+  fi
+}
+
+ensure_basic_deps() {
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    warn "缺少 curl/wget，尝试自动安装 curl..."
+    try_install_pkg curl
+  fi
+  if ! command -v tar >/dev/null 2>&1; then
+    warn "缺少 tar，尝试自动安装..."
+    try_install_pkg tar
+  fi
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    die "缺少 curl/wget，且自动安装失败。Alpine 请手动执行: apk add --no-cache curl；Debian/Ubuntu: apt-get install -y curl"
+  fi
+  if ! command -v tar >/dev/null 2>&1; then
+    die "缺少 tar，且自动安装失败。Alpine 请手动执行: apk add --no-cache tar"
+  fi
+}
+ensure_basic_deps
+
 http_get() {
   if command -v curl >/dev/null 2>&1; then
     curl -sL --max-time 5 "$1" 2>/dev/null || true
@@ -55,11 +105,23 @@ http_get() {
 }
 
 dl() {
-  if command -v curl >/dev/null 2>&1; then
-    curl -sL "$1" -o "$2"
-  else
-    wget -q "$1" -O "$2"
-  fi
+  # 下载并校验：失败(网络错误/HTTP错误码/空文件)会重试，最终仍失败则返回非零
+  _url="$1"; _out="$2"; _tries=0
+  while [ "$_tries" -lt 3 ]; do
+    if command -v curl >/dev/null 2>&1; then
+      curl -sL --fail --max-time 60 "$_url" -o "$_out" 2>/dev/null
+    else
+      wget -q --timeout=60 "$_url" -O "$_out" 2>/dev/null
+    fi
+    if [ -s "$_out" ]; then
+      return 0
+    fi
+    _tries=$((_tries + 1))
+    warn "下载失败(第 ${_tries} 次): $_url"
+    rm -f "$_out"
+    sleep 2
+  done
+  return 1
 }
 
 # base64 编码，兼容无 -w0 的环境
@@ -82,6 +144,11 @@ url_encode() {
     -e 's/@/%40/g'
 }
 
+# JSON 字符串转义（反斜杠和双引号），用于任何可能包含特殊字符的用户输入
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
 # IPv6 地址加方括号包裹，IPv4 原样返回
 format_addr() {
   case "$1" in
@@ -92,6 +159,24 @@ format_addr() {
 
 # 端口合法性检查（参数：端口值，协议 tcp/udp，已用端口列表文件）
 USED_PORTS_FILE="/tmp/sb-used-ports.txt"
+
+# 探测端口是否已被系统上其他进程占用（TCP 和 UDP 都查），
+# 这是 sing-box check 覆盖不到的：check 只校验配置语法，不做实际 bind 测试，
+# 真正 bind 失败要等到 run 时才会暴露，而且会导致整个多协议进程直接退出。
+port_in_use_os() {
+  _p="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | grep -q ":${_p} " && return 0
+    ss -lun 2>/dev/null | grep -q ":${_p} " && return 0
+    return 1
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | grep -q ":${_p} " && return 0
+    netstat -lun 2>/dev/null | grep -q ":${_p} " && return 0
+    return 1
+  fi
+  return 1
+}
+
 port_ok() {
   _p="$1"
   [ -z "$_p" ] && return 1
@@ -100,6 +185,9 @@ port_ok() {
   esac
   [ "$_p" -lt 1 ] || [ "$_p" -gt 65535 ] && return 1
   grep -qx "$_p" "$USED_PORTS_FILE" 2>/dev/null && return 1
+  if port_in_use_os "$_p"; then
+    return 1
+  fi
   echo "$_p" >> "$USED_PORTS_FILE"
   return 0
 }
@@ -139,10 +227,23 @@ wait_port() {
 }
 
 # ── UUID 管理 ─────────────────────────────────────────────────────────────────
+# 严格校验 UUID 格式：UUID 可能来自外部环境变量/表单输入，
+# 不校验的话它会被原样拼进下面的 python -c "..." 源码字符串里，
+# 精心构造的值（比如带单引号和分号）可以借此执行任意 python 代码。
+valid_uuid() {
+  case "$1" in
+    [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F])
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 if [ -n "$UUID" ]; then
+  valid_uuid "$UUID" || die "UUID 格式不合法: ${UUID}（必须是标准格式，如 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）"
   echo "$UUID" > "$UUID_FILE"
 elif [ -f "$UUID_FILE" ]; then
   UUID="$(cat "$UUID_FILE")"
+  valid_uuid "$UUID" || die "uuid.txt 中的 UUID 格式已损坏，请删除该文件后重试: $UUID_FILE"
 else
   UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null \
     || python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null \
@@ -150,9 +251,10 @@ else
     || od -x /dev/urandom | head -1 | awk '{print $2$3"-"$4"-"$5"-"$6"-"$7$8$9}')"
   echo "$UUID" > "$UUID_FILE"
 fi
+chmod 600 "$UUID_FILE" 2>/dev/null || true
 
 # SS2022 密码：取 UUID 前 16 字节做 base64（24字符）
-# 优先 python3，备选 openssl，都没有则报错提示
+# 优先 python3，备选 openssl（不再依赖 xxd，Alpine/busybox 环境通常没有 xxd）
 SS_PASS=""
 if command -v python3 >/dev/null 2>&1; then
   SS_PASS="$(python3 -c "
@@ -168,12 +270,18 @@ import base64, binascii
 print(base64.b64encode(binascii.unhexlify(u)).decode())
 " 2>/dev/null)" || SS_PASS=""
 fi
+if [ -z "$SS_PASS" ] && [ -n "$SS_PORT" ] && ! command -v openssl >/dev/null 2>&1; then
+  warn "缺少 openssl，尝试自动安装..."
+  try_install_pkg openssl
+fi
 if [ -z "$SS_PASS" ] && command -v openssl >/dev/null 2>&1; then
   _hex="$(echo "$UUID" | tr -d '-' | cut -c1-32)"
-  SS_PASS="$(printf '%s' "$_hex" | xxd -r -p 2>/dev/null | openssl base64 -A 2>/dev/null)" || SS_PASS=""
+  # 把十六进制字符串转成 \xHH 转义序列交给 printf 还原成原始字节，不再需要 xxd
+  _hexesc="$(printf '%s' "$_hex" | sed 's/\(..\)/\\x\1/g')"
+  SS_PASS="$(printf "$_hexesc" | openssl base64 -A 2>/dev/null)" || SS_PASS=""
 fi
 if [ -z "$SS_PASS" ] && [ -n "$SS_PORT" ]; then
-  warn "SS2022 密码生成失败（需要 python3/python/openssl+xxd），Shadowsocks 将被跳过"
+  warn "SS2022 密码生成失败（需要 python3/python/openssl），Shadowsocks 将被跳过"
 fi
 
 # ── 架构检测 ──────────────────────────────────────────────────────────────────
@@ -229,22 +337,45 @@ download_singbox() {
   log "正在获取 sing-box 最新版本..."
   SB_VER="$(http_get 'https://api.github.com/repos/SagerNet/sing-box/releases/latest' \
     | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
-  SB_VER="${SB_VER:-v1.12.0}"
+  if [ -z "$SB_VER" ]; then
+    SB_VER="v1.12.0"
+    warn "获取最新版本号失败（可能是 GitHub API 限流），回退到 ${SB_VER}，较新协议（如 AnyTLS）可能不受支持"
+  fi
   SB_VER_NUM="${SB_VER#v}"
   log "下载 sing-box ${SB_VER} (${SB_ARCH})..."
-  dl "https://github.com/SagerNet/sing-box/releases/download/${SB_VER}/sing-box-${SB_VER_NUM}-linux-${SB_ARCH}.tar.gz" \
-     /tmp/sing-box.tar.gz
+  if ! dl "https://github.com/SagerNet/sing-box/releases/download/${SB_VER}/sing-box-${SB_VER_NUM}-linux-${SB_ARCH}.tar.gz" \
+     /tmp/sing-box.tar.gz; then
+    die "sing-box 下载失败（网络问题或版本 ${SB_VER} 不存在该架构的构建），请检查网络后重试"
+  fi
+  if ! tar -tzf /tmp/sing-box.tar.gz >/dev/null 2>&1; then
+    rm -f /tmp/sing-box.tar.gz
+    die "sing-box 压缩包已损坏（下载不完整），请重新运行脚本"
+  fi
   tar -xzf /tmp/sing-box.tar.gz -C "$SB_DIR" --strip-components=1
   chmod +x "$SB_BIN"
   rm -f /tmp/sing-box.tar.gz
-  log "sing-box 下载完成"
+  if ! "$SB_BIN" version >/dev/null 2>&1; then
+    rm -f "$SB_BIN"
+    die "sing-box 二进制无法执行（架构可能不匹配: ${SB_ARCH}），请检查系统架构"
+  fi
+  log "sing-box 下载完成: $("$SB_BIN" version 2>/dev/null | head -1)"
 }
 
 # ── 下载 cloudflared ──────────────────────────────────────────────────────────
 download_cloudflared() {
   log "正在下载 cloudflared (${CF_ARCH})..."
-  dl "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${CF_ARCH}" "$CF_BIN"
+  if ! dl "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${CF_ARCH}" "$CF_BIN"; then
+    warn "cloudflared 下载失败，Argo 隧道本次将被禁用"
+    DISABLE_ARGO="true"
+    return 1
+  fi
   chmod +x "$CF_BIN"
+  if ! "$CF_BIN" --version >/dev/null 2>&1; then
+    warn "cloudflared 二进制无法执行（架构可能不匹配: ${CF_ARCH}），Argo 隧道本次将被禁用"
+    rm -f "$CF_BIN"
+    DISABLE_ARGO="true"
+    return 1
+  fi
   log "cloudflared 下载完成"
 }
 
@@ -253,8 +384,13 @@ pkill -f "$SB_BIN"    2>/dev/null || true
 pkill -f "$CF_BIN"    2>/dev/null || true
 sleep 1
 
+[ -x "$SB_BIN" ] && ! "$SB_BIN" version >/dev/null 2>&1 && { warn "已存在的 sing-box 二进制无法运行，重新下载"; rm -f "$SB_BIN"; }
 [ -x "$SB_BIN" ] || download_singbox
-[ -x "$CF_BIN" ] || { [ "${DISABLE_ARGO:-}" != "true" ] && download_cloudflared || true; }
+
+if [ "${DISABLE_ARGO:-}" != "true" ]; then
+  [ -x "$CF_BIN" ] && ! "$CF_BIN" --version >/dev/null 2>&1 && { warn "已存在的 cloudflared 二进制无法运行，重新下载"; rm -f "$CF_BIN"; }
+  [ -x "$CF_BIN" ] || download_cloudflared || true
+fi
 
 # ── 端口分配 ──────────────────────────────────────────────────────────────────
 rm -f "$USED_PORTS_FILE"
@@ -287,14 +423,32 @@ fi
 NAME_ENCODED="$(url_encode "$NAME")"
 
 # ── 公网 IP ───────────────────────────────────────────────────────────────────
+# 校验拿到的到底像不像一个 IP：出口网络异常时，ipinfo.io 之类的接口可能返回
+# 代理拦截页/验证码页/captive portal 的 HTML，而不是纯 IP 文本。不校验的话，
+# 这段垃圾内容会被原样拼进 SOCKS5/Trojan/Hysteria2 等订阅链接里。
+valid_ip() {
+  _v="$1"
+  [ -z "$_v" ] && return 1
+  [ "${#_v}" -gt 45 ] && return 1
+  case "$_v" in
+    *[!0-9a-fA-F:.]*) return 1 ;;
+    *[0-9]*) : ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
 PUBLIC_IP=""
 if [ -n "$HY2_PORT" ] || [ -n "$TUIC_PORT" ] || [ -n "$REALITY_PORT" ] || [ -n "$SS_PORT" ] || [ -n "$SOCKS5_PORT" ] || [ -n "$TROJAN_PORT" ] || [ -n "$ANYTLS_PORT" ]; then
-  PUBLIC_IP="$(http_get 'https://ipinfo.io/ip' | tr -d '[:space:]')"
-  [ -z "$PUBLIC_IP" ] && PUBLIC_IP="$(http_get 'https://ifconfig.co/ip' | tr -d '[:space:]')"
-  # IPv4 获取失败（纯 IPv6 服务器），尝试 IPv6 接口
+  for _ipsrc in 'https://ipinfo.io/ip' 'https://ifconfig.co/ip' 'https://api64.ipify.org' 'https://v6.ident.me'; do
+    _cand="$(http_get "$_ipsrc" | tr -d '[:space:]')"
+    if valid_ip "$_cand"; then
+      PUBLIC_IP="$_cand"
+      break
+    fi
+  done
   if [ -z "$PUBLIC_IP" ]; then
-    PUBLIC_IP="$(http_get 'https://api64.ipify.org' | tr -d '[:space:]')"
-    [ -z "$PUBLIC_IP" ] && PUBLIC_IP="$(http_get 'https://v6.ident.me' | tr -d '[:space:]')"
+    warn "公网 IP 获取失败或返回内容不像有效 IP，依赖公网 IP 的协议（HY2/TUIC/Reality/SS/SOCKS5/Trojan/AnyTLS）本次订阅链接将缺失对应节点"
   fi
 fi
 
@@ -306,6 +460,10 @@ if [ -n "$HY2_PORT" ] || [ -n "$TUIC_PORT" ] || [ -n "$TROJAN_PORT" ] || [ -n "$
   CERT_PATH="$CERT_DIR/cert.pem"
   KEY_PATH="$CERT_DIR/key.pem"
   if [ ! -f "$CERT_PATH" ] || [ ! -f "$KEY_PATH" ]; then
+    if ! command -v openssl >/dev/null 2>&1; then
+      warn "缺少 openssl，尝试自动安装（否则将回退到内置的共享自签证书）..."
+      try_install_pkg openssl
+    fi
     if command -v openssl >/dev/null 2>&1; then
       openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days 3650 -nodes \
         -keyout "$KEY_PATH" -out "$CERT_PATH" \
@@ -335,6 +493,7 @@ eQ6OFb9LbLYL9f+sAiAffoMbi4y/0YUSlTtz7as9S8/lciBF5VCUoVIKS+vX2g==
 CERTEOF
     fi
   fi
+  chmod 600 "$KEY_PATH" 2>/dev/null || true
 fi
 
 # ── Reality 密钥 ──────────────────────────────────────────────────────────────
@@ -351,6 +510,7 @@ if [ -n "$REALITY_PORT" ]; then
     REALITY_PUB="$(echo  "$KEYPAIR" | grep PublicKey  | sed 's/PublicKey: *//')"
     if [ -n "$REALITY_PRIV" ] && [ -n "$REALITY_PUB" ]; then
       printf 'PrivateKey: %s\nPublicKey: %s\n' "$REALITY_PRIV" "$REALITY_PUB" > "$REALITY_KEY_FILE"
+      chmod 600 "$REALITY_KEY_FILE" 2>/dev/null || true
       log "Reality 密钥生成完成"
     else
       warn "Reality 密钥生成失败，VLESS Reality 将被跳过"
@@ -440,6 +600,16 @@ fi
 # 逐协议增量校验：每加入一个 inbound 就用 sing-box check 单独验证一次，
 # 校验失败只跳过该协议（并关闭其 _ACTIVE 标记，保证后续订阅/日志展示一致），
 # 不再因为某一个协议不兼容当前 sing-box 版本就让整个脚本直接退出。
+# 校验失败时可能要把 sing-box 的报错甚至配置文件本身打到日志(journal)里排查，
+# 但配置里有 UUID / SS 密码 / Reality 私钥，直接照抄会把这些明文写进日志，
+# 尤其是 systemd Restart=always 场景下会一次次重复泄露。统一做脱敏。
+redact_secrets() {
+  sed \
+    -e "s|${UUID:-__no_uuid__}|<UUID>|g" \
+    -e "s|${SS_PASS:-__no_ss_pass__}|<SS_PASSWORD>|g" \
+    -e "s|${REALITY_PRIV:-__no_reality_priv__}|<REALITY_PRIVATE_KEY>|g"
+}
+
 _inbounds=""
 _sep=""
 
@@ -451,6 +621,8 @@ try_add_inbound() {
     ${_snippet}"
   _tc="/tmp/sb-trycfg-$$.json"
   _tl="/tmp/sb-trylog-$$.log"
+  : > "$_tc"; chmod 600 "$_tc" 2>/dev/null || true
+  : > "$_tl"; chmod 600 "$_tl" 2>/dev/null || true
   printf '{\n  "log": { "level": "warn" },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct" }]\n}\n' "$_trial" > "$_tc"
   if "$SB_BIN" check -c "$_tc" >"$_tl" 2>&1; then
     _inbounds="$_trial"
@@ -459,7 +631,7 @@ try_add_inbound() {
     return 0
   else
     warn "${_label} 配置校验未通过，已跳过该协议（不影响其他协议启动）:"
-    sed 's/^/    /' "$_tl" 2>/dev/null
+    redact_secrets < "$_tl" | sed 's/^/    /'
     rm -f "$_tc" "$_tl"
     return 1
   fi
@@ -473,7 +645,7 @@ if [ "${DISABLE_ARGO:-}" != "true" ]; then
       \"listen\": \"127.0.0.1\",
       \"listen_port\": ${ARGO_PORT},
       \"users\": [{ \"uuid\": \"${UUID}\", \"alterId\": 0 }],
-      \"transport\": { \"type\": \"ws\", \"path\": \"${WS_PATH}\" }
+      \"transport\": { \"type\": \"ws\", \"path\": \"$(json_escape "$WS_PATH")\" }
     }"
   if ! try_add_inbound "VMess/Argo" "$_vmess_json"; then
     warn "VMess 基础入口校验失败，Argo 隧道本次将不启动"
@@ -604,31 +776,51 @@ ROUTE_JSON=""
 
 printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct" }%s]%s\n}\n' \
   "$_inbounds" "$EXTRA_OUTBOUND_JSON" "$ROUTE_JSON" > "$CONFIG_FILE"
+chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 
 # 最终整体校验：单个 inbound 都已验证过，这一步主要防的是出站/路由部分的问题
 # （比如自定义出口配置有误）。如果失败，先尝试去掉自定义出口再试一次，仍失败才终止。
-if ! "$SB_BIN" check -c "$CONFIG_FILE" 2>/tmp/sb-finalcheck.log; then
+_fc="/tmp/sb-finalcheck-$$.log"
+: > "$_fc"; chmod 600 "$_fc" 2>/dev/null || true
+if ! "$SB_BIN" check -c "$CONFIG_FILE" 2>"$_fc"; then
   warn "整体配置校验失败，尝试去除自定义出口后重试："
-  sed 's/^/    /' /tmp/sb-finalcheck.log
+  redact_secrets < "$_fc" | sed 's/^/    /'
   if [ -n "$EXTRA_OUTBOUND_JSON" ]; then
     EXTRA_OUTBOUND_JSON=""
     ROUTE_JSON=""
     printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct" }]\n}\n' \
       "$_inbounds" > "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
     if "$SB_BIN" check -c "$CONFIG_FILE" 2>/dev/null; then
       warn "已回退为直连出口，自定义出口本次未生效"
     else
-      warn "sing-box 配置校验仍然失败，尝试输出配置内容以供排查："
-      cat "$CONFIG_FILE"
+      warn "sing-box 配置校验仍然失败，输出配置内容以供排查（已脱敏 UUID/密码/私钥）："
+      redact_secrets < "$CONFIG_FILE"
+      rm -f "$_fc"
+      # 持续性故障标记：如果 60 秒内已经因为同样的原因失败过，
+      # 说明这不是偶发问题（比如配置本身就有问题），额外等待，
+      # 避免 systemd Restart=always 把同样的报错每 10 秒刷一遍日志。
+      _failmark="$STATE_DIR/.last-config-fail"
+      _now="$(date +%s 2>/dev/null || echo 0)"
+      if [ -f "$_failmark" ]; then
+        _last="$(cat "$_failmark" 2>/dev/null || echo 0)"
+        if [ $((_now - _last)) -lt 60 ]; then
+          warn "60 秒内已重复失败，额外等待 60 秒再退出，避免刷屏..."
+          sleep 60
+        fi
+      fi
+      echo "$_now" > "$_failmark" 2>/dev/null || true
       die "配置无效，终止启动"
     fi
   else
-    warn "sing-box 配置校验仍然失败，尝试输出配置内容以供排查："
-    cat "$CONFIG_FILE"
+    warn "sing-box 配置校验仍然失败，输出配置内容以供排查（已脱敏 UUID/密码/私钥）："
+    redact_secrets < "$CONFIG_FILE"
+    rm -f "$_fc"
     die "配置无效，终止启动"
   fi
+else
+  rm -f "$_fc"
 fi
-rm -f /tmp/sb-finalcheck.log
 
 # ── 启动 sing-box（守护循环）─────────────────────────────────────────────────
 start_singbox() {
@@ -654,7 +846,6 @@ start_singbox || die "sing-box 首次启动失败"
 # generate_sub 用新域名重写订阅文件。看门狗每次重启 cloudflared 都会调用它，
 # 而不再是只在脚本启动时解析一次域名。
 ARGO_HOST=""
-CF_LOG="$HOME_DIR/cf.log"
 CF_PID=""
 
 start_cloudflared() {
@@ -704,7 +895,7 @@ generate_sub() {
   ALL_LINKS=""
 
   if [ "${DISABLE_ARGO:-}" != "true" ]; then
-    VMESS_JSON="{\"v\":\"2\",\"ps\":\"${NAME}\",\"add\":\"cdns.doon.eu.org\",\"port\":\"443\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${ARGO_HOST}\",\"path\":\"${WS_PATH}\",\"tls\":\"tls\",\"sni\":\"${ARGO_HOST}\"}"
+    VMESS_JSON="{\"v\":\"2\",\"ps\":\"$(json_escape "$NAME")\",\"add\":\"cdns.doon.eu.org\",\"port\":\"443\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${ARGO_HOST}\",\"path\":\"$(json_escape "$WS_PATH")\",\"tls\":\"tls\",\"sni\":\"${ARGO_HOST}\"}"
     ALL_LINKS="vmess://$(b64 "$VMESS_JSON")"
   fi
 
@@ -753,6 +944,7 @@ generate_sub() {
 
   SUB_BASE64="$(b64 "$ALL_LINKS")"
   echo "$SUB_BASE64" > "$SUB_FILE"
+  chmod 600 "$SUB_FILE" 2>/dev/null || true
 
   log "================= 订阅内容 (已刷新) ================="
   echo "$SUB_BASE64"
@@ -785,20 +977,38 @@ log "========================================"
 # 以前 cloudflared 崩溃只有在 sing-box 也一起崩溃时才会被顺带重拉，
 # 现在两者各自都有存活检查。cloudflared 每次重启都会重新调用
 # start_cloudflared，临时隧道的新域名会被重新解析并写回 sub.txt。
+# 加入退避重试：如果是持续性故障（比如端口被别的进程永久占用），
+# 不会每 10-15 秒就重启一次刷屏，重试间隔会随连续失败次数递增，最长封顶 60 秒。
 log "进入守护模式..."
+SB_FAIL_COUNT=0
+CF_FAIL_COUNT=0
 while true; do
   if ! kill -0 $SB_PID 2>/dev/null; then
-    warn "sing-box 意外退出，5 秒后重启..."
-    sleep 5
-    start_singbox || { warn "重启失败，继续等待..."; sleep 10; continue; }
+    SB_FAIL_COUNT=$((SB_FAIL_COUNT + 1))
+    _backoff=$((SB_FAIL_COUNT * 5))
+    [ "$_backoff" -gt 60 ] && _backoff=60
+    warn "sing-box 意外退出（连续第 ${SB_FAIL_COUNT} 次），${_backoff} 秒后重启..."
+    sleep "$_backoff"
+    if start_singbox; then
+      SB_FAIL_COUNT=0
+    else
+      warn "重启失败，继续等待..."
+      sleep 10
+      continue
+    fi
   fi
 
   if [ "${DISABLE_ARGO:-}" != "true" ]; then
     if [ -z "$CF_PID" ] || ! kill -0 "$CF_PID" 2>/dev/null; then
-      warn "cloudflared 意外退出（或未运行），5 秒后重启..."
+      CF_FAIL_COUNT=$((CF_FAIL_COUNT + 1))
+      _cf_backoff=$((CF_FAIL_COUNT * 5))
+      [ "$_cf_backoff" -gt 60 ] && _cf_backoff=60
+      warn "cloudflared 意外退出（或未运行，连续第 ${CF_FAIL_COUNT} 次），${_cf_backoff} 秒后重启..."
       pkill -f "$CF_BIN" 2>/dev/null || true
-      sleep 5
+      sleep "$_cf_backoff"
       start_cloudflared
+    else
+      CF_FAIL_COUNT=0
     fi
   fi
 

@@ -1,4 +1,22 @@
 #!/bin/bash
+# 这个脚本用到了大量 bash 专属语法（local / [[ / 字符串切片 / read -p 等），
+# 如果是被 `sh install.sh` 直接跑起来的（Alpine 默认 /bin/sh 是 ash，不支持这些），
+# 这里会自动尝试用 bash 重新执行自己；如果连 bash 都没有，就给出明确提示而不是
+# 跑到一半在某个 bash 专属语法上报出一堆看不懂的语法错误。
+if [ -z "${BASH_VERSION:-}" ]; then
+  if command -v bash >/dev/null 2>&1; then
+    exec bash "$0" "$@"
+  else
+    echo "本脚本需要 bash 才能运行，当前系统未检测到 bash。"
+    if command -v apk >/dev/null 2>&1; then
+      echo "Alpine 用户请先执行: apk add --no-cache bash   然后重新运行本脚本"
+    elif command -v apt-get >/dev/null 2>&1; then
+      echo "Debian/Ubuntu 用户请先执行: apt-get install -y bash   然后重新运行本脚本"
+    fi
+    exit 1
+  fi
+fi
+
 set -e
 
 GREEN='\033[0;32m'
@@ -7,6 +25,46 @@ YELLOW='\033[0;33m'
 NC='\033[0m'
 
 echo -e "${YELLOW}========== singbox 安装 ==========${NC}"
+
+# 极简发行版（典型如 Alpine）可能连 curl/tar/openssl 都没预装，
+# 尝试用 apk/apt 自动补齐，装不上就明确报错，而不是让后面莫名其妙地失败。
+_bootstrap_deps() {
+  _missing=""
+  command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || _missing="$_missing curl"
+  command -v tar     >/dev/null 2>&1 || _missing="$_missing tar"
+  command -v openssl >/dev/null 2>&1 || _missing="$_missing openssl"
+  [ -z "$_missing" ] && return 0
+
+  echo -e "${YELLOW}检测到缺少依赖:${_missing}${NC}"
+  if command -v apk >/dev/null 2>&1; then
+    echo -e "${YELLOW}检测到 Alpine (apk)，尝试自动安装...${NC}"
+    if [ "$(id -u)" = "0" ]; then
+      apk add --no-cache $_missing >/dev/null 2>&1 || true
+    elif command -v sudo >/dev/null 2>&1; then
+      sudo apk add --no-cache $_missing >/dev/null 2>&1 || true
+    fi
+  elif command -v apt-get >/dev/null 2>&1; then
+    echo -e "${YELLOW}检测到 Debian/Ubuntu (apt)，尝试自动安装...${NC}"
+    if [ "$(id -u)" = "0" ]; then
+      apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq $_missing >/dev/null 2>&1 || true
+    elif command -v sudo >/dev/null 2>&1; then
+      sudo apt-get update -qq >/dev/null 2>&1 && sudo apt-get install -y -qq $_missing >/dev/null 2>&1 || true
+    fi
+  fi
+
+  _still_missing=""
+  command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || _still_missing="$_still_missing curl/wget"
+  command -v tar     >/dev/null 2>&1 || _still_missing="$_still_missing tar"
+  if [ -n "$_still_missing" ]; then
+    echo -e "${RED}以下依赖仍然缺失，无法继续:${_still_missing}${NC}"
+    echo -e "${RED}Alpine 请手动执行: apk add --no-cache curl tar openssl${NC}"
+    echo -e "${RED}Debian/Ubuntu 请手动执行: apt-get install -y curl tar openssl${NC}"
+    exit 1
+  fi
+  # openssl 缺失不阻断安装：singbox.sh 里有内置的共享自签证书兜底
+  command -v openssl >/dev/null 2>&1 || echo -e "${YELLOW}openssl 仍然缺失，HY2/TUIC/Trojan/AnyTLS 将使用内置的共享自签证书${NC}"
+}
+_bootstrap_deps
 
 if command -v curl >/dev/null 2>&1; then
   DL="curl -sL"; DL_O="-o"
@@ -136,11 +194,12 @@ WHITE='\033[0;97m'
 RESET='\033[0m'
 
 APP_DIR="$HOME/singbox"
+STATE_DIR="$APP_DIR/state"
 WRAPPER="$APP_DIR/start.sh"
 SUB_FILE="$APP_DIR/sub.txt"
 LOG_FILE="$APP_DIR/run.log"
 SB_BIN_PATH="/tmp/sb-bin/singbox/sing-box"
-OUTBOUND_FILE="$HOME/outbound.conf"
+OUTBOUND_FILE="$STATE_DIR/outbound.conf"
 
 get_val() {
   grep "^export $1=" "$WRAPPER" 2>/dev/null | sed 's/.*="\(.*\)"/\1/' | head -1
@@ -321,7 +380,7 @@ config_uuid() {
   read -r confirm
   if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
     set_val UUID "$new_uuid"
-    rm -f "$HOME/reality-keys.txt"
+    rm -f "$STATE_DIR/reality-keys.txt"
     restart_service
     echo -e "${GREEN}UUID 已更新${RESET}"
     press_any_key
@@ -464,7 +523,7 @@ config_proto() {
         val="$(echo "$val" | tr -d '[:space:]')"
         if [ -n "$val" ]; then
           set_val REALITY_DOMAIN "$val"
-          rm -f "$HOME/reality-keys.txt"
+          rm -f "$STATE_DIR/reality-keys.txt"
           echo -e "${GREEN}已更新为: $val，Reality 密钥已清除，重启后重新生成${RESET}"
         fi
         sleep 1
@@ -598,6 +657,7 @@ PORT=${port}
 USER=${user}
 PASS=${pass}
 EOF
+    chmod 600 "$OUTBOUND_FILE" 2>/dev/null || true
     restart_service
     echo -e "${GREEN}出口已设置${RESET}"
     press_any_key
@@ -815,7 +875,9 @@ export SOCKS5_PORT="$NEW_SOCKS5_PORT"
 export TROJAN_PORT="$NEW_TROJAN_PORT"
 export ANYTLS_PORT="$NEW_ANYTLS_PORT"
 cd "$APP_DIR"
-nohup bash "$APP_DIR/singbox.sh" >> "$APP_DIR/run.log" 2>&1 &
+touch "$APP_DIR/run.log" 2>/dev/null
+chmod 600 "$APP_DIR/run.log" 2>/dev/null
+nohup sh "$APP_DIR/singbox.sh" >> "$APP_DIR/run.log" 2>&1 &
 echo \$! > "$APP_DIR/singbox.pid"
 WRAPEOF
 chmod +x "$WRAPPER"
@@ -880,7 +942,9 @@ export SOCKS5_PORT="$INPUT_SOCKS5_PORT"
 export TROJAN_PORT="$INPUT_TROJAN_PORT"
 export ANYTLS_PORT="$INPUT_ANYTLS_PORT"
 cd "$APP_DIR"
-nohup bash "$APP_DIR/singbox.sh" >> "$APP_DIR/run.log" 2>&1 &
+touch "$APP_DIR/run.log" 2>/dev/null
+chmod 600 "$APP_DIR/run.log" 2>/dev/null
+nohup sh "$APP_DIR/singbox.sh" >> "$APP_DIR/run.log" 2>&1 &
 echo \$! > "$APP_DIR/singbox.pid"
 WRAPEOF
 chmod +x "$WRAPPER"
@@ -899,6 +963,10 @@ if $USER_SYSTEMD_OK; then
 Description=singbox service
 After=network-online.target
 Wants=network-online.target
+# 连续失败 5 次(5 分钟内)后 systemd 就不再自动重启了，避免配置永久损坏时
+# 每 10 秒重启一次刷屏日志；需要人工介入用 systemctl --user reset-failed 后再启动。
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -917,7 +985,7 @@ Environment=SS_PORT=$INPUT_SS_PORT
 Environment=SOCKS5_PORT=$INPUT_SOCKS5_PORT
 Environment=TROJAN_PORT=$INPUT_TROJAN_PORT
 Environment=ANYTLS_PORT=$INPUT_ANYTLS_PORT
-ExecStart=/bin/bash $APP_DIR/singbox.sh
+ExecStart=/bin/sh $APP_DIR/singbox.sh
 Restart=always
 RestartSec=10
 StandardOutput=journal
