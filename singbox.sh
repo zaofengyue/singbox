@@ -20,6 +20,12 @@ SS_PORT="${SS_PORT:-}"
 SOCKS5_PORT="${SOCKS5_PORT:-}"
 TROJAN_PORT="${TROJAN_PORT:-}"
 ANYTLS_PORT="${ANYTLS_PORT:-}"
+# 域名证书绑定（留空则该协议使用共享自签证书）：值是已经用 acme.sh 申请好的域名，
+# 证书文件预期位于 $STATE_DIR/domain-certs/<域名>/{cert.pem,key.pem}
+HY2_CERT_DOMAIN="${HY2_CERT_DOMAIN:-}"
+TUIC_CERT_DOMAIN="${TUIC_CERT_DOMAIN:-}"
+TROJAN_CERT_DOMAIN="${TROJAN_CERT_DOMAIN:-}"
+ANYTLS_CERT_DOMAIN="${ANYTLS_CERT_DOMAIN:-}"
 # 优选地址
 CF_PREFER_HOST="${CF_PREFER_HOST:-cdns.doon.eu.org}"
 WS_PATH="${WS_PATH:-/fengyue}"
@@ -38,6 +44,7 @@ CONFIG_FILE="$STATE_DIR/sb-config.json"
 REALITY_KEY_FILE="$STATE_DIR/reality-keys.txt"
 OUTBOUND_FILE="$STATE_DIR/outbound.conf"
 CERT_DIR="$STATE_DIR/certs"
+DOMAIN_CERT_DIR="$STATE_DIR/domain-certs"
 SUB_FILE="$APP_DIR/sub.txt"
 CF_LOG="$APP_DIR/cf.log"
 
@@ -496,6 +503,36 @@ CERTEOF
   chmod 600 "$KEY_PATH" 2>/dev/null || true
 fi
 
+# ── 域名证书解析 ──────────────────────────────────────────────────────────────
+# 每个协议独立决定自己用哪份证书：如果绑定了域名（通过管理面板"域名证书"功能用
+# acme.sh 申请），并且对应的 cert.pem/key.pem 确实存在，就用域名证书（客户端可以
+# 正常做证书链校验，不用 insecure/allowInsecure）；否则回退到上面的共享自签证书。
+resolve_cert_for() {
+  # $1=域名(可能为空)，结果写进 _RC_CERT / _RC_KEY / _RC_SNI / _RC_INSECURE
+  _dom="$1"
+  if [ -n "$_dom" ] && [ -f "$DOMAIN_CERT_DIR/$_dom/cert.pem" ] && [ -f "$DOMAIN_CERT_DIR/$_dom/key.pem" ]; then
+    _RC_CERT="$DOMAIN_CERT_DIR/$_dom/cert.pem"
+    _RC_KEY="$DOMAIN_CERT_DIR/$_dom/key.pem"
+    _RC_SNI="$_dom"
+    _RC_INSECURE=0
+  else
+    [ -n "$_dom" ] && warn "协议绑定的域名证书 ${_dom} 不存在或文件不完整，本次回退为自签证书"
+    _RC_CERT="$CERT_PATH"
+    _RC_KEY="$KEY_PATH"
+    _RC_SNI=""
+    _RC_INSECURE=1
+  fi
+}
+
+resolve_cert_for "$HY2_CERT_DOMAIN"
+HY2_TLS_CERT="$_RC_CERT"; HY2_TLS_KEY="$_RC_KEY"; HY2_TLS_SNI="$_RC_SNI"; HY2_TLS_INSECURE="$_RC_INSECURE"
+resolve_cert_for "$TUIC_CERT_DOMAIN"
+TUIC_TLS_CERT="$_RC_CERT"; TUIC_TLS_KEY="$_RC_KEY"; TUIC_TLS_SNI="$_RC_SNI"; TUIC_TLS_INSECURE="$_RC_INSECURE"
+resolve_cert_for "$TROJAN_CERT_DOMAIN"
+TROJAN_TLS_CERT="$_RC_CERT"; TROJAN_TLS_KEY="$_RC_KEY"; TROJAN_TLS_SNI="$_RC_SNI"; TROJAN_TLS_INSECURE="$_RC_INSECURE"
+resolve_cert_for "$ANYTLS_CERT_DOMAIN"
+ANYTLS_TLS_CERT="$_RC_CERT"; ANYTLS_TLS_KEY="$_RC_KEY"; ANYTLS_TLS_SNI="$_RC_SNI"; ANYTLS_TLS_INSECURE="$_RC_INSECURE"
+
 # ── Reality 密钥 ──────────────────────────────────────────────────────────────
 REALITY_PRIV=""
 REALITY_PUB=""
@@ -664,8 +701,8 @@ if [ "$HY2_ACTIVE" = "1" ]; then
       \"tls\": {
         \"enabled\": true,
         \"alpn\": [\"h3\"],
-        \"certificate_path\": \"${CERT_PATH}\",
-        \"key_path\": \"${KEY_PATH}\"
+        \"certificate_path\": \"${HY2_TLS_CERT}\",
+        \"key_path\": \"${HY2_TLS_KEY}\"
       }
     }"
   try_add_inbound "Hysteria2" "$_hy2_json" || HY2_ACTIVE=0
@@ -682,8 +719,8 @@ if [ "$TUIC_ACTIVE" = "1" ]; then
       \"tls\": {
         \"enabled\": true,
         \"alpn\": [\"h3\"],
-        \"certificate_path\": \"${CERT_PATH}\",
-        \"key_path\": \"${KEY_PATH}\"
+        \"certificate_path\": \"${TUIC_TLS_CERT}\",
+        \"key_path\": \"${TUIC_TLS_KEY}\"
       }
     }"
   try_add_inbound "TUIC" "$_tuic_json" || TUIC_ACTIVE=0
@@ -743,8 +780,8 @@ if [ "$TROJAN_ACTIVE" = "1" ]; then
       \"users\": [{ \"password\": \"${UUID}\" }],
       \"tls\": {
         \"enabled\": true,
-        \"certificate_path\": \"${CERT_PATH}\",
-        \"key_path\": \"${KEY_PATH}\"
+        \"certificate_path\": \"${TROJAN_TLS_CERT}\",
+        \"key_path\": \"${TROJAN_TLS_KEY}\"
       }
     }"
   try_add_inbound "Trojan" "$_trojan_json" || TROJAN_ACTIVE=0
@@ -759,8 +796,8 @@ if [ "$ANYTLS_ACTIVE" = "1" ]; then
       \"users\": [{ \"password\": \"${UUID}\" }],
       \"tls\": {
         \"enabled\": true,
-        \"certificate_path\": \"${CERT_PATH}\",
-        \"key_path\": \"${KEY_PATH}\"
+        \"certificate_path\": \"${ANYTLS_TLS_CERT}\",
+        \"key_path\": \"${ANYTLS_TLS_KEY}\"
       }
     }"
   try_add_inbound "AnyTLS" "$_anytls_json" || ANYTLS_ACTIVE=0
@@ -900,13 +937,23 @@ generate_sub() {
   fi
 
   if [ "$HY2_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-    _link="hysteria2://${UUID}@$(format_addr "$PUBLIC_IP"):${HY2_PORT}?sni=www.bing.com&insecure=1&alpn=h3&obfs=none#${NAME_ENCODED}"
+    if [ "$HY2_TLS_INSECURE" = "0" ]; then
+      _hy2_sni="$HY2_TLS_SNI"; _hy2_insecure="0"
+    else
+      _hy2_sni="www.bing.com"; _hy2_insecure="1"
+    fi
+    _link="hysteria2://${UUID}@$(format_addr "$PUBLIC_IP"):${HY2_PORT}?sni=${_hy2_sni}&insecure=${_hy2_insecure}&alpn=h3&obfs=none#${NAME_ENCODED}"
     ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
   fi
 
   if [ "$TUIC_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-    _link="tuic://${UUID}:${UUID}@$(format_addr "$PUBLIC_IP"):${TUIC_PORT}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${NAME_ENCODED}"
+    if [ "$TUIC_TLS_INSECURE" = "0" ]; then
+      _tuic_sni="$TUIC_TLS_SNI"; _tuic_insecure="0"
+    else
+      _tuic_sni="www.bing.com"; _tuic_insecure="1"
+    fi
+    _link="tuic://${UUID}:${UUID}@$(format_addr "$PUBLIC_IP"):${TUIC_PORT}?sni=${_tuic_sni}&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=${_tuic_insecure}#${NAME_ENCODED}"
     ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
   fi
@@ -931,13 +978,23 @@ generate_sub() {
   fi
 
   if [ "$TROJAN_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-    _link="trojan://${UUID}@$(format_addr "$PUBLIC_IP"):${TROJAN_PORT}?security=tls&sni=bing.com&allowInsecure=1&fp=firefox#${NAME_ENCODED}"
+    if [ "$TROJAN_TLS_INSECURE" = "0" ]; then
+      _trojan_sni="$TROJAN_TLS_SNI"; _trojan_insecure="0"
+    else
+      _trojan_sni="bing.com"; _trojan_insecure="1"
+    fi
+    _link="trojan://${UUID}@$(format_addr "$PUBLIC_IP"):${TROJAN_PORT}?security=tls&sni=${_trojan_sni}&allowInsecure=${_trojan_insecure}&fp=firefox#${NAME_ENCODED}"
     ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
   fi
 
   if [ "$ANYTLS_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-    _link="anytls://${UUID}@$(format_addr "$PUBLIC_IP"):${ANYTLS_PORT}?sni=bing.com&insecure=1#${NAME_ENCODED}"
+    if [ "$ANYTLS_TLS_INSECURE" = "0" ]; then
+      _anytls_sni="$ANYTLS_TLS_SNI"; _anytls_insecure="0"
+    else
+      _anytls_sni="bing.com"; _anytls_insecure="1"
+    fi
+    _link="anytls://${UUID}@$(format_addr "$PUBLIC_IP"):${ANYTLS_PORT}?sni=${_anytls_sni}&insecure=${_anytls_insecure}#${NAME_ENCODED}"
     ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
   fi
@@ -962,13 +1019,13 @@ fi
 log "============== 已启用协议 =============="
 [ "${DISABLE_ARGO:-}" != "true" ] && log "✓ VMess + WS + Argo TLS  (域名: $ARGO_HOST)"
 [ "${DISABLE_ARGO:-}" = "true"  ] && log "✗ Argo 隧道已禁用"
-[ "$HY2_ACTIVE"     = "1" ] && log "✓ Hysteria2     端口 $HY2_PORT (UDP)"
-[ "$TUIC_ACTIVE"    = "1" ] && log "✓ TUIC v5       端口 $TUIC_PORT (UDP)"
+[ "$HY2_ACTIVE"     = "1" ] && log "✓ Hysteria2     端口 $HY2_PORT (UDP)  证书: ${HY2_CERT_DOMAIN:-自签}"
+[ "$TUIC_ACTIVE"    = "1" ] && log "✓ TUIC v5       端口 $TUIC_PORT (UDP)  证书: ${TUIC_CERT_DOMAIN:-自签}"
 [ "$REALITY_ACTIVE" = "1" ] && log "✓ VLESS Reality 端口 $REALITY_PORT  PubKey: $REALITY_PUB"
 [ "$SS_ACTIVE"      = "1" ] && log "✓ Shadowsocks   端口 $SS_PORT (TCP)"
 [ "$SOCKS5_ACTIVE"  = "1" ] && log "✓ SOCKS5        端口 $SOCKS5_PORT (TCP/UDP)  用户: singbox"
-[ "$TROJAN_ACTIVE"  = "1" ] && log "✓ Trojan        端口 $TROJAN_PORT (TCP)"
-[ "$ANYTLS_ACTIVE"  = "1" ] && log "✓ AnyTLS        端口 $ANYTLS_PORT (TCP)"
+[ "$TROJAN_ACTIVE"  = "1" ] && log "✓ Trojan        端口 $TROJAN_PORT (TCP)  证书: ${TROJAN_CERT_DOMAIN:-自签}"
+[ "$ANYTLS_ACTIVE"  = "1" ] && log "✓ AnyTLS        端口 $ANYTLS_PORT (TCP)  证书: ${ANYTLS_CERT_DOMAIN:-自签}"
 [ -n "$EXTRA_OUTBOUND_JSON" ] && log "✓ 自定义出口    ${CUSTOM_OUT_TYPE}://${CUSTOM_OUT_ADDR}:${CUSTOM_OUT_PORT}"
 log "========================================"
 

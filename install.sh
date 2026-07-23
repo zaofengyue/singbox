@@ -195,11 +195,14 @@ RESET='\033[0m'
 
 APP_DIR="$HOME/singbox"
 STATE_DIR="$APP_DIR/state"
+ACME_HOME="$STATE_DIR/acme.sh"
+DOMAIN_CERT_DIR="$STATE_DIR/domain-certs"
 WRAPPER="$APP_DIR/start.sh"
 SUB_FILE="$APP_DIR/sub.txt"
 LOG_FILE="$APP_DIR/run.log"
 SB_BIN_PATH="/tmp/sb-bin/singbox/sing-box"
 OUTBOUND_FILE="$STATE_DIR/outbound.conf"
+SVCFILE="$HOME/.config/systemd/user/singbox.service"
 
 get_val() {
   grep "^export $1=" "$WRAPPER" 2>/dev/null | sed 's/.*="\(.*\)"/\1/' | head -1
@@ -211,6 +214,16 @@ set_val() {
     sed -i "s|^export $key=.*|export $key=\"$val\"|" "$WRAPPER"
   else
     sed -i "/^cd /i export $key=\"$val\"" "$WRAPPER"
+  fi
+  # 同步到 systemd 单元：systemd 直接执行 singbox.sh 并从 unit 的 Environment= 读变量，
+  # 不会去读 start.sh，之前这里没同步导致 systemd 托管模式下面板改配置实际不生效。
+  if [ -f "$SVCFILE" ]; then
+    if grep -q "^Environment=$key=" "$SVCFILE" 2>/dev/null; then
+      sed -i "s|^Environment=$key=.*|Environment=$key=$val|" "$SVCFILE"
+    else
+      sed -i "/^\[Install\]/i Environment=$key=$val" "$SVCFILE"
+    fi
+    systemctl --user daemon-reload 2>/dev/null || true
   fi
 }
 
@@ -256,6 +269,7 @@ main_menu() {
     echo -e "${WHITE}5. 更新 sing-box${RESET}"
     echo -e "${WHITE}6. 彻底删除${RESET}"
     echo -e "${WHITE}7. 自定义出口${RESET}"
+    echo -e "${WHITE}8. 域名证书${RESET}"
     echo -e "${WHITE}0. 退出${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -ne "${GRAY}请输入选项: ${RESET}"
@@ -268,6 +282,7 @@ main_menu() {
       5) menu_update ;;
       6) menu_delete ;;
       7) menu_outbound ;;
+      8) menu_domain_cert ;;
       0) exit 0 ;;
       *) ;;
     esac
@@ -338,6 +353,7 @@ menu_config() {
     echo -e "${WHITE}1. UUID${RESET}"
     echo -e "${WHITE}2. Argo 隧道模式${RESET}"
     echo -e "${WHITE}3. 可选协议端口${RESET}"
+    echo -e "${WHITE}4. 协议证书绑定${RESET}"
     echo -e "${WHITE}0. 返回${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -ne "${GRAY}请输入选项: ${RESET}"
@@ -346,6 +362,7 @@ menu_config() {
       1) config_uuid ;;
       2) config_argo ;;
       3) config_proto ;;
+      4) config_cert_bind ;;
       0) return ;;
       *) ;;
     esac
@@ -545,6 +562,112 @@ config_proto() {
   done
 }
 
+# ── 协议证书绑定 ──────────────────────────────────────────────────────────────
+# 把某个已经用 acme.sh 申请好的域名证书，绑定给某个支持 TLS 的协议使用，
+# 替代默认的共享自签证书。只处理当前已启用（配了端口）的协议。
+_list_domain_certs() {
+  # 输出已签发的域名列表，每行一个
+  [ -d "$DOMAIN_CERT_DIR" ] || return 0
+  for d in "$DOMAIN_CERT_DIR"/*/; do
+    [ -d "$d" ] || continue
+    dom="$(basename "$d")"
+    [ -f "$d/cert.pem" ] && [ -f "$d/key.pem" ] && echo "$dom"
+  done
+}
+
+config_cert_bind() {
+  while true; do
+    clear
+    echo -e "${GREEN}======= 协议证书绑定 =======${RESET}"
+    local hy2 tuic trojan anytls hy2_dom tuic_dom trojan_dom anytls_dom
+    hy2=$(get_val HY2_PORT); tuic=$(get_val TUIC_PORT)
+    trojan=$(get_val TROJAN_PORT); anytls=$(get_val ANYTLS_PORT)
+    hy2_dom=$(get_val HY2_CERT_DOMAIN); tuic_dom=$(get_val TUIC_CERT_DOMAIN)
+    trojan_dom=$(get_val TROJAN_CERT_DOMAIN); anytls_dom=$(get_val ANYTLS_CERT_DOMAIN)
+
+    local avail
+    avail="$(_list_domain_certs)"
+    if [ -z "$avail" ]; then
+      echo -e "${YELLOW}还没有已签发的域名证书，请先到主菜单「8. 域名证书」申请${RESET}"
+      press_any_key
+      return
+    fi
+
+    echo -e "${GRAY}可用域名证书: ${CYAN}$(echo "$avail" | tr '\n' ' ')${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    local shown=0
+    if [ -n "$hy2" ]; then
+      echo -e "${WHITE}1. Hysteria2  [${CYAN}${hy2_dom:-自签}${WHITE}]${RESET}"; shown=1
+    fi
+    if [ -n "$tuic" ]; then
+      echo -e "${WHITE}2. TUIC       [${CYAN}${tuic_dom:-自签}${WHITE}]${RESET}"; shown=1
+    fi
+    if [ -n "$trojan" ]; then
+      echo -e "${WHITE}3. Trojan     [${CYAN}${trojan_dom:-自签}${WHITE}]${RESET}"; shown=1
+    fi
+    if [ -n "$anytls" ]; then
+      echo -e "${WHITE}4. AnyTLS     [${CYAN}${anytls_dom:-自签}${WHITE}]${RESET}"; shown=1
+    fi
+    if [ "$shown" = "0" ]; then
+      echo -e "${YELLOW}当前没有已启用的 HY2/TUIC/Trojan/AnyTLS 协议，请先在「可选协议端口」里开启${RESET}"
+      press_any_key
+      return
+    fi
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}0. 返回${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -ne "${GRAY}选择要绑定证书的协议: ${RESET}"
+    read -r popt
+
+    local key=""
+    case "$popt" in
+      1) [ -n "$hy2" ]    && key="HY2_CERT_DOMAIN" ;;
+      2) [ -n "$tuic" ]   && key="TUIC_CERT_DOMAIN" ;;
+      3) [ -n "$trojan" ] && key="TROJAN_CERT_DOMAIN" ;;
+      4) [ -n "$anytls" ] && key="ANYTLS_CERT_DOMAIN" ;;
+      0) return ;;
+      *) continue ;;
+    esac
+    [ -z "$key" ] && continue
+
+    echo ""
+    echo -e "${GRAY}可选域名:${RESET}"
+    local i=1
+    local -a domlist
+    domlist=()
+    while IFS= read -r d; do
+      [ -z "$d" ] && continue
+      echo -e "  ${GREEN}${i}${RESET}. $d"
+      domlist+=("$d")
+      i=$((i + 1))
+    done <<< "$avail"
+    echo -e "  ${GREEN}0${RESET}. 恢复自签证书"
+    echo -ne "${GRAY}选择域名 [回车取消]: ${RESET}"
+    read -r dopt
+    [ -z "$dopt" ] && continue
+
+    if [ "$dopt" = "0" ]; then
+      set_val "$key" ""
+      echo -e "${GREEN}已恢复为自签证书${RESET}"
+    elif [ "$dopt" -ge 1 ] 2>/dev/null && [ "$dopt" -le "${#domlist[@]}" ] 2>/dev/null; then
+      local chosen="${domlist[$((dopt - 1))]}"
+      set_val "$key" "$chosen"
+      echo -e "${GREEN}已绑定域名证书: $chosen${RESET}"
+    else
+      echo -e "${RED}无效选择${RESET}"
+      sleep 1
+      continue
+    fi
+
+    echo -ne "${GRAY}立即重启服务使其生效? [Y/n]: ${RESET}"
+    read -r confirm
+    if [ "$confirm" != "n" ] && [ "$confirm" != "N" ]; then
+      restart_service
+    fi
+    press_any_key
+  done
+}
+
 # ── 更新 sing-box ─────────────────────────────────────────────────────────────
 menu_update() {
   clear
@@ -710,6 +833,240 @@ menu_outbound() {
   done
 }
 
+# ── 域名证书 (acme.sh) ────────────────────────────────────────────────────────
+_port80_busy() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | grep -q ':80 ' && return 0
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | grep -q ':80 ' && return 0
+  fi
+  return 1
+}
+
+ensure_acme() {
+  [ -x "$ACME_HOME/acme.sh" ] && return 0
+  echo -e "${YELLOW}正在安装 acme.sh...${RESET}"
+  mkdir -p "$STATE_DIR"
+  local tmp_acme="/tmp/acme-install-$$"
+  rm -rf "$tmp_acme"
+  mkdir -p "$tmp_acme"
+  if command -v curl >/dev/null 2>&1; then
+    curl -sL https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh -o "$tmp_acme/acme.sh"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh -O "$tmp_acme/acme.sh"
+  fi
+  if [ ! -s "$tmp_acme/acme.sh" ]; then
+    echo -e "${RED}acme.sh 下载失败，请检查网络${RESET}"
+    rm -rf "$tmp_acme"
+    return 1
+  fi
+  chmod +x "$tmp_acme/acme.sh"
+  # 没有 crontab 的话 acme.sh 的安装程序会直接拒绝安装（除非加 --force）。
+  # 容器/部分极简 Alpine 环境经常没装 cron，这里探测一下并相应处理。
+  local _install_out _has_cron=1
+  command -v crontab >/dev/null 2>&1 || _has_cron=0
+  if [ "$_has_cron" = "1" ]; then
+    _install_out="$(cd "$tmp_acme" && ./acme.sh --install --home "$ACME_HOME" 2>&1)"
+  else
+    echo -e "${YELLOW}未检测到 crontab，将跳过自动续期定时任务的安装${RESET}"
+    _install_out="$(cd "$tmp_acme" && ./acme.sh --install --home "$ACME_HOME" --force 2>&1)"
+  fi
+  rm -rf "$tmp_acme"
+  if [ ! -x "$ACME_HOME/acme.sh" ]; then
+    echo -e "${RED}acme.sh 安装失败：${RESET}"
+    echo "$_install_out" | tail -10 | sed 's/^/    /'
+    return 1
+  fi
+  if [ "$_has_cron" = "1" ]; then
+    echo -e "${GREEN}acme.sh 安装完成（已自动注册续期定时任务）${RESET}"
+  else
+    echo -e "${GREEN}acme.sh 安装完成${RESET}"
+    echo -e "${YELLOW}⚠ 没有自动续期任务，Let's Encrypt 证书 90 天过期，请记得定期回到本菜单手动续期${RESET}"
+  fi
+  return 0
+}
+
+issue_domain_cert() {
+  ensure_acme || { press_any_key; return; }
+  echo ""
+  echo -ne "${WHITE}要签发证书的域名（需已解析到本机公网 IP）: ${RESET}"
+  read -r domain
+  domain="$(echo "$domain" | tr -d '[:space:]')"
+  if [ -z "$domain" ]; then
+    echo -e "${RED}域名不能为空${RESET}"
+    sleep 1
+    return
+  fi
+  if [ -f "$DOMAIN_CERT_DIR/$domain/cert.pem" ]; then
+    echo -e "${YELLOW}该域名证书已存在，如需更新请用「续期」，或先「删除」再重新申请${RESET}"
+    press_any_key
+    return
+  fi
+
+  echo -e "${YELLOW}即将用 HTTP-01 standalone 方式申请 Let's Encrypt 证书，${RESET}"
+  echo -e "${YELLOW}需要域名已解析到本机公网 IP，且 80 端口能被外网临时访问几秒钟。${RESET}"
+  echo -ne "${GRAY}确认继续? [y/N]: ${RESET}"
+  read -r confirm
+  [ "$confirm" != "y" ] && [ "$confirm" != "Y" ] && return
+
+  # sing-box 本身不占 80，但以防用户自己配置过什么监听在 80，这里先探测一下
+  if _port80_busy; then
+    echo -e "${YELLOW}⚠ 80 端口当前被占用，standalone 验证可能会失败。${RESET}"
+    echo -ne "${GRAY}仍然继续? [y/N]: ${RESET}"
+    read -r confirm2
+    [ "$confirm2" != "y" ] && [ "$confirm2" != "Y" ] && return
+  fi
+
+  mkdir -p "$DOMAIN_CERT_DIR/$domain"
+  echo -e "${YELLOW}正在申请证书，可能需要几十秒...${RESET}"
+  if "$ACME_HOME/acme.sh" --home "$ACME_HOME" --issue -d "$domain" --standalone --httpport 80 --server letsencrypt --force; then
+    "$ACME_HOME/acme.sh" --home "$ACME_HOME" --install-cert -d "$domain" \
+      --key-file "$DOMAIN_CERT_DIR/$domain/key.pem" \
+      --fullchain-file "$DOMAIN_CERT_DIR/$domain/cert.pem" \
+      --reloadcmd "pkill -f 'sing-box run' 2>/dev/null || true" >/dev/null 2>&1
+    chmod 600 "$DOMAIN_CERT_DIR/$domain/key.pem" 2>/dev/null || true
+    if [ -f "$DOMAIN_CERT_DIR/$domain/cert.pem" ] && [ -f "$DOMAIN_CERT_DIR/$domain/key.pem" ]; then
+      echo -e "${GREEN}证书申请成功: $domain${RESET}"
+      echo -e "${GRAY}去「3. 修改配置 -> 4. 协议证书绑定」把它绑定给某个协议即可生效${RESET}"
+    else
+      echo -e "${RED}证书安装步骤失败，请检查上面的输出${RESET}"
+      rm -rf "$DOMAIN_CERT_DIR/$domain"
+    fi
+  else
+    echo -e "${RED}证书申请失败：常见原因是域名没有解析到本机，或 80 端口无法从公网访问（防火墙/云厂商安全组没放行）${RESET}"
+    rm -rf "$DOMAIN_CERT_DIR/$domain"
+  fi
+  press_any_key
+}
+
+import_domain_cert() {
+  echo ""
+  echo -e "${GRAY}适用场景：域名没解析到本机 / 80 端口打不开 / 证书是别处签发的${RESET}"
+  echo -ne "${WHITE}域名(仅作为标识，不会验证是否解析到本机): ${RESET}"
+  read -r domain
+  domain="$(echo "$domain" | tr -d '[:space:]')"
+  [ -z "$domain" ] && { echo -e "${RED}域名不能为空${RESET}"; sleep 1; return; }
+  echo -ne "${WHITE}证书文件路径(fullchain/cert .pem): ${RESET}"
+  read -r cert_src
+  echo -ne "${WHITE}私钥文件路径(key .pem): ${RESET}"
+  read -r key_src
+  if [ ! -f "$cert_src" ] || [ ! -f "$key_src" ]; then
+    echo -e "${RED}文件不存在，请检查路径${RESET}"
+    sleep 1
+    return
+  fi
+  mkdir -p "$DOMAIN_CERT_DIR/$domain"
+  cp "$cert_src" "$DOMAIN_CERT_DIR/$domain/cert.pem"
+  cp "$key_src" "$DOMAIN_CERT_DIR/$domain/key.pem"
+  chmod 600 "$DOMAIN_CERT_DIR/$domain/key.pem" 2>/dev/null || true
+  echo -e "${GREEN}导入完成: $domain${RESET}"
+  echo -e "${GRAY}注意：手动导入的证书不会被 acme.sh 自动续期，到期需要重新导入${RESET}"
+  press_any_key
+}
+
+_pick_domain_cert() {
+  # 交互式选一个已有域名，选中的值放进全局变量 _PICKED_DOMAIN
+  local certs
+  certs="$(_list_domain_certs)"
+  if [ -z "$certs" ]; then
+    echo -e "${YELLOW}还没有已签发/导入的域名证书${RESET}"
+    press_any_key
+    _PICKED_DOMAIN=""
+    return 1
+  fi
+  local i=1
+  local -a domlist
+  domlist=()
+  while IFS= read -r d; do
+    [ -z "$d" ] && continue
+    echo -e "  ${GREEN}${i}${RESET}. $d"
+    domlist+=("$d")
+    i=$((i + 1))
+  done <<< "$certs"
+  echo -ne "${GRAY}选择 [回车取消]: ${RESET}"
+  read -r popt
+  if [ -z "$popt" ] || ! [ "$popt" -ge 1 ] 2>/dev/null || ! [ "$popt" -le "${#domlist[@]}" ] 2>/dev/null; then
+    _PICKED_DOMAIN=""
+    return 1
+  fi
+  _PICKED_DOMAIN="${domlist[$((popt - 1))]}"
+  return 0
+}
+
+renew_domain_cert() {
+  echo -e "${GRAY}选择要续期的域名:${RESET}"
+  _pick_domain_cert || return
+  local dom="$_PICKED_DOMAIN"
+  if [ ! -x "$ACME_HOME/acme.sh" ]; then
+    echo -e "${RED}未检测到 acme.sh，该证书可能是手动导入的，无法自动续期，请重新手动导入新证书${RESET}"
+    press_any_key
+    return
+  fi
+  echo -e "${YELLOW}正在续期 $dom ...${RESET}"
+  "$ACME_HOME/acme.sh" --home "$ACME_HOME" --renew -d "$dom" --force --standalone --httpport 80
+  "$ACME_HOME/acme.sh" --home "$ACME_HOME" --install-cert -d "$dom" \
+    --key-file "$DOMAIN_CERT_DIR/$dom/key.pem" \
+    --fullchain-file "$DOMAIN_CERT_DIR/$dom/cert.pem" \
+    --reloadcmd "pkill -f 'sing-box run' 2>/dev/null || true" >/dev/null 2>&1
+  chmod 600 "$DOMAIN_CERT_DIR/$dom/key.pem" 2>/dev/null || true
+  echo -e "${GREEN}续期完成${RESET}"
+  press_any_key
+}
+
+delete_domain_cert() {
+  echo -e "${GRAY}选择要删除的域名:${RESET}"
+  _pick_domain_cert || return
+  local dom="$_PICKED_DOMAIN"
+  echo -e "${YELLOW}⚠ 如果有协议正绑定这个域名证书，删除后该协议会在下次重启时自动回退为自签证书${RESET}"
+  echo -ne "${GRAY}确认删除 $dom ? [y/N]: ${RESET}"
+  read -r confirm
+  if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+    [ -x "$ACME_HOME/acme.sh" ] && "$ACME_HOME/acme.sh" --home "$ACME_HOME" --remove -d "$dom" >/dev/null 2>&1
+    rm -rf "$DOMAIN_CERT_DIR/$dom"
+    echo -e "${GREEN}已删除${RESET}"
+  fi
+  press_any_key
+}
+
+menu_domain_cert() {
+  while true; do
+    clear
+    echo -e "${GREEN}======= 域名证书 (acme.sh) =======${RESET}"
+    local certs
+    certs="$(_list_domain_certs)"
+    if [ -n "$certs" ]; then
+      echo -e "${GRAY}已签发/导入证书:${RESET}"
+      while IFS= read -r d; do
+        [ -z "$d" ] && continue
+        local exp=""
+        if command -v openssl >/dev/null 2>&1 && [ -f "$DOMAIN_CERT_DIR/$d/cert.pem" ]; then
+          exp="$(openssl x509 -enddate -noout -in "$DOMAIN_CERT_DIR/$d/cert.pem" 2>/dev/null | sed 's/notAfter=//')"
+        fi
+        echo -e "  ${CYAN}$d${RESET}  ${GRAY}${exp:+到期: $exp}${RESET}"
+      done <<< "$certs"
+    else
+      echo -e "${GRAY}还没有已签发的域名证书${RESET}"
+    fi
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}1. 申请新域名证书 (acme.sh 自动)${RESET}"
+    echo -e "${WHITE}2. 手动导入已有证书${RESET}"
+    echo -e "${WHITE}3. 续期指定证书${RESET}"
+    echo -e "${WHITE}4. 删除证书${RESET}"
+    echo -e "${WHITE}0. 返回${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -ne "${GRAY}请输入选项: ${RESET}"
+    read -r opt
+    case "$opt" in
+      1) issue_domain_cert ;;
+      2) import_domain_cert ;;
+      3) renew_domain_cert ;;
+      4) delete_domain_cert ;;
+      0) return ;;
+      *) ;;
+    esac
+  done
+}
+
 # ── 彻底删除 ──────────────────────────────────────────────────────────────────
 menu_delete() {
   clear
@@ -774,6 +1131,7 @@ for RC in "\$HOME/.bashrc" "\$HOME/.profile" "\$HOME/.bash_profile" "\$HOME/.zsh
   sed -i '/# singbox/d'  "\$RC" 2>/dev/null || true
   sed -i '/singbox/d'    "\$RC" 2>/dev/null || true
 done
+[ -x "\$HOME/singbox/state/acme.sh/acme.sh" ] && "\$HOME/singbox/state/acme.sh/acme.sh" --uninstall >/dev/null 2>&1 || true
 rm -rf "\$HOME/singbox"
 rm -rf /tmp/sb-bin
 rm -f "\$HOME/uuid.txt" "\$HOME/sb-config.json" "\$HOME/reality-keys.txt" "\$HOME/outbound.conf"
