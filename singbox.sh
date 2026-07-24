@@ -26,6 +26,14 @@ HY2_CERT_DOMAIN="${HY2_CERT_DOMAIN:-}"
 TUIC_CERT_DOMAIN="${TUIC_CERT_DOMAIN:-}"
 TROJAN_CERT_DOMAIN="${TROJAN_CERT_DOMAIN:-}"
 ANYTLS_CERT_DOMAIN="${ANYTLS_CERT_DOMAIN:-}"
+# HY2/TUIC 多端口：
+# *_EXTRA_PORTS = 逗号分隔的额外固定端口，跟主端口一样独立监听、共享同一套凭证/证书
+# *_HOP_RANGE   = 端口跳跃范围如 "20000-30000"，只在真正监听的主端口上生效，
+#                 靠 nftables/iptables 把这段 UDP 范围整体转发到主端口，需要 root
+HY2_EXTRA_PORTS="${HY2_EXTRA_PORTS:-}"
+HY2_HOP_RANGE="${HY2_HOP_RANGE:-}"
+TUIC_EXTRA_PORTS="${TUIC_EXTRA_PORTS:-}"
+TUIC_HOP_RANGE="${TUIC_HOP_RANGE:-}"
 # 优选地址
 CF_PREFER_HOST="${CF_PREFER_HOST:-cdns.doon.eu.org}"
 WS_PATH="${WS_PATH:-/fengyue}"
@@ -197,6 +205,45 @@ port_ok() {
   fi
   echo "$_p" >> "$USED_PORTS_FILE"
   return 0
+}
+
+# 校验 "20000-30000" 这种端口范围格式，用于端口跳跃(port hopping)
+valid_port_range() {
+  _r="$1"
+  case "$_r" in
+    *[!0-9-]*) return 1 ;;
+  esac
+  _start="${_r%%-*}"
+  _end="${_r##*-}"
+  [ "$_r" = "${_start}-${_end}" ] || return 1
+  case "$_start" in ''|*[!0-9]*) return 1 ;; esac
+  case "$_end" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_start" -ge 1 ] && [ "$_end" -le 65535 ] && [ "$_start" -lt "$_end" ]
+}
+
+# 解析逗号分隔的额外端口列表，逐个跑 port_ok 校验，输出通过校验的端口(空格分隔)
+parse_extra_ports() {
+  # 注意：这个函数的 stdout 会被调用方用 $(...) 捕获当返回值，
+  # 所以内部绝对不能调用会写 stdout 的 warn()/log()，否则警告文字会混进
+  # 端口列表里，把后面所有基于这个列表的处理全部搞坏（曾经实际导致过
+  # sing-box 因为端口列表被污染而重复绑定同一端口，启动时直接崩溃）。
+  _list="$1"
+  _out=""
+  _old_ifs="$IFS"
+  IFS=','
+  for _p in $_list; do
+    IFS="$_old_ifs"
+    _p="$(echo "$_p" | tr -d '[:space:]')"
+    [ -z "$_p" ] && continue
+    if port_ok "$_p"; then
+      _out="${_out}${_out:+ }${_p}"
+    else
+      echo "[WARN] 额外端口 ${_p} 无效或冲突，已跳过" >&2
+    fi
+    IFS=','
+  done
+  IFS="$_old_ifs"
+  echo "$_out"
 }
 
 get_free_port() {
@@ -690,12 +737,23 @@ if [ "${DISABLE_ARGO:-}" != "true" ]; then
   fi
 fi
 
+HY2_ACTIVE_PORTS=""
 if [ "$HY2_ACTIVE" = "1" ]; then
-  _hy2_json="{
+  _hy2_ports="$HY2_PORT"
+  if [ -n "$HY2_EXTRA_PORTS" ]; then
+    _hy2_extra="$(parse_extra_ports "$HY2_EXTRA_PORTS")"
+    [ -n "$_hy2_extra" ] && _hy2_ports="$_hy2_ports $_hy2_extra"
+  fi
+  _idx=0
+  for _p in $_hy2_ports; do
+    _idx=$((_idx + 1))
+    _tag="hy2-in"
+    [ "$_idx" -gt 1 ] && _tag="hy2-in-${_idx}"
+    _hy2_json="{
       \"type\": \"hysteria2\",
-      \"tag\": \"hy2-in\",
+      \"tag\": \"${_tag}\",
       \"listen\": \"::\",
-      \"listen_port\": ${HY2_PORT},
+      \"listen_port\": ${_p},
       \"users\": [{ \"password\": \"${UUID}\" }],
       \"masquerade\": \"https://bing.com\",
       \"tls\": {
@@ -705,15 +763,30 @@ if [ "$HY2_ACTIVE" = "1" ]; then
         \"key_path\": \"${HY2_TLS_KEY}\"
       }
     }"
-  try_add_inbound "Hysteria2" "$_hy2_json" || HY2_ACTIVE=0
+    if try_add_inbound "Hysteria2(${_p})" "$_hy2_json"; then
+      HY2_ACTIVE_PORTS="${HY2_ACTIVE_PORTS}${HY2_ACTIVE_PORTS:+ }${_p}"
+    fi
+  done
+  [ -z "$HY2_ACTIVE_PORTS" ] && HY2_ACTIVE=0
 fi
 
+TUIC_ACTIVE_PORTS=""
 if [ "$TUIC_ACTIVE" = "1" ]; then
-  _tuic_json="{
+  _tuic_ports="$TUIC_PORT"
+  if [ -n "$TUIC_EXTRA_PORTS" ]; then
+    _tuic_extra="$(parse_extra_ports "$TUIC_EXTRA_PORTS")"
+    [ -n "$_tuic_extra" ] && _tuic_ports="$_tuic_ports $_tuic_extra"
+  fi
+  _idx=0
+  for _p in $_tuic_ports; do
+    _idx=$((_idx + 1))
+    _tag="tuic-in"
+    [ "$_idx" -gt 1 ] && _tag="tuic-in-${_idx}"
+    _tuic_json="{
       \"type\": \"tuic\",
-      \"tag\": \"tuic-in\",
+      \"tag\": \"${_tag}\",
       \"listen\": \"::\",
-      \"listen_port\": ${TUIC_PORT},
+      \"listen_port\": ${_p},
       \"users\": [{ \"uuid\": \"${UUID}\", \"password\": \"${UUID}\" }],
       \"congestion_control\": \"bbr\",
       \"tls\": {
@@ -723,8 +796,100 @@ if [ "$TUIC_ACTIVE" = "1" ]; then
         \"key_path\": \"${TUIC_TLS_KEY}\"
       }
     }"
-  try_add_inbound "TUIC" "$_tuic_json" || TUIC_ACTIVE=0
+    if try_add_inbound "TUIC(${_p})" "$_tuic_json"; then
+      TUIC_ACTIVE_PORTS="${TUIC_ACTIVE_PORTS}${TUIC_ACTIVE_PORTS:+ }${_p}"
+    fi
+  done
+  [ -z "$TUIC_ACTIVE_PORTS" ] && TUIC_ACTIVE=0
 fi
+
+# ── 端口跳跃 (port hopping) ───────────────────────────────────────────────────
+# 只转发到"主端口"（HY2_PORT/TUIC_PORT 本身），跟上面的额外固定端口是两回事：
+# 额外端口是多开几个独立监听，端口跳跃是把一段范围整体 NAT 到同一个主端口。
+# 需要 root 权限操作 nftables/iptables，规则不持久化到磁盘，每次脚本启动都会
+# 用固定的表/链幂等地重新下发（flush 掉自己那部分再重建），不影响系统上其它防火墙规则。
+HOP_NFT_TABLE="singbox_hop"
+HOP_BACKEND=""
+
+hop_detect_backend() {
+  [ -n "$HOP_BACKEND" ] && return 0
+  if command -v nft >/dev/null 2>&1; then
+    HOP_BACKEND="nft"; return 0
+  fi
+  if command -v iptables >/dev/null 2>&1; then
+    HOP_BACKEND="iptables"; return 0
+  fi
+  warn "缺少 nft/iptables，尝试自动安装..."
+  try_install_pkg nftables
+  if command -v nft >/dev/null 2>&1; then
+    HOP_BACKEND="nft"; return 0
+  fi
+  try_install_pkg iptables
+  if command -v iptables >/dev/null 2>&1; then
+    HOP_BACKEND="iptables"; return 0
+  fi
+  return 1
+}
+
+hop_init_chain() {
+  if [ "$HOP_BACKEND" = "nft" ]; then
+    nft add table inet "$HOP_NFT_TABLE" 2>/dev/null
+    nft "add chain inet $HOP_NFT_TABLE prerouting { type nat hook prerouting priority -100 ; }" 2>/dev/null
+    nft flush chain inet "$HOP_NFT_TABLE" prerouting 2>/dev/null
+  elif [ "$HOP_BACKEND" = "iptables" ]; then
+    iptables -t nat -N SINGBOX_HOP 2>/dev/null
+    iptables -t nat -C PREROUTING -j SINGBOX_HOP 2>/dev/null || iptables -t nat -A PREROUTING -j SINGBOX_HOP 2>/dev/null
+    iptables -t nat -F SINGBOX_HOP 2>/dev/null
+    if command -v ip6tables >/dev/null 2>&1; then
+      ip6tables -t nat -N SINGBOX_HOP 2>/dev/null
+      ip6tables -t nat -C PREROUTING -j SINGBOX_HOP 2>/dev/null || ip6tables -t nat -A PREROUTING -j SINGBOX_HOP 2>/dev/null
+      ip6tables -t nat -F SINGBOX_HOP 2>/dev/null
+    fi
+  fi
+}
+
+hop_add_rule() {
+  # $1=协议标签 $2=范围(如 20000-30000) $3=转发目标端口(主端口) -> 0=成功
+  _label="$1"; _range="$2"; _port="$3"
+  if ! valid_port_range "$_range"; then
+    warn "${_label}_HOP_RANGE 格式不合法(${_range})，应为如 20000-30000，已跳过"
+    return 1
+  fi
+  if [ "$HOP_BACKEND" = "nft" ]; then
+    if nft add rule inet "$HOP_NFT_TABLE" prerouting udp dport "$_range" redirect to ":${_port}" 2>/dev/null; then
+      log "端口跳跃已生效(nftables): ${_label} UDP ${_range} -> ${_port}"
+      return 0
+    fi
+  elif [ "$HOP_BACKEND" = "iptables" ]; then
+    _dports="$(echo "$_range" | tr '-' ':')"
+    if iptables -t nat -A SINGBOX_HOP -p udp --dport "$_dports" -j REDIRECT --to-port "$_port" 2>/dev/null; then
+      command -v ip6tables >/dev/null 2>&1 && ip6tables -t nat -A SINGBOX_HOP -p udp --dport "$_dports" -j REDIRECT --to-port "$_port" 2>/dev/null
+      log "端口跳跃已生效(iptables): ${_label} UDP ${_range} -> ${_port}"
+      return 0
+    fi
+  fi
+  warn "${_label} 端口跳跃规则下发失败"
+  return 1
+}
+
+HY2_HOP_ACTIVE=0
+TUIC_HOP_ACTIVE=0
+if [ -n "$HY2_HOP_RANGE" ] || [ -n "$TUIC_HOP_RANGE" ]; then
+  if [ "$(id -u)" != "0" ]; then
+    warn "端口跳跃需要 root 权限下发防火墙规则，本次跳过（协议本身仍会用主端口正常工作）"
+  elif hop_detect_backend; then
+    hop_init_chain
+    if [ -n "$HY2_HOP_RANGE" ] && [ "$HY2_ACTIVE" = "1" ]; then
+      hop_add_rule "Hysteria2" "$HY2_HOP_RANGE" "$HY2_PORT" && HY2_HOP_ACTIVE=1
+    fi
+    if [ -n "$TUIC_HOP_RANGE" ] && [ "$TUIC_ACTIVE" = "1" ]; then
+      hop_add_rule "TUIC" "$TUIC_HOP_RANGE" "$TUIC_PORT" && TUIC_HOP_ACTIVE=1
+    fi
+  else
+    warn "缺少 nft/iptables 且自动安装失败，端口跳跃本次未生效"
+  fi
+fi
+
 
 if [ "$REALITY_ACTIVE" = "1" ]; then
   _reality_json="{
@@ -942,9 +1107,22 @@ generate_sub() {
     else
       _hy2_sni="www.bing.com"; _hy2_insecure="1"
     fi
-    _link="hysteria2://${UUID}@$(format_addr "$PUBLIC_IP"):${HY2_PORT}?sni=${_hy2_sni}&insecure=${_hy2_insecure}&alpn=h3&obfs=none#${NAME_ENCODED}"
-    ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
+    _hy2_hopq=""
+    [ "$HY2_HOP_ACTIVE" = "1" ] && _hy2_hopq="&mport=${HY2_HOP_RANGE}"
+    _idx=0
+    for _p in $HY2_ACTIVE_PORTS; do
+      _idx=$((_idx + 1))
+      _hy2_name="$NAME_ENCODED"
+      _hy2_q=""
+      if [ "$_idx" -gt 1 ]; then
+        _hy2_name="${NAME_ENCODED}-P${_idx}"
+      else
+        _hy2_q="$_hy2_hopq"
+      fi
+      _link="hysteria2://${UUID}@$(format_addr "$PUBLIC_IP"):${_p}?sni=${_hy2_sni}&insecure=${_hy2_insecure}&alpn=h3&obfs=none${_hy2_q}#${_hy2_name}"
+      ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
+    done
   fi
 
   if [ "$TUIC_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
@@ -953,9 +1131,22 @@ generate_sub() {
     else
       _tuic_sni="www.bing.com"; _tuic_insecure="1"
     fi
-    _link="tuic://${UUID}:${UUID}@$(format_addr "$PUBLIC_IP"):${TUIC_PORT}?sni=${_tuic_sni}&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=${_tuic_insecure}#${NAME_ENCODED}"
-    ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
+    _tuic_hopq=""
+    [ "$TUIC_HOP_ACTIVE" = "1" ] && _tuic_hopq="&mport=${TUIC_HOP_RANGE}"
+    _idx=0
+    for _p in $TUIC_ACTIVE_PORTS; do
+      _idx=$((_idx + 1))
+      _tuic_name="$NAME_ENCODED"
+      _tuic_q=""
+      if [ "$_idx" -gt 1 ]; then
+        _tuic_name="${NAME_ENCODED}-P${_idx}"
+      else
+        _tuic_q="$_tuic_hopq"
+      fi
+      _link="tuic://${UUID}:${UUID}@$(format_addr "$PUBLIC_IP"):${_p}?sni=${_tuic_sni}&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=${_tuic_insecure}${_tuic_q}#${_tuic_name}"
+      ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
+    done
   fi
 
   if [ "$REALITY_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ] && [ -n "$REALITY_PUB" ]; then
@@ -1019,8 +1210,20 @@ fi
 log "============== 已启用协议 =============="
 [ "${DISABLE_ARGO:-}" != "true" ] && log "✓ VMess + WS + Argo TLS  (域名: $ARGO_HOST)"
 [ "${DISABLE_ARGO:-}" = "true"  ] && log "✗ Argo 隧道已禁用"
-[ "$HY2_ACTIVE"     = "1" ] && log "✓ Hysteria2     端口 $HY2_PORT (UDP)  证书: ${HY2_CERT_DOMAIN:-自签}"
-[ "$TUIC_ACTIVE"    = "1" ] && log "✓ TUIC v5       端口 $TUIC_PORT (UDP)  证书: ${TUIC_CERT_DOMAIN:-自签}"
+if [ "$HY2_ACTIVE" = "1" ]; then
+  _hy2_extra_disp="$(echo "$HY2_ACTIVE_PORTS" | sed "s/^${HY2_PORT} *//")"
+  _hy2_line="✓ Hysteria2     端口 $HY2_PORT (UDP)  证书: ${HY2_CERT_DOMAIN:-自签}"
+  [ -n "$_hy2_extra_disp" ] && _hy2_line="${_hy2_line}  额外端口: ${_hy2_extra_disp}"
+  [ "$HY2_HOP_ACTIVE" = "1" ] && _hy2_line="${_hy2_line}  跳跃: ${HY2_HOP_RANGE}"
+  log "$_hy2_line"
+fi
+if [ "$TUIC_ACTIVE" = "1" ]; then
+  _tuic_extra_disp="$(echo "$TUIC_ACTIVE_PORTS" | sed "s/^${TUIC_PORT} *//")"
+  _tuic_line="✓ TUIC v5       端口 $TUIC_PORT (UDP)  证书: ${TUIC_CERT_DOMAIN:-自签}"
+  [ -n "$_tuic_extra_disp" ] && _tuic_line="${_tuic_line}  额外端口: ${_tuic_extra_disp}"
+  [ "$TUIC_HOP_ACTIVE" = "1" ] && _tuic_line="${_tuic_line}  跳跃: ${TUIC_HOP_RANGE}"
+  log "$_tuic_line"
+fi
 [ "$REALITY_ACTIVE" = "1" ] && log "✓ VLESS Reality 端口 $REALITY_PORT  PubKey: $REALITY_PUB"
 [ "$SS_ACTIVE"      = "1" ] && log "✓ Shadowsocks   端口 $SS_PORT (TCP)"
 [ "$SOCKS5_ACTIVE"  = "1" ] && log "✓ SOCKS5        端口 $SOCKS5_PORT (TCP/UDP)  用户: singbox"

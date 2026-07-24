@@ -354,6 +354,7 @@ menu_config() {
     echo -e "${WHITE}2. Argo 隧道模式${RESET}"
     echo -e "${WHITE}3. 可选协议端口${RESET}"
     echo -e "${WHITE}4. 协议证书绑定${RESET}"
+    echo -e "${WHITE}5. HY2/TUIC 多端口${RESET}"
     echo -e "${WHITE}0. 返回${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -ne "${GRAY}请输入选项: ${RESET}"
@@ -363,6 +364,7 @@ menu_config() {
       2) config_argo ;;
       3) config_proto ;;
       4) config_cert_bind ;;
+      5) config_multiport ;;
       0) return ;;
       *) ;;
     esac
@@ -665,6 +667,114 @@ config_cert_bind() {
       restart_service
     fi
     press_any_key
+  done
+}
+
+# ── HY2/TUIC 多端口 ───────────────────────────────────────────────────────────
+# 两种独立的"多端口"：
+#   额外端口 = 同一协议再多开几个固定端口，各自独立监听，跟主端口共享凭证/证书
+#   端口跳跃 = 一段 UDP 范围整体 NAT 转发到主端口，客户端在范围内随机跳，抗限速
+#             （需要 root + nftables/iptables，本身在 singbox.sh 启动时才会真正下发）
+config_multiport() {
+  while true; do
+    clear
+    echo -e "${GREEN}======= HY2/TUIC 多端口 =======${RESET}"
+    local hy2 tuic hy2_extra tuic_extra hy2_hop tuic_hop
+    hy2=$(get_val HY2_PORT); tuic=$(get_val TUIC_PORT)
+    hy2_extra=$(get_val HY2_EXTRA_PORTS); tuic_extra=$(get_val TUIC_EXTRA_PORTS)
+    hy2_hop=$(get_val HY2_HOP_RANGE); tuic_hop=$(get_val TUIC_HOP_RANGE)
+
+    if [ -z "$hy2" ] && [ -z "$tuic" ]; then
+      echo -e "${YELLOW}当前没有已启用的 HY2/TUIC，请先在「可选协议端口」里开启${RESET}"
+      press_any_key
+      return
+    fi
+
+    echo -e "${GRAY}--------------------------------${RESET}"
+    if [ -n "$hy2" ]; then
+      echo -e "${WHITE}Hysteria2${RESET} (主端口 ${CYAN}$hy2${RESET})"
+      echo -e "  额外端口: ${CYAN}${hy2_extra:-无}${RESET}"
+      echo -e "  端口跳跃: ${CYAN}${hy2_hop:-未启用}${RESET}"
+    fi
+    if [ -n "$tuic" ]; then
+      echo -e "${WHITE}TUIC${RESET} (主端口 ${CYAN}$tuic${RESET})"
+      echo -e "  额外端口: ${CYAN}${tuic_extra:-无}${RESET}"
+      echo -e "  端口跳跃: ${CYAN}${tuic_hop:-未启用}${RESET}"
+    fi
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}1. 设置 Hysteria2 额外端口${RESET}"
+    echo -e "${WHITE}2. 设置 Hysteria2 端口跳跃范围${RESET}"
+    echo -e "${WHITE}3. 设置 TUIC 额外端口${RESET}"
+    echo -e "${WHITE}4. 设置 TUIC 端口跳跃范围${RESET}"
+    echo -e "${WHITE}0. 确认并重启${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -ne "${GRAY}请输入选项: ${RESET}"
+    read -r opt
+
+    case "$opt" in
+      1)
+        if [ -z "$hy2" ]; then
+          echo -e "${RED}Hysteria2 未启用${RESET}"; sleep 1; continue
+        fi
+        echo -ne "${GRAY}额外端口(逗号分隔如 19001,19002，留空清除)[当前: ${hy2_extra:-无}]: ${RESET}"
+        read -r val
+        set_val HY2_EXTRA_PORTS "$val"
+        echo -e "${GREEN}已更新${RESET}"
+        sleep 1
+        ;;
+      2)
+        if [ -z "$hy2" ]; then
+          echo -e "${RED}Hysteria2 未启用${RESET}"; sleep 1; continue
+        fi
+        echo -e "${YELLOW}提示：端口跳跃需要 root 权限 + nftables/iptables，容器/非 root 环境可能无法生效${RESET}"
+        echo -ne "${GRAY}跳跃范围(如 20000-30000，留空清除)[当前: ${hy2_hop:-未启用}]: ${RESET}"
+        read -r val
+        if [ -n "$val" ] && ! echo "$val" | grep -qE '^[0-9]+-[0-9]+$'; then
+          echo -e "${RED}格式不对，应为如 20000-30000${RESET}"
+          sleep 1
+          continue
+        fi
+        set_val HY2_HOP_RANGE "$val"
+        echo -e "${GREEN}已更新${RESET}"
+        sleep 1
+        ;;
+      3)
+        if [ -z "$tuic" ]; then
+          echo -e "${RED}TUIC 未启用${RESET}"; sleep 1; continue
+        fi
+        echo -ne "${GRAY}额外端口(逗号分隔如 19101,19102，留空清除)[当前: ${tuic_extra:-无}]: ${RESET}"
+        read -r val
+        set_val TUIC_EXTRA_PORTS "$val"
+        echo -e "${GREEN}已更新${RESET}"
+        sleep 1
+        ;;
+      4)
+        if [ -z "$tuic" ]; then
+          echo -e "${RED}TUIC 未启用${RESET}"; sleep 1; continue
+        fi
+        echo -e "${YELLOW}提示：端口跳跃需要 root 权限 + nftables/iptables，容器/非 root 环境可能无法生效${RESET}"
+        echo -e "${YELLOW}且 TUIC 端口跳跃的客户端支持不如 Hysteria2 普及，部分客户端会当成普通单端口用${RESET}"
+        echo -ne "${GRAY}跳跃范围(如 20000-30000，留空清除)[当前: ${tuic_hop:-未启用}]: ${RESET}"
+        read -r val
+        if [ -n "$val" ] && ! echo "$val" | grep -qE '^[0-9]+-[0-9]+$'; then
+          echo -e "${RED}格式不对，应为如 20000-30000${RESET}"
+          sleep 1
+          continue
+        fi
+        set_val TUIC_HOP_RANGE "$val"
+        echo -e "${GREEN}已更新${RESET}"
+        sleep 1
+        ;;
+      0)
+        echo -ne "${GRAY}确认修改并重启? [y/N]: ${RESET}"
+        read -r confirm
+        if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+          restart_service
+        fi
+        return
+        ;;
+      *) ;;
+    esac
   done
 }
 
@@ -1132,6 +1242,18 @@ for RC in "\$HOME/.bashrc" "\$HOME/.profile" "\$HOME/.bash_profile" "\$HOME/.zsh
   sed -i '/singbox/d'    "\$RC" 2>/dev/null || true
 done
 [ -x "\$HOME/singbox/state/acme.sh/acme.sh" ] && "\$HOME/singbox/state/acme.sh/acme.sh" --uninstall >/dev/null 2>&1 || true
+# 清理端口跳跃留下的防火墙表/链(如果有)
+command -v nft >/dev/null 2>&1 && nft delete table inet singbox_hop >/dev/null 2>&1 || true
+if command -v iptables >/dev/null 2>&1; then
+  iptables -t nat -F SINGBOX_HOP >/dev/null 2>&1 || true
+  iptables -t nat -D PREROUTING -j SINGBOX_HOP >/dev/null 2>&1 || true
+  iptables -t nat -X SINGBOX_HOP >/dev/null 2>&1 || true
+fi
+if command -v ip6tables >/dev/null 2>&1; then
+  ip6tables -t nat -F SINGBOX_HOP >/dev/null 2>&1 || true
+  ip6tables -t nat -D PREROUTING -j SINGBOX_HOP >/dev/null 2>&1 || true
+  ip6tables -t nat -X SINGBOX_HOP >/dev/null 2>&1 || true
+fi
 rm -rf "\$HOME/singbox"
 rm -rf /tmp/sb-bin
 rm -f "\$HOME/uuid.txt" "\$HOME/sb-config.json" "\$HOME/reality-keys.txt" "\$HOME/outbound.conf"
