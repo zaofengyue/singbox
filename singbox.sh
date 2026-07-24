@@ -1103,9 +1103,9 @@ generate_sub() {
 
   if [ "$HY2_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
     if [ "$HY2_TLS_INSECURE" = "0" ]; then
-      _hy2_sni="$HY2_TLS_SNI"; _hy2_insecure="0"
+      _hy2_sni="$HY2_TLS_SNI"; _hy2_insecure="0"; _hy2_addr="$HY2_TLS_SNI"
     else
-      _hy2_sni="www.bing.com"; _hy2_insecure="1"
+      _hy2_sni="www.bing.com"; _hy2_insecure="1"; _hy2_addr="$(format_addr "$PUBLIC_IP")"
     fi
     _hy2_hopq=""
     [ "$HY2_HOP_ACTIVE" = "1" ] && _hy2_hopq="&mport=${HY2_HOP_RANGE}"
@@ -1119,7 +1119,7 @@ generate_sub() {
       else
         _hy2_q="$_hy2_hopq"
       fi
-      _link="hysteria2://${UUID}@$(format_addr "$PUBLIC_IP"):${_p}?sni=${_hy2_sni}&insecure=${_hy2_insecure}&alpn=h3&obfs=none${_hy2_q}#${_hy2_name}"
+      _link="hysteria2://${UUID}@${_hy2_addr}:${_p}?sni=${_hy2_sni}&insecure=${_hy2_insecure}&alpn=h3&obfs=none${_hy2_q}#${_hy2_name}"
       ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
     done
@@ -1127,9 +1127,9 @@ generate_sub() {
 
   if [ "$TUIC_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
     if [ "$TUIC_TLS_INSECURE" = "0" ]; then
-      _tuic_sni="$TUIC_TLS_SNI"; _tuic_insecure="0"
+      _tuic_sni="$TUIC_TLS_SNI"; _tuic_insecure="0"; _tuic_addr="$TUIC_TLS_SNI"
     else
-      _tuic_sni="www.bing.com"; _tuic_insecure="1"
+      _tuic_sni="www.bing.com"; _tuic_insecure="1"; _tuic_addr="$(format_addr "$PUBLIC_IP")"
     fi
     _tuic_hopq=""
     [ "$TUIC_HOP_ACTIVE" = "1" ] && _tuic_hopq="&mport=${TUIC_HOP_RANGE}"
@@ -1143,7 +1143,7 @@ generate_sub() {
       else
         _tuic_q="$_tuic_hopq"
       fi
-      _link="tuic://${UUID}:${UUID}@$(format_addr "$PUBLIC_IP"):${_p}?sni=${_tuic_sni}&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=${_tuic_insecure}${_tuic_q}#${_tuic_name}"
+      _link="tuic://${UUID}:${UUID}@${_tuic_addr}:${_p}?sni=${_tuic_sni}&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=${_tuic_insecure}${_tuic_q}#${_tuic_name}"
       ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
     done
@@ -1170,22 +1170,22 @@ generate_sub() {
 
   if [ "$TROJAN_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
     if [ "$TROJAN_TLS_INSECURE" = "0" ]; then
-      _trojan_sni="$TROJAN_TLS_SNI"; _trojan_insecure="0"
+      _trojan_sni="$TROJAN_TLS_SNI"; _trojan_insecure="0"; _trojan_addr="$TROJAN_TLS_SNI"
     else
-      _trojan_sni="bing.com"; _trojan_insecure="1"
+      _trojan_sni="bing.com"; _trojan_insecure="1"; _trojan_addr="$(format_addr "$PUBLIC_IP")"
     fi
-    _link="trojan://${UUID}@$(format_addr "$PUBLIC_IP"):${TROJAN_PORT}?security=tls&sni=${_trojan_sni}&allowInsecure=${_trojan_insecure}&fp=firefox#${NAME_ENCODED}"
+    _link="trojan://${UUID}@${_trojan_addr}:${TROJAN_PORT}?security=tls&sni=${_trojan_sni}&allowInsecure=${_trojan_insecure}&fp=firefox#${NAME_ENCODED}"
     ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
   fi
 
   if [ "$ANYTLS_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
     if [ "$ANYTLS_TLS_INSECURE" = "0" ]; then
-      _anytls_sni="$ANYTLS_TLS_SNI"; _anytls_insecure="0"
+      _anytls_sni="$ANYTLS_TLS_SNI"; _anytls_insecure="0"; _anytls_addr="$ANYTLS_TLS_SNI"
     else
-      _anytls_sni="bing.com"; _anytls_insecure="1"
+      _anytls_sni="bing.com"; _anytls_insecure="1"; _anytls_addr="$(format_addr "$PUBLIC_IP")"
     fi
-    _link="anytls://${UUID}@$(format_addr "$PUBLIC_IP"):${ANYTLS_PORT}?sni=${_anytls_sni}&insecure=${_anytls_insecure}#${NAME_ENCODED}"
+    _link="anytls://${UUID}@${_anytls_addr}:${ANYTLS_PORT}?sni=${_anytls_sni}&insecure=${_anytls_insecure}#${NAME_ENCODED}"
     ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
   fi

@@ -139,41 +139,61 @@ if ! $HAS_ENV; then
   echo -e "  ${GREEN}g${NC}. AnyTLS       (TCP)"
   read -p "选择协议（如 ac 表示启用 a 和 c，留空跳过）: " _PROTO_CHOICE
 
+  # 端口和 Reality 伪装域名不再交互询问：端口在 20000-49151 范围内随机生成
+  # （避开 0-1023 常规/知名端口，也避开高位动态端口区间），本次内部去重；
+  # Reality 域名留空，交给 singbox.sh 用内置默认值 www.iij.ad.jp。
+  _used_rand_ports=""
+  gen_rand_port() {
+    local _p _tries=0
+    while [ $_tries -lt 50 ]; do
+      _p=$(( (RANDOM % 29152) + 20000 ))
+      case " $_used_rand_ports " in
+        *" $_p "*) _tries=$((_tries + 1)); continue ;;
+      esac
+      if command -v ss >/dev/null 2>&1 && ss -ltnu 2>/dev/null | grep -q ":${_p} "; then
+        _tries=$((_tries + 1)); continue
+      fi
+      _GEN_PORT="$_p"
+      _used_rand_ports="$_used_rand_ports $_p"
+      return
+    done
+    _GEN_PORT="$_p"
+    _used_rand_ports="$_used_rand_ports $_p"
+  }
+
   if echo "$_PROTO_CHOICE" | grep -qi "a"; then
-    read -p "HY2_PORT/Hysteria2 端口(UDP): " INPUT_HY2_PORT
-    INPUT_HY2_PORT="$(echo "$INPUT_HY2_PORT" | tr -d '[:space:]')"
+    gen_rand_port; INPUT_HY2_PORT="$_GEN_PORT"
+    echo -e "${GREEN}Hysteria2 端口: $INPUT_HY2_PORT${NC}"
   fi
 
   if echo "$_PROTO_CHOICE" | grep -qi "b"; then
-    read -p "TUIC_PORT/TUIC v5 端口(UDP): " INPUT_TUIC_PORT
-    INPUT_TUIC_PORT="$(echo "$INPUT_TUIC_PORT" | tr -d '[:space:]')"
+    gen_rand_port; INPUT_TUIC_PORT="$_GEN_PORT"
+    echo -e "${GREEN}TUIC v5 端口: $INPUT_TUIC_PORT${NC}"
   fi
 
   if echo "$_PROTO_CHOICE" | grep -qi "c"; then
-    read -p "REALITY_PORT/VLESS Reality 端口(TCP): " INPUT_REALITY_PORT
-    INPUT_REALITY_PORT="$(echo "$INPUT_REALITY_PORT" | tr -d '[:space:]')"
-    read -p "REALITY_DOMAIN/Reality 伪装域名（留空默认 www.iij.ad.jp）: " INPUT_REALITY_DOMAIN
-    INPUT_REALITY_DOMAIN="$(echo "$INPUT_REALITY_DOMAIN" | tr -d '[:space:]')"
+    gen_rand_port; INPUT_REALITY_PORT="$_GEN_PORT"
+    echo -e "${GREEN}VLESS Reality 端口: $INPUT_REALITY_PORT（伪装域名使用默认值）${NC}"
   fi
 
   if echo "$_PROTO_CHOICE" | grep -qi "d"; then
-    read -p "SS_PORT/Shadowsocks 端口(TCP): " INPUT_SS_PORT
-    INPUT_SS_PORT="$(echo "$INPUT_SS_PORT" | tr -d '[:space:]')"
+    gen_rand_port; INPUT_SS_PORT="$_GEN_PORT"
+    echo -e "${GREEN}Shadowsocks 端口: $INPUT_SS_PORT${NC}"
   fi
 
   if echo "$_PROTO_CHOICE" | grep -qi "e"; then
-    read -p "SOCKS5_PORT/SOCKS5 端口(TCP/UDP): " INPUT_SOCKS5_PORT
-    INPUT_SOCKS5_PORT="$(echo "$INPUT_SOCKS5_PORT" | tr -d '[:space:]')"
+    gen_rand_port; INPUT_SOCKS5_PORT="$_GEN_PORT"
+    echo -e "${GREEN}SOCKS5 端口: $INPUT_SOCKS5_PORT${NC}"
   fi
 
   if echo "$_PROTO_CHOICE" | grep -qi "f"; then
-    read -p "TROJAN_PORT/Trojan 端口(TCP): " INPUT_TROJAN_PORT
-    INPUT_TROJAN_PORT="$(echo "$INPUT_TROJAN_PORT" | tr -d '[:space:]')"
+    gen_rand_port; INPUT_TROJAN_PORT="$_GEN_PORT"
+    echo -e "${GREEN}Trojan 端口: $INPUT_TROJAN_PORT${NC}"
   fi
 
   if echo "$_PROTO_CHOICE" | grep -qi "g"; then
-    read -p "ANYTLS_PORT/AnyTLS 端口(TCP): " INPUT_ANYTLS_PORT
-    INPUT_ANYTLS_PORT="$(echo "$INPUT_ANYTLS_PORT" | tr -d '[:space:]')"
+    gen_rand_port; INPUT_ANYTLS_PORT="$_GEN_PORT"
+    echo -e "${GREEN}AnyTLS 端口: $INPUT_ANYTLS_PORT${NC}"
   fi
 fi
 
@@ -264,11 +284,13 @@ main_menu() {
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -e "${WHITE}1. 查看节点订阅${RESET}"
     echo -e "${WHITE}2. 查看运行日志${RESET}"
-    echo -e "${WHITE}3. 修改配置${RESET}"
-    echo -e "${WHITE}4. 重启服务${RESET}"
-    echo -e "${WHITE}5. 更新 sing-box${RESET}"
-    echo -e "${WHITE}6. 彻底删除${RESET}"
-    echo -e "${WHITE}7. 自定义出口${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}3. 重启sing-box${RESET}"
+    echo -e "${WHITE}4. 更新sing-box${RESET}"
+    echo -e "${WHITE}5. 卸载sing-box${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}6. 修改配置${RESET}"
+    echo -e "${WHITE}7. 出口设置${RESET}"
     echo -e "${WHITE}8. 域名证书${RESET}"
     echo -e "${WHITE}0. 退出${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
@@ -277,10 +299,10 @@ main_menu() {
     case "$opt" in
       1) menu_sub ;;
       2) menu_log ;;
-      3) menu_config ;;
-      4) restart_service ;;
-      5) menu_update ;;
-      6) menu_delete ;;
+      3) restart_service ;;
+      4) menu_update ;;
+      5) menu_delete ;;
+      6) menu_config ;;
       7) menu_outbound ;;
       8) menu_domain_cert ;;
       0) exit 0 ;;
@@ -350,11 +372,12 @@ menu_config() {
     clear
     echo -e "${GREEN}======= 修改配置 =======${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
-    echo -e "${WHITE}1. UUID${RESET}"
-    echo -e "${WHITE}2. Argo 隧道模式${RESET}"
-    echo -e "${WHITE}3. 可选协议端口${RESET}"
-    echo -e "${WHITE}4. 协议证书绑定${RESET}"
-    echo -e "${WHITE}5. HY2/TUIC 多端口${RESET}"
+    echo -e "${WHITE}1. 修改UUID${RESET}"
+    echo -e "${WHITE}2. Argo隧道管理${RESET}"
+    echo -e "${WHITE}3. 修改协议端口${RESET}"
+    echo -e "${WHITE}4. 域名证书绑定${RESET}"
+    echo -e "${WHITE}5. 添加多端口${RESET}"
+    echo -e "${WHITE}6. 端口跳跃${RESET}"
     echo -e "${WHITE}0. 返回${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -ne "${GRAY}请输入选项: ${RESET}"
@@ -364,7 +387,8 @@ menu_config() {
       2) config_argo ;;
       3) config_proto ;;
       4) config_cert_bind ;;
-      5) config_multiport ;;
+      5) config_extraports ;;
+      6) config_hop ;;
       0) return ;;
       *) ;;
     esac
@@ -426,7 +450,7 @@ config_argo() {
     fi
 
     echo -e "${GRAY}--------------------------------${RESET}"
-    echo -e "${WHITE}1. 临时隧道（自动获取域名）${RESET}"
+    echo -e "${WHITE}1. 临时隧道${RESET}"
     echo -e "${WHITE}2. 固定隧道${RESET}"
     echo -e "${WHITE}3. 禁用 Argo${RESET}"
     echo -e "${WHITE}0. 返回${RESET}"
@@ -670,42 +694,27 @@ config_cert_bind() {
   done
 }
 
-# ── HY2/TUIC 多端口 ───────────────────────────────────────────────────────────
-# 两种独立的"多端口"：
-#   额外端口 = 同一协议再多开几个固定端口，各自独立监听，跟主端口共享凭证/证书
-#   端口跳跃 = 一段 UDP 范围整体 NAT 转发到主端口，客户端在范围内随机跳，抗限速
-#             （需要 root + nftables/iptables，本身在 singbox.sh 启动时才会真正下发）
-config_multiport() {
+# ── 添加多端口（同协议多开几个独立固定端口）───────────────────────────────────
+config_extraports() {
   while true; do
     clear
-    echo -e "${GREEN}======= HY2/TUIC 多端口 =======${RESET}"
-    local hy2 tuic hy2_extra tuic_extra hy2_hop tuic_hop
+    echo -e "${GREEN}======= 添加多端口 =======${RESET}"
+    local hy2 tuic hy2_extra tuic_extra
     hy2=$(get_val HY2_PORT); tuic=$(get_val TUIC_PORT)
     hy2_extra=$(get_val HY2_EXTRA_PORTS); tuic_extra=$(get_val TUIC_EXTRA_PORTS)
-    hy2_hop=$(get_val HY2_HOP_RANGE); tuic_hop=$(get_val TUIC_HOP_RANGE)
 
     if [ -z "$hy2" ] && [ -z "$tuic" ]; then
-      echo -e "${YELLOW}当前没有已启用的 HY2/TUIC，请先在「可选协议端口」里开启${RESET}"
+      echo -e "${YELLOW}当前没有已启用的 HY2/TUIC，请先在「修改协议端口」里开启${RESET}"
       press_any_key
       return
     fi
 
     echo -e "${GRAY}--------------------------------${RESET}"
-    if [ -n "$hy2" ]; then
-      echo -e "${WHITE}Hysteria2${RESET} (主端口 ${CYAN}$hy2${RESET})"
-      echo -e "  额外端口: ${CYAN}${hy2_extra:-无}${RESET}"
-      echo -e "  端口跳跃: ${CYAN}${hy2_hop:-未启用}${RESET}"
-    fi
-    if [ -n "$tuic" ]; then
-      echo -e "${WHITE}TUIC${RESET} (主端口 ${CYAN}$tuic${RESET})"
-      echo -e "  额外端口: ${CYAN}${tuic_extra:-无}${RESET}"
-      echo -e "  端口跳跃: ${CYAN}${tuic_hop:-未启用}${RESET}"
-    fi
+    [ -n "$hy2" ]  && echo -e "${WHITE}Hysteria2${RESET} (主端口 ${CYAN}$hy2${RESET})  额外端口: ${CYAN}${hy2_extra:-无}${RESET}"
+    [ -n "$tuic" ] && echo -e "${WHITE}TUIC${RESET}      (主端口 ${CYAN}$tuic${RESET})  额外端口: ${CYAN}${tuic_extra:-无}${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -e "${WHITE}1. 设置 Hysteria2 额外端口${RESET}"
-    echo -e "${WHITE}2. 设置 Hysteria2 端口跳跃范围${RESET}"
-    echo -e "${WHITE}3. 设置 TUIC 额外端口${RESET}"
-    echo -e "${WHITE}4. 设置 TUIC 端口跳跃范围${RESET}"
+    echo -e "${WHITE}2. 设置 TUIC 额外端口${RESET}"
     echo -e "${WHITE}0. 确认并重启${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -ne "${GRAY}请输入选项: ${RESET}"
@@ -723,10 +732,62 @@ config_multiport() {
         sleep 1
         ;;
       2)
+        if [ -z "$tuic" ]; then
+          echo -e "${RED}TUIC 未启用${RESET}"; sleep 1; continue
+        fi
+        echo -ne "${GRAY}额外端口(逗号分隔如 19101,19102，留空清除)[当前: ${tuic_extra:-无}]: ${RESET}"
+        read -r val
+        set_val TUIC_EXTRA_PORTS "$val"
+        echo -e "${GREEN}已更新${RESET}"
+        sleep 1
+        ;;
+      0)
+        echo -ne "${GRAY}确认修改并重启? [y/N]: ${RESET}"
+        read -r confirm
+        if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+          restart_service
+        fi
+        return
+        ;;
+      *) ;;
+    esac
+  done
+}
+
+# ── 端口跳跃（一段 UDP 范围整体 NAT 转发到主端口，抗限速）────────────────────
+# 需要 root + nftables/iptables，实际的规则下发在 singbox.sh 启动时才会真正执行。
+config_hop() {
+  while true; do
+    clear
+    echo -e "${GREEN}======= 端口跳跃 =======${RESET}"
+    local hy2 tuic hy2_hop tuic_hop
+    hy2=$(get_val HY2_PORT); tuic=$(get_val TUIC_PORT)
+    hy2_hop=$(get_val HY2_HOP_RANGE); tuic_hop=$(get_val TUIC_HOP_RANGE)
+
+    if [ -z "$hy2" ] && [ -z "$tuic" ]; then
+      echo -e "${YELLOW}当前没有已启用的 HY2/TUIC，请先在「修改协议端口」里开启${RESET}"
+      press_any_key
+      return
+    fi
+
+    echo -e "${GRAY}--------------------------------${RESET}"
+    [ -n "$hy2" ]  && echo -e "${WHITE}Hysteria2${RESET} (主端口 ${CYAN}$hy2${RESET})  端口跳跃: ${CYAN}${hy2_hop:-未启用}${RESET}"
+    [ -n "$tuic" ] && echo -e "${WHITE}TUIC${RESET}      (主端口 ${CYAN}$tuic${RESET})  端口跳跃: ${CYAN}${tuic_hop:-未启用}${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${YELLOW}提示：需要 root 权限 + nftables/iptables，容器/非 root 环境可能无法生效${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}1. 设置 Hysteria2 端口跳跃范围${RESET}"
+    echo -e "${WHITE}2. 设置 TUIC 端口跳跃范围${RESET}"
+    echo -e "${WHITE}0. 确认并重启${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -ne "${GRAY}请输入选项: ${RESET}"
+    read -r opt
+
+    case "$opt" in
+      1)
         if [ -z "$hy2" ]; then
           echo -e "${RED}Hysteria2 未启用${RESET}"; sleep 1; continue
         fi
-        echo -e "${YELLOW}提示：端口跳跃需要 root 权限 + nftables/iptables，容器/非 root 环境可能无法生效${RESET}"
         echo -ne "${GRAY}跳跃范围(如 20000-30000，留空清除)[当前: ${hy2_hop:-未启用}]: ${RESET}"
         read -r val
         if [ -n "$val" ] && ! echo "$val" | grep -qE '^[0-9]+-[0-9]+$'; then
@@ -738,22 +799,11 @@ config_multiport() {
         echo -e "${GREEN}已更新${RESET}"
         sleep 1
         ;;
-      3)
+      2)
         if [ -z "$tuic" ]; then
           echo -e "${RED}TUIC 未启用${RESET}"; sleep 1; continue
         fi
-        echo -ne "${GRAY}额外端口(逗号分隔如 19101,19102，留空清除)[当前: ${tuic_extra:-无}]: ${RESET}"
-        read -r val
-        set_val TUIC_EXTRA_PORTS "$val"
-        echo -e "${GREEN}已更新${RESET}"
-        sleep 1
-        ;;
-      4)
-        if [ -z "$tuic" ]; then
-          echo -e "${RED}TUIC 未启用${RESET}"; sleep 1; continue
-        fi
-        echo -e "${YELLOW}提示：端口跳跃需要 root 权限 + nftables/iptables，容器/非 root 环境可能无法生效${RESET}"
-        echo -e "${YELLOW}且 TUIC 端口跳跃的客户端支持不如 Hysteria2 普及，部分客户端会当成普通单端口用${RESET}"
+        echo -e "${YELLOW}TUIC 端口跳跃的客户端支持不如 Hysteria2 普及，部分客户端会当成普通单端口用${RESET}"
         echo -ne "${GRAY}跳跃范围(如 20000-30000，留空清除)[当前: ${tuic_hop:-未启用}]: ${RESET}"
         read -r val
         if [ -n "$val" ] && ! echo "$val" | grep -qE '^[0-9]+-[0-9]+$'; then
@@ -781,7 +831,7 @@ config_multiport() {
 # ── 更新 sing-box ─────────────────────────────────────────────────────────────
 menu_update() {
   clear
-  echo -e "${GREEN}======= 更新 sing-box =======${RESET}"
+  echo -e "${GREEN}======= 更新sing-box =======${RESET}"
 
   local cur_ver latest_ver
   if [ -f "$SB_BIN_PATH" ]; then
@@ -903,7 +953,7 @@ EOF
 menu_outbound() {
   while true; do
     clear
-    echo -e "${GREEN}======= 自定义出口 =======${RESET}"
+    echo -e "${GREEN}======= 出口设置 =======${RESET}"
     local cur_type cur_addr cur_port
     cur_type=$(get_outbound_val TYPE)
     cur_addr=$(get_outbound_val ADDR)
@@ -1158,7 +1208,7 @@ menu_domain_cert() {
       echo -e "${GRAY}还没有已签发的域名证书${RESET}"
     fi
     echo -e "${GRAY}--------------------------------${RESET}"
-    echo -e "${WHITE}1. 申请新域名证书 (acme.sh 自动)${RESET}"
+    echo -e "${WHITE}1. 申请新域名证书${RESET}"
     echo -e "${WHITE}2. 手动导入已有证书${RESET}"
     echo -e "${WHITE}3. 续期指定证书${RESET}"
     echo -e "${WHITE}4. 删除证书${RESET}"
@@ -1180,7 +1230,7 @@ menu_domain_cert() {
 # ── 彻底删除 ──────────────────────────────────────────────────────────────────
 menu_delete() {
   clear
-  echo -e "${RED}======= 彻底删除 =======${RESET}"
+  echo -e "${RED}======= 卸载sing-box =======${RESET}"
   echo -e "${YELLOW}⚠ 将删除所有文件、进程和自启配置${RESET}"
   echo -e "${GRAY}--------------------------------${RESET}"
   echo -e "${WHITE}1. 确认删除${RESET}"
