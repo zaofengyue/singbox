@@ -137,8 +137,7 @@ if ! $HAS_ENV; then
   echo -e "  ${GREEN}e${NC}. SOCKS5       (TCP/UDP)"
   echo -e "  ${GREEN}f${NC}. Trojan       (TCP)"
   echo -e "  ${GREEN}g${NC}. AnyTLS       (TCP)"
-  read -p "选择协议（如 ac 表示启用 a 和 c，输入 all 表示全部启用，留空跳过）: " _PROTO_CHOICE
-  echo "$_PROTO_CHOICE" | grep -qi "^all$" && _PROTO_CHOICE="abcdefg"
+  read -p "选择协议（如 ac 表示启用 a 和 c，留空跳过）: " _PROTO_CHOICE
 
   # 端口和 Reality 伪装域名不再交互询问：端口在 20000-49151 范围内随机生成
   # （避开 0-1023 常规/知名端口，也避开高位动态端口区间），本次内部去重；
@@ -376,10 +375,9 @@ menu_config() {
     echo -e "${WHITE}1. 修改UUID${RESET}"
     echo -e "${WHITE}2. Argo隧道管理${RESET}"
     echo -e "${WHITE}3. 修改协议端口${RESET}"
-    echo -e "${WHITE}4. 添加/删除协议${RESET}"
-    echo -e "${WHITE}5. 域名证书绑定${RESET}"
-    echo -e "${WHITE}6. 添加多端口${RESET}"
-    echo -e "${WHITE}7. 端口跳跃${RESET}"
+    echo -e "${WHITE}4. 域名证书绑定${RESET}"
+    echo -e "${WHITE}5. 添加多端口${RESET}"
+    echo -e "${WHITE}6. 端口跳跃${RESET}"
     echo -e "${WHITE}0. 返回${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -ne "${GRAY}请输入选项: ${RESET}"
@@ -388,10 +386,9 @@ menu_config() {
       1) config_uuid ;;
       2) config_argo ;;
       3) config_proto ;;
-      4) config_addrm_proto ;;
-      5) config_cert_bind ;;
-      6) config_extraports ;;
-      7) config_hop ;;
+      4) config_cert_bind ;;
+      5) config_extraports ;;
+      6) config_hop ;;
       0) return ;;
       *) ;;
     esac
@@ -578,136 +575,6 @@ config_proto() {
       6) _set_port SOCKS5_PORT "$socks5" "SOCKS5" ;;
       7) _set_port TROJAN_PORT "$trojan" "Trojan" ;;
       8) _set_port ANYTLS_PORT "$anytls" "AnyTLS" ;;
-      0)
-        echo -ne "${GRAY}确认修改并重启? [y/N]: ${RESET}"
-        read -r confirm
-        if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-          restart_service
-        fi
-        return
-        ;;
-      *) ;;
-    esac
-  done
-}
-
-# ── 添加/删除协议 ─────────────────────────────────────────────────────────────
-# 跟"修改协议端口"的区别：这里是批量勾选式操作，新增协议端口自动随机生成
-# （不用自己想端口号，跟安装时的体验一致）；删除协议时顺带清理它挂着的域名证书
-# 绑定/额外端口/跳跃范围，避免留下指向已禁用协议的孤儿配置。
-_gen_rand_port_panel() {
-  local _p _tries=0
-  while [ $_tries -lt 50 ]; do
-    _p=$(( (RANDOM % 29152) + 20000 ))
-    if command -v ss >/dev/null 2>&1 && ss -ltnu 2>/dev/null | grep -q ":${_p} "; then
-      _tries=$((_tries + 1)); continue
-    fi
-    _GEN_PORT="$_p"
-    return
-  done
-  _GEN_PORT="$_p"
-}
-
-config_addrm_proto() {
-  while true; do
-    clear
-    echo -e "${GREEN}======= 添加/删除协议 =======${RESET}"
-    local hy2 tuic reality ss socks5 trojan anytls
-    hy2=$(get_val HY2_PORT); tuic=$(get_val TUIC_PORT); reality=$(get_val REALITY_PORT)
-    ss=$(get_val SS_PORT); socks5=$(get_val SOCKS5_PORT); trojan=$(get_val TROJAN_PORT); anytls=$(get_val ANYTLS_PORT)
-
-    echo -e "${GRAY}--------------------------------${RESET}"
-    echo -e "  a. Hysteria2    (UDP) [${CYAN}${hy2:-未启用}${RESET}]"
-    echo -e "  b. TUIC         (UDP) [${CYAN}${tuic:-未启用}${RESET}]"
-    echo -e "  c. VLESS Reality(TCP) [${CYAN}${reality:-未启用}${RESET}]"
-    echo -e "  d. Shadowsocks  (TCP) [${CYAN}${ss:-未启用}${RESET}]"
-    echo -e "  e. SOCKS5  (TCP/UDP)  [${CYAN}${socks5:-未启用}${RESET}]"
-    echo -e "  f. Trojan       (TCP) [${CYAN}${trojan:-未启用}${RESET}]"
-    echo -e "  g. AnyTLS       (TCP) [${CYAN}${anytls:-未启用}${RESET}]"
-    echo -e "${GRAY}--------------------------------${RESET}"
-    echo -e "${WHITE}1. 添加协议（端口自动随机生成）${RESET}"
-    echo -e "${WHITE}2. 删除协议${RESET}"
-    echo -e "${WHITE}0. 返回${RESET}"
-    echo -e "${GRAY}--------------------------------${RESET}"
-    echo -ne "${GRAY}请输入选项: ${RESET}"
-    read -r opt
-
-    case "$opt" in
-      1)
-        echo -ne "${GRAY}选择要添加的协议(如 ac，或 all 表示剩余全部，留空取消): ${RESET}"
-        read -r sel
-        [ -z "$sel" ] && continue
-        echo "$sel" | grep -qi "^all$" && sel="abcdefg"
-        _added=""
-        if echo "$sel" | grep -qi "a" && [ -z "$hy2" ]; then
-          _gen_rand_port_panel; set_val HY2_PORT "$_GEN_PORT"; _added="${_added}Hysteria2($_GEN_PORT) "
-        fi
-        if echo "$sel" | grep -qi "b" && [ -z "$tuic" ]; then
-          _gen_rand_port_panel; set_val TUIC_PORT "$_GEN_PORT"; _added="${_added}TUIC($_GEN_PORT) "
-        fi
-        if echo "$sel" | grep -qi "c" && [ -z "$reality" ]; then
-          _gen_rand_port_panel; set_val REALITY_PORT "$_GEN_PORT"; _added="${_added}Reality($_GEN_PORT) "
-        fi
-        if echo "$sel" | grep -qi "d" && [ -z "$ss" ]; then
-          _gen_rand_port_panel; set_val SS_PORT "$_GEN_PORT"; _added="${_added}Shadowsocks($_GEN_PORT) "
-        fi
-        if echo "$sel" | grep -qi "e" && [ -z "$socks5" ]; then
-          _gen_rand_port_panel; set_val SOCKS5_PORT "$_GEN_PORT"; _added="${_added}SOCKS5($_GEN_PORT) "
-        fi
-        if echo "$sel" | grep -qi "f" && [ -z "$trojan" ]; then
-          _gen_rand_port_panel; set_val TROJAN_PORT "$_GEN_PORT"; _added="${_added}Trojan($_GEN_PORT) "
-        fi
-        if echo "$sel" | grep -qi "g" && [ -z "$anytls" ]; then
-          _gen_rand_port_panel; set_val ANYTLS_PORT "$_GEN_PORT"; _added="${_added}AnyTLS($_GEN_PORT) "
-        fi
-        if [ -n "$_added" ]; then
-          echo -e "${GREEN}已添加: ${_added}${RESET}"
-        else
-          echo -e "${YELLOW}没有新增（可能都已启用，或没匹配到有效字母）${RESET}"
-        fi
-        sleep 1
-        ;;
-      2)
-        echo -ne "${GRAY}选择要删除的协议(如 ac，或 all 表示全部，留空取消): ${RESET}"
-        read -r sel
-        [ -z "$sel" ] && continue
-        echo "$sel" | grep -qi "^all$" && sel="abcdefg"
-        _removed=""
-        if echo "$sel" | grep -qi "a" && [ -n "$hy2" ]; then
-          set_val HY2_PORT ""; set_val HY2_EXTRA_PORTS ""; set_val HY2_HOP_RANGE ""; set_val HY2_CERT_DOMAIN ""
-          _removed="${_removed}Hysteria2 "
-        fi
-        if echo "$sel" | grep -qi "b" && [ -n "$tuic" ]; then
-          set_val TUIC_PORT ""; set_val TUIC_EXTRA_PORTS ""; set_val TUIC_HOP_RANGE ""; set_val TUIC_CERT_DOMAIN ""
-          _removed="${_removed}TUIC "
-        fi
-        if echo "$sel" | grep -qi "c" && [ -n "$reality" ]; then
-          set_val REALITY_PORT ""
-          _removed="${_removed}Reality "
-        fi
-        if echo "$sel" | grep -qi "d" && [ -n "$ss" ]; then
-          set_val SS_PORT ""
-          _removed="${_removed}Shadowsocks "
-        fi
-        if echo "$sel" | grep -qi "e" && [ -n "$socks5" ]; then
-          set_val SOCKS5_PORT ""
-          _removed="${_removed}SOCKS5 "
-        fi
-        if echo "$sel" | grep -qi "f" && [ -n "$trojan" ]; then
-          set_val TROJAN_PORT ""; set_val TROJAN_CERT_DOMAIN ""
-          _removed="${_removed}Trojan "
-        fi
-        if echo "$sel" | grep -qi "g" && [ -n "$anytls" ]; then
-          set_val ANYTLS_PORT ""; set_val ANYTLS_CERT_DOMAIN ""
-          _removed="${_removed}AnyTLS "
-        fi
-        if [ -n "$_removed" ]; then
-          echo -e "${GREEN}已删除: ${_removed}${RESET}"
-        else
-          echo -e "${YELLOW}没有删除（可能都未启用，或没匹配到有效字母）${RESET}"
-        fi
-        sleep 1
-        ;;
       0)
         echo -ne "${GRAY}确认修改并重启? [y/N]: ${RESET}"
         read -r confirm
@@ -1442,7 +1309,6 @@ rm -rf /tmp/sb-bin
 rm -f "\$HOME/uuid.txt" "\$HOME/sb-config.json" "\$HOME/reality-keys.txt" "\$HOME/outbound.conf"
 rm -rf "\$HOME/certs"
 rm -f "$LOCAL_BIN/sb" "$LOCAL_BIN/sb-sub" "$LOCAL_BIN/sb-log" "$LOCAL_BIN/sb-del" "$LOCAL_BIN/sb-edit"
-rm -f /usr/local/bin/sb /usr/local/bin/sb-sub /usr/local/bin/sb-log /usr/local/bin/sb-del /usr/local/bin/sb-edit 2>/dev/null
 echo "删除完成"
 DELCMD
 chmod +x "$LOCAL_BIN/sb-del"
@@ -1580,27 +1446,9 @@ chmod +x "$LOCAL_BIN/sb-edit"
 
 # ── PATH 注入 ─────────────────────────────────────────────────────────────────
 export PATH="$LOCAL_BIN:$PATH"
-
-# 优先方案：/usr/local/bin 在几乎所有发行版的默认 PATH 里都有，不管 bash/zsh/ash、
-# 登录还是非登录 shell，都不依赖任何 rc 文件被正确 source。这是最可靠的做法，专门
-# 用来解决 Debian/Alpine/Ubuntu 精简镜像里 ~/.local/bin 经常没被自动加进 PATH 的
-# 问题（这类镜像很多时候连 ~/.bashrc、~/.profile 都不存在，rc 文件方案根本生效不了）。
-if [ "$(id -u)" = "0" ] || [ -w /usr/local/bin ] 2>/dev/null; then
-  mkdir -p /usr/local/bin 2>/dev/null
-  for cmd in sb sb-sub sb-log sb-del sb-edit; do
-    ln -sf "$LOCAL_BIN/$cmd" "/usr/local/bin/$cmd" 2>/dev/null || true
-  done
-  if [ -x /usr/local/bin/sb ]; then
-    echo -e "${GREEN}命令已链接到 /usr/local/bin，新开终端即可直接使用${NC}"
-  fi
-fi
-
-# 兜底方案：往常见 shell 启动文件里追加 PATH，文件不存在就顺手创建
-# （非 root 且 /usr/local/bin 不可写时的最后一道保险）。
-for RC in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc"; do
-  [ -e "$RC" ] || : > "$RC" 2>/dev/null
+for RC in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.zshrc"; do
   if [ -f "$RC" ] && ! grep -q "# singbox PATH" "$RC" 2>/dev/null; then
-    printf '\n# singbox PATH\nexport PATH="%s:$PATH"\n' "$LOCAL_BIN" >> "$RC" 2>/dev/null
+    printf '\n# singbox PATH\nexport PATH="%s:$PATH"\n' "$LOCAL_BIN" >> "$RC"
   fi
 done
 
