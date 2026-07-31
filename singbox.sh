@@ -307,6 +307,11 @@ else
 fi
 chmod 600 "$UUID_FILE" 2>/dev/null || true
 
+# SOCKS5 凭证从 UUID 派生：用户名取前 8 位（第一段），密码取后 12 位（最后一段），
+# 不用额外再管理一套单独的用户名/密码。
+SOCKS5_USER="${UUID%%-*}"
+SOCKS5_PASS="${UUID##*-}"
+
 # SS2022 密码：取 UUID 前 16 字节做 base64（24字符）
 # 优先 python3，备选 openssl（不再依赖 xxd，Alpine/busybox 环境通常没有 xxd）
 SS_PASS=""
@@ -391,28 +396,61 @@ download_singbox() {
   log "正在获取 sing-box 最新版本..."
   SB_VER="$(http_get 'https://api.github.com/repos/SagerNet/sing-box/releases/latest' \
     | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
+  SB_FALLBACK_VER="v1.12.0"
   if [ -z "$SB_VER" ]; then
-    SB_VER="v1.12.0"
+    SB_VER="$SB_FALLBACK_VER"
     warn "获取最新版本号失败（可能是 GitHub API 限流），回退到 ${SB_VER}，较新协议（如 AnyTLS）可能不受支持"
   fi
-  SB_VER_NUM="${SB_VER#v}"
-  log "下载 sing-box ${SB_VER} (${SB_ARCH})..."
-  if ! dl "https://github.com/SagerNet/sing-box/releases/download/${SB_VER}/sing-box-${SB_VER_NUM}-linux-${SB_ARCH}.tar.gz" \
-     /tmp/sing-box.tar.gz; then
-    die "sing-box 下载失败（网络问题或版本 ${SB_VER} 不存在该架构的构建），请检查网络后重试"
+
+  # 尝试下载+校验指定版本：官方发行版里 "linux-${ARCH}.tar.gz"（不带后缀）是动态
+  # 链接 glibc 的构建，系统 glibc 版本不够新、或者是 musl 系统（Alpine 等）时会
+  # 直接跑不起来——这才是"架构不匹配"报错的真正原因，不是 CPU 指令集不对。
+  # 优先尝试 "-musl" 静态编译构建（零运行时依赖，随便什么系统都能跑），
+  # 这个变体不存在再退回默认构建。全部尝试完还是不行，返回 1 交给调用方决定
+  # 要不要换版本重试。
+  _try_fetch_singbox() {
+    _v="$1"
+    _vnum="${_v#v}"
+    for _suffix in "-musl" ""; do
+      _asset="sing-box-${_vnum}-linux-${SB_ARCH}${_suffix}.tar.gz"
+      log "下载 sing-box ${_v} (${SB_ARCH}${_suffix:+ 静态musl})..."
+      if ! dl "https://github.com/SagerNet/sing-box/releases/download/${_v}/${_asset}" /tmp/sing-box.tar.gz; then
+        warn "sing-box ${_v}${_suffix} 下载失败（该变体可能不存在，或网络问题）"
+        continue
+      fi
+      if ! tar -tzf /tmp/sing-box.tar.gz >/dev/null 2>&1; then
+        rm -f /tmp/sing-box.tar.gz
+        warn "sing-box ${_v}${_suffix} 压缩包已损坏（下载不完整）"
+        continue
+      fi
+      rm -rf "$SB_DIR"
+      mkdir -p "$SB_DIR"
+      tar -xzf /tmp/sing-box.tar.gz -C "$SB_DIR" --strip-components=1
+      chmod +x "$SB_BIN"
+      rm -f /tmp/sing-box.tar.gz
+      if "$SB_BIN" version >/dev/null 2>&1; then
+        return 0
+      fi
+      warn "sing-box ${_v}${_suffix} 二进制下载完整但无法执行"
+      rm -f "$SB_BIN"
+    done
+    return 1
+  }
+
+  if _try_fetch_singbox "$SB_VER"; then
+    log "sing-box 下载完成: $("$SB_BIN" version 2>/dev/null | head -1)"
+    return 0
   fi
-  if ! tar -tzf /tmp/sing-box.tar.gz >/dev/null 2>&1; then
-    rm -f /tmp/sing-box.tar.gz
-    die "sing-box 压缩包已损坏（下载不完整），请重新运行脚本"
+
+  if [ "$SB_VER" != "$SB_FALLBACK_VER" ]; then
+    warn "${SB_VER} 不可用，尝试回退到已知版本 ${SB_FALLBACK_VER}..."
+    if _try_fetch_singbox "$SB_FALLBACK_VER"; then
+      log "sing-box 下载完成（回退版本）: $("$SB_BIN" version 2>/dev/null | head -1)"
+      return 0
+    fi
   fi
-  tar -xzf /tmp/sing-box.tar.gz -C "$SB_DIR" --strip-components=1
-  chmod +x "$SB_BIN"
-  rm -f /tmp/sing-box.tar.gz
-  if ! "$SB_BIN" version >/dev/null 2>&1; then
-    rm -f "$SB_BIN"
-    die "sing-box 二进制无法执行（架构可能不匹配: ${SB_ARCH}），请检查系统架构"
-  fi
-  log "sing-box 下载完成: $("$SB_BIN" version 2>/dev/null | head -1)"
+
+  die "sing-box 下载/校验失败（已尝试 ${SB_ARCH} 架构下 musl/glibc 两种构建，最新版 ${SB_VER} 和回退版 ${SB_FALLBACK_VER} 均不可用），请检查网络或系统架构"
 }
 
 # ── 下载 cloudflared ──────────────────────────────────────────────────────────
@@ -931,7 +969,7 @@ if [ "$SOCKS5_ACTIVE" = "1" ]; then
       \"tag\": \"socks5-in\",
       \"listen\": \"::\",
       \"listen_port\": ${SOCKS5_PORT},
-      \"users\": [{ \"username\": \"singbox\", \"password\": \"${UUID}\" }]
+      \"users\": [{ \"username\": \"${SOCKS5_USER}\", \"password\": \"${SOCKS5_PASS}\" }]
     }"
   try_add_inbound "SOCKS5" "$_socks5_json" || SOCKS5_ACTIVE=0
 fi
@@ -1163,7 +1201,11 @@ generate_sub() {
   fi
 
   if [ "$SOCKS5_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-    _link="socks5://singbox:${UUID}@$(format_addr "$PUBLIC_IP"):${SOCKS5_PORT}#${NAME_ENCODED}"
+    # 注意 scheme 是 socks:// 不是 socks5://，且 user:pass 要 base64 编码
+    # （跟 SS 链接同一套写法）——大多数客户端只认这种格式，之前的 socks5:// 明文
+    # 格式很多客户端识别不出来，会被当成无效链接导入失败。
+    SOCKS5_USERINFO="$(b64 "${SOCKS5_USER}:${SOCKS5_PASS}")"
+    _link="socks://${SOCKS5_USERINFO}@$(format_addr "$PUBLIC_IP"):${SOCKS5_PORT}#${NAME_ENCODED}"
     ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
   fi
@@ -1226,7 +1268,7 @@ if [ "$TUIC_ACTIVE" = "1" ]; then
 fi
 [ "$REALITY_ACTIVE" = "1" ] && log "✓ VLESS Reality 端口 $REALITY_PORT  PubKey: $REALITY_PUB"
 [ "$SS_ACTIVE"      = "1" ] && log "✓ Shadowsocks   端口 $SS_PORT (TCP)"
-[ "$SOCKS5_ACTIVE"  = "1" ] && log "✓ SOCKS5        端口 $SOCKS5_PORT (TCP/UDP)  用户: singbox"
+[ "$SOCKS5_ACTIVE"  = "1" ] && log "✓ SOCKS5        端口 $SOCKS5_PORT (TCP/UDP)  用户: $SOCKS5_USER"
 [ "$TROJAN_ACTIVE"  = "1" ] && log "✓ Trojan        端口 $TROJAN_PORT (TCP)  证书: ${TROJAN_CERT_DOMAIN:-自签}"
 [ "$ANYTLS_ACTIVE"  = "1" ] && log "✓ AnyTLS        端口 $ANYTLS_PORT (TCP)  证书: ${ANYTLS_CERT_DOMAIN:-自签}"
 [ -n "$EXTRA_OUTBOUND_JSON" ] && log "✓ 自定义出口    ${CUSTOM_OUT_TYPE}://${CUSTOM_OUT_ADDR}:${CUSTOM_OUT_PORT}"

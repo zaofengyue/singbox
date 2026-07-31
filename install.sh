@@ -137,7 +137,8 @@ if ! $HAS_ENV; then
   echo -e "  ${GREEN}e${NC}. SOCKS5       (TCP/UDP)"
   echo -e "  ${GREEN}f${NC}. Trojan       (TCP)"
   echo -e "  ${GREEN}g${NC}. AnyTLS       (TCP)"
-  read -p "选择协议（如 ac 表示启用 a 和 c，留空跳过）: " _PROTO_CHOICE
+  read -p "选择协议（如 ac 表示启用 a 和 c，输入 all 表示全部启用，留空跳过）: " _PROTO_CHOICE
+  echo "$_PROTO_CHOICE" | grep -qi "^all$" && _PROTO_CHOICE="abcdefg"
 
   # 端口和 Reality 伪装域名不再交互询问：端口在 20000-49151 范围内随机生成
   # （避开 0-1023 常规/知名端口，也避开高位动态端口区间），本次内部去重；
@@ -1309,6 +1310,7 @@ rm -rf /tmp/sb-bin
 rm -f "\$HOME/uuid.txt" "\$HOME/sb-config.json" "\$HOME/reality-keys.txt" "\$HOME/outbound.conf"
 rm -rf "\$HOME/certs"
 rm -f "$LOCAL_BIN/sb" "$LOCAL_BIN/sb-sub" "$LOCAL_BIN/sb-log" "$LOCAL_BIN/sb-del" "$LOCAL_BIN/sb-edit"
+rm -f /usr/local/bin/sb /usr/local/bin/sb-sub /usr/local/bin/sb-log /usr/local/bin/sb-del /usr/local/bin/sb-edit 2>/dev/null
 echo "删除完成"
 DELCMD
 chmod +x "$LOCAL_BIN/sb-del"
@@ -1446,9 +1448,27 @@ chmod +x "$LOCAL_BIN/sb-edit"
 
 # ── PATH 注入 ─────────────────────────────────────────────────────────────────
 export PATH="$LOCAL_BIN:$PATH"
-for RC in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.zshrc"; do
+
+# 优先方案：/usr/local/bin 在几乎所有发行版的默认 PATH 里都有，不管 bash/zsh/ash、
+# 登录还是非登录 shell，都不依赖任何 rc 文件被正确 source。这是最可靠的做法，专门
+# 用来解决 Debian/Alpine/Ubuntu 精简镜像里 ~/.local/bin 经常没被自动加进 PATH 的
+# 问题（这类镜像很多时候连 ~/.bashrc、~/.profile 都不存在，rc 文件方案根本生效不了）。
+if [ "$(id -u)" = "0" ] || [ -w /usr/local/bin ] 2>/dev/null; then
+  mkdir -p /usr/local/bin 2>/dev/null
+  for cmd in sb sb-sub sb-log sb-del sb-edit; do
+    ln -sf "$LOCAL_BIN/$cmd" "/usr/local/bin/$cmd" 2>/dev/null || true
+  done
+  if [ -x /usr/local/bin/sb ]; then
+    echo -e "${GREEN}命令已链接到 /usr/local/bin，新开终端即可直接使用${NC}"
+  fi
+fi
+
+# 兜底方案：往常见 shell 启动文件里追加 PATH，文件不存在就顺手创建
+# （非 root 且 /usr/local/bin 不可写时的最后一道保险）。
+for RC in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc"; do
+  [ -e "$RC" ] || : > "$RC" 2>/dev/null
   if [ -f "$RC" ] && ! grep -q "# singbox PATH" "$RC" 2>/dev/null; then
-    printf '\n# singbox PATH\nexport PATH="%s:$PATH"\n' "$LOCAL_BIN" >> "$RC"
+    printf '\n# singbox PATH\nexport PATH="%s:$PATH"\n' "$LOCAL_BIN" >> "$RC" 2>/dev/null
   fi
 done
 
