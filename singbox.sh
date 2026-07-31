@@ -307,6 +307,11 @@ else
 fi
 chmod 600 "$UUID_FILE" 2>/dev/null || true
 
+# SOCKS5 凭证从 UUID 派生：用户名取前 8 位（第一段），密码取后 12 位（最后一段），
+# 不用额外再管理一套单独的用户名/密码。
+SOCKS5_USER="${UUID%%-*}"
+SOCKS5_PASS="${UUID##*-}"
+
 # SS2022 密码：取 UUID 前 16 字节做 base64（24字符）
 # 优先 python3，备选 openssl（不再依赖 xxd，Alpine/busybox 环境通常没有 xxd）
 SS_PASS=""
@@ -931,7 +936,7 @@ if [ "$SOCKS5_ACTIVE" = "1" ]; then
       \"tag\": \"socks5-in\",
       \"listen\": \"::\",
       \"listen_port\": ${SOCKS5_PORT},
-      \"users\": [{ \"username\": \"singbox\", \"password\": \"${UUID}\" }]
+      \"users\": [{ \"username\": \"${SOCKS5_USER}\", \"password\": \"${SOCKS5_PASS}\" }]
     }"
   try_add_inbound "SOCKS5" "$_socks5_json" || SOCKS5_ACTIVE=0
 fi
@@ -1163,7 +1168,11 @@ generate_sub() {
   fi
 
   if [ "$SOCKS5_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-    _link="socks5://singbox:${UUID}@$(format_addr "$PUBLIC_IP"):${SOCKS5_PORT}#${NAME_ENCODED}"
+    # 注意 scheme 是 socks:// 不是 socks5://，且 user:pass 要 base64 编码
+    # （跟 SS 链接同一套写法）——大多数客户端只认这种格式，之前的 socks5:// 明文
+    # 格式很多客户端识别不出来，会被当成无效链接导入失败。
+    SOCKS5_USERINFO="$(b64 "${SOCKS5_USER}:${SOCKS5_PASS}")"
+    _link="socks://${SOCKS5_USERINFO}@$(format_addr "$PUBLIC_IP"):${SOCKS5_PORT}#${NAME_ENCODED}"
     ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
   fi
@@ -1226,7 +1235,7 @@ if [ "$TUIC_ACTIVE" = "1" ]; then
 fi
 [ "$REALITY_ACTIVE" = "1" ] && log "✓ VLESS Reality 端口 $REALITY_PORT  PubKey: $REALITY_PUB"
 [ "$SS_ACTIVE"      = "1" ] && log "✓ Shadowsocks   端口 $SS_PORT (TCP)"
-[ "$SOCKS5_ACTIVE"  = "1" ] && log "✓ SOCKS5        端口 $SOCKS5_PORT (TCP/UDP)  用户: singbox"
+[ "$SOCKS5_ACTIVE"  = "1" ] && log "✓ SOCKS5        端口 $SOCKS5_PORT (TCP/UDP)  用户: $SOCKS5_USER"
 [ "$TROJAN_ACTIVE"  = "1" ] && log "✓ Trojan        端口 $TROJAN_PORT (TCP)  证书: ${TROJAN_CERT_DOMAIN:-自签}"
 [ "$ANYTLS_ACTIVE"  = "1" ] && log "✓ AnyTLS        端口 $ANYTLS_PORT (TCP)  证书: ${ANYTLS_CERT_DOMAIN:-自签}"
 [ -n "$EXTRA_OUTBOUND_JSON" ] && log "✓ 自定义出口    ${CUSTOM_OUT_TYPE}://${CUSTOM_OUT_ADDR}:${CUSTOM_OUT_PORT}"
