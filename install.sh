@@ -436,11 +436,12 @@ config_argo() {
   while true; do
     clear
     echo -e "${GREEN}======= Argo 隧道模式 =======${RESET}"
-    local cur_domain cur_auth cur_port cur_disable
+    local cur_domain cur_auth cur_port cur_disable cur_protocol
     cur_domain=$(get_val ARGO_DOMAIN)
     cur_auth=$(get_val ARGO_AUTH)
     cur_port=$(get_val ARGO_PORT)
     cur_disable=$(get_val DISABLE_ARGO)
+    cur_protocol=$(get_val ARGO_PROTOCOL)
 
     if [ "$cur_disable" = "true" ]; then
       echo -e "${GRAY}当前: ${RED}已禁用${RESET}"
@@ -449,11 +450,13 @@ config_argo() {
     else
       echo -e "${GRAY}当前: ${CYAN}临时隧道${RESET}"
     fi
+    echo -e "${GRAY}连接协议: ${CYAN}${cur_protocol:-http2(默认)}${RESET}"
 
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -e "${WHITE}1. 临时隧道${RESET}"
     echo -e "${WHITE}2. 固定隧道${RESET}"
     echo -e "${WHITE}3. 禁用 Argo${RESET}"
+    echo -e "${WHITE}4. 切换连接协议${RESET}"
     echo -e "${WHITE}0. 返回${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -ne "${GRAY}请输入选项: ${RESET}"
@@ -502,6 +505,30 @@ config_argo() {
           set_val DISABLE_ARGO "true"
           set_val ARGO_DOMAIN ""
           set_val ARGO_AUTH ""
+          restart_service
+          press_any_key
+        fi
+        ;;
+      4)
+        echo ""
+        echo -e "${GRAY}当前: ${CYAN}${cur_protocol:-http2}${RESET}"
+        echo -e "${GRAY}--------------------------------${RESET}"
+        echo -e "${WHITE}1. http2（推荐，兼容性最好，NAT/UDP受限环境用这个）${RESET}"
+        echo -e "${WHITE}2. quic （延迟更低，但部分网络环境下连不上）${RESET}"
+        echo -e "${WHITE}3. auto （cloudflared 自动探测，优先 quic 失败再降级 http2）${RESET}"
+        echo -ne "${GRAY}选择 [回车取消]: ${RESET}"
+        read -r popt
+        local new_protocol=""
+        case "$popt" in
+          1) new_protocol="http2" ;;
+          2) new_protocol="quic" ;;
+          3) new_protocol="auto" ;;
+          *) continue ;;
+        esac
+        echo -ne "${GRAY}确认切换为 ${new_protocol} 并重启? [y/N]: ${RESET}"
+        read -r confirm
+        if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+          set_val ARGO_PROTOCOL "$new_protocol"
           restart_service
           press_any_key
         fi
