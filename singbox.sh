@@ -11,6 +11,17 @@ NAME="${NAME:-}"
 ARGO_DOMAIN="${ARGO_DOMAIN:-}"
 ARGO_AUTH="${ARGO_AUTH:-}"
 DISABLE_ARGO="${DISABLE_ARGO:-}"
+# cloudflared 默认会优先探测 QUIC(UDP)连边缘节点，NAT 型 VPS/UDP 受限网络下经常
+# 连不上或者降级过程不可靠，导致 Argo 隧道时通时不通。默认强制走 http2(TCP)，
+# 需要的话可以自己覆盖成 quic 或 auto。
+ARGO_PROTOCOL="${ARGO_PROTOCOL:-http2}"
+case "$ARGO_PROTOCOL" in
+  http2|quic|auto) : ;;
+  *)
+    echo "[WARN] ARGO_PROTOCOL 值不合法(${ARGO_PROTOCOL})，只支持 http2/quic/auto，已回退为 http2"
+    ARGO_PROTOCOL="http2"
+    ;;
+esac
 # 可选协议端口（填写则启用，留空不启动）
 HY2_PORT="${HY2_PORT:-}"
 TUIC_PORT="${TUIC_PORT:-}"
@@ -1090,16 +1101,16 @@ CF_PID=""
 
 start_cloudflared() {
   if [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_AUTH" ]; then
-    log "启动固定 Argo 隧道..."
-    "$CF_BIN" tunnel --edge-ip-version auto --no-autoupdate \
+    log "启动固定 Argo 隧道 (protocol=${ARGO_PROTOCOL})..."
+    "$CF_BIN" tunnel --edge-ip-version auto --protocol "$ARGO_PROTOCOL" --no-autoupdate \
       run --token "$ARGO_AUTH" >/dev/null 2>&1 &
     CF_PID=$!
     sleep 3
     ARGO_HOST="$ARGO_DOMAIN"
   else
-    log "启动临时 Argo 隧道..."
+    log "启动临时 Argo 隧道 (protocol=${ARGO_PROTOCOL})..."
     rm -f "$CF_LOG"
-    "$CF_BIN" tunnel --edge-ip-version auto --no-autoupdate \
+    "$CF_BIN" tunnel --edge-ip-version auto --protocol "$ARGO_PROTOCOL" --no-autoupdate \
       --url "http://127.0.0.1:${ARGO_PORT}" \
       --logfile "$CF_LOG" >/dev/null 2>&1 &
     CF_PID=$!
