@@ -47,7 +47,7 @@ jobs:
           cp index.obf.js release/index.js
           cp package.json release/package.json
           cp index.html   release/index.html
-          cd release && zip -r ../node-sb.zip .
+          cd release && zip -r ../sbx.zip .
 
       - name: Login to ghcr.io
         uses: docker/login-action@v3
@@ -71,8 +71,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/node-sb:latest
-            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/node-sb:latest
+            ghcr.io/${{ github.repository_owner }}/sbx:latest
+            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/sbx:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -82,10 +82,10 @@ jobs:
           tag_name: latest
           name: Latest Release
           make_latest: true
-          files: node-sb.zip
+          files: sbx.zip
           body: |
-            ## node-sb
-            下载 `node-sb.zip` 解压后上传到平台即可使用。
+            ## sbx
+            下载 `sbx.zip` 解压后上传到平台即可使用。
             包含文件：
             - `index.js`（已混淆）
             - `package.json`
