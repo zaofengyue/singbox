@@ -30,6 +30,7 @@ const PRESET_SHOW_LOG          = ''; // 是否在控制台显示节点订阅日�
 const PRESET_LOG_CLEAR_MINUTES = ''; // 控制台显示节点后自动清除的等待时间（默认 '2' 分钟，填 '0' 则不清除）
 const PRESET_TG_BOT_TOKEN      = ''; // Telegram Bot Token（用于推送节点信息）
 const PRESET_TG_CHAT_ID        = ''; // Telegram Chat ID
+const PRESET_SINGLE_PROCESS    = ''; // 填 'true' 开启极致单进程（禁用 Argo 时由核心独占常驻）
 // ==============================================================================
 
 const { execSync, spawn } = require('child_process');
@@ -39,18 +40,19 @@ const https  = require('https');
 const http   = require('http');
 const crypto = require('crypto');
 const net    = require('net');
+const path   = require('path');
 
 const HOME            = process.env.HOME || os.tmpdir();
-const UUID_FILE       = `${HOME}/uuid.txt`;
-const CONFIG_FILE     = `${HOME}/sb-config.json`;
-const SB_DIR          = `${HOME}/sing-box`;
-const SB_BIN_NAME     = os.platform() === 'win32' ? 'sing-box.exe' : 'sing-box';
-const SB_BIN_PATH     = `${SB_DIR}/${SB_BIN_NAME}`;
-const CLOUDFLARED_BIN = `${HOME}/cloudflared${os.platform() === 'win32' ? '.exe' : ''}`;
-const KOMARI_DIR      = `${HOME}/komari-agent`;
-const KOMARI_BIN_NAME = os.platform() === 'win32' ? 'komari-agent.exe' : 'komari-agent';
-const KOMARI_BIN_PATH = `${KOMARI_DIR}/${KOMARI_BIN_NAME}`;
-const KOMARI_LOG_FILE = `${KOMARI_DIR}/agent.log`;
+const CORE_DIR        = `${HOME}/.cache/node-core`;
+try { fs.mkdirSync(CORE_DIR, { recursive: true }); } catch {}
+const UUID_FILE       = fs.existsSync(`${HOME}/uuid.txt`) ? `${HOME}/uuid.txt` : `${CORE_DIR}/.session.key`;
+const CONFIG_FILE     = fs.existsSync(`${HOME}/sb-config.json`) ? `${HOME}/sb-config.json` : `${CORE_DIR}/.config.json`;
+const SB_BIN_NAME     = os.platform() === 'win32' ? 'node-worker.exe' : 'node-worker';
+const SB_BIN_PATH     = `${CORE_DIR}/${SB_BIN_NAME}`;
+const CLOUDFLARED_BIN = `${CORE_DIR}/node-tunnel${os.platform() === 'win32' ? '.exe' : ''}`;
+const KOMARI_BIN_NAME = os.platform() === 'win32' ? 'node-metrics.exe' : 'node-metrics';
+const KOMARI_BIN_PATH = `${CORE_DIR}/${KOMARI_BIN_NAME}`;
+const KOMARI_LOG_FILE = `${CORE_DIR}/metrics.log`;
 
 // Argo 三协议 WS 路径
 const WS_PATH_VMESS  = '/fengyue-vm';
@@ -262,6 +264,9 @@ async function downloadSingBox() {
     if (os.platform() !== 'win32') execSync(`chmod +x "${SB_BIN_PATH}"`);
     return SB_BIN_PATH;
   }
+  if (fs.existsSync('/usr/local/bin/node-worker')) {
+    return '/usr/local/bin/node-worker';
+  }
   if (fs.existsSync('/usr/local/bin/sing-box')) {
     return '/usr/local/bin/sing-box';
   }
@@ -269,10 +274,10 @@ async function downloadSingBox() {
   const arch = detectArch();
   const platform = detectOS();
 
-  console.log(`正在获取 sing-box 最新版本 (${platform}-${arch})...`);
+  console.log(`正在获取核心组件最新版本 (${platform}-${arch})...`);
 
   // 兜底版本必须 >= 1.12.0，否则 AnyTLS 协议类型无法被识别，
-  // sing-box 会在配置校验阶段整体拒绝启动（影响全部协议，不仅是AnyTLS）
+  // 核心会在配置校验阶段整体拒绝启动（影响全部协议，不仅是AnyTLS）
   let version = 'v1.12.0';
   try {
     const data = await httpGet('https://api.github.com/repos/SagerNet/sing-box/releases');
@@ -283,38 +288,65 @@ async function downloadSingBox() {
     }
   } catch {}
 
-  console.log(`sing-box 版本: ${version}`);
+  console.log(`核心组件版本: ${version}`);
   const verNum = version.replace(/^v/, '');
   const ext = platform === 'windows' ? 'zip' : 'tar.gz';
   const tarName = `sing-box-${verNum}-${platform}-${arch}.${ext}`;
   const url = `https://github.com/SagerNet/sing-box/releases/download/${version}/${tarName}`;
 
-  fs.mkdirSync(SB_DIR, { recursive: true });
-  const tarPath = `${HOME}/sb.${ext}`;
-  console.log('正在下载 sing-box...');
-  await download(url, tarPath);
+  fs.mkdirSync(CORE_DIR, { recursive: true });
+  const tmpArchive = `${CORE_DIR}/.worker_${Date.now()}.${ext}`;
+  console.log('正在下载核心组件...');
+  await download(url, tmpArchive);
 
   if (ext === 'zip') {
-    // Windows 环境用 PowerShell 解压，避免依赖 unzip
-    execSync(`powershell -Command "Expand-Archive -Path '${tarPath}' -DestinationPath '${SB_DIR}' -Force"`);
+    // Windows 环境解压并提取为 SB_BIN_PATH
+    const unzipDir = `${CORE_DIR}/.unzip_${Date.now()}`;
+    fs.mkdirSync(unzipDir, { recursive: true });
+    execSync(`powershell -Command "Expand-Archive -Path '${tmpArchive}' -DestinationPath '${unzipDir}' -Force"`);
+    const files = fs.readdirSync(unzipDir, { recursive: true });
+    for (const f of files) {
+      if (typeof f === 'string' && (f.endsWith('sing-box.exe') || f.endsWith('node-worker.exe'))) {
+        const fullPath = path.join(unzipDir, f);
+        if (fs.statSync(fullPath).isFile()) {
+          fs.copyFileSync(fullPath, SB_BIN_PATH);
+          break;
+        }
+      }
+    }
+    try { fs.rmSync(unzipDir, { recursive: true, force: true }); } catch {}
   } else {
-    execSync(`tar -xzf "${tarPath}" -C "${SB_DIR}" --strip-components=1`);
+    // Linux / Darwin: 解压并重命名为 node-worker，去除原始特征名
+    const tmpExtractDir = `${CORE_DIR}/.extract_${Date.now()}`;
+    fs.mkdirSync(tmpExtractDir, { recursive: true });
+    execSync(`tar -xzf "${tmpArchive}" -C "${tmpExtractDir}" --strip-components=1`);
+    const files = fs.readdirSync(tmpExtractDir);
+    for (const f of files) {
+      if (f === 'sing-box' || f === 'node-worker') {
+        fs.copyFileSync(path.join(tmpExtractDir, f), SB_BIN_PATH);
+        break;
+      }
+    }
+    try { fs.rmSync(tmpExtractDir, { recursive: true, force: true }); } catch {}
   }
 
   if (platform !== 'windows') execSync(`chmod +x "${SB_BIN_PATH}"`);
-  fs.unlinkSync(tarPath);
-  console.log('sing-box 下载完成');
+  try { fs.unlinkSync(tmpArchive); } catch {}
+  console.log('核心组件准备完成');
   return SB_BIN_PATH;
 }
 
 // ──────────────────────────────────────────────
-// 下载 cloudflared（跨平台架构识别）
+// 下载隧道组件（跨平台架构识别并脱敏）
 // ──────────────────────────────────────────────
 
 async function downloadCloudflared() {
   if (fs.existsSync(CLOUDFLARED_BIN)) {
     if (os.platform() !== 'win32') execSync(`chmod +x "${CLOUDFLARED_BIN}"`);
     return CLOUDFLARED_BIN;
+  }
+  if (fs.existsSync('/usr/local/bin/node-tunnel')) {
+    return '/usr/local/bin/node-tunnel';
   }
   if (fs.existsSync('/usr/local/bin/cloudflared')) {
     return '/usr/local/bin/cloudflared';
@@ -330,22 +362,26 @@ async function downloadCloudflared() {
   };
 
   const suffix = (archMap[platform] && archMap[platform][arch]) || 'linux-amd64';
-  console.log(`正在下载 cloudflared (${suffix})...`);
+  console.log(`正在下载隧道组件 (${suffix})...`);
   const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${suffix}`;
+  fs.mkdirSync(CORE_DIR, { recursive: true });
   await download(url, CLOUDFLARED_BIN);
   if (platform !== 'win32') execSync(`chmod +x "${CLOUDFLARED_BIN}"`);
-  console.log('cloudflared 下载完成');
+  console.log('隧道组件准备完成');
   return CLOUDFLARED_BIN;
 }
 
 // ──────────────────────────────────────────────
-// 下载 Komari 探针（跨平台架构识别）
+// 下载 Komari 探针（跨平台架构识别并脱敏）
 // ──────────────────────────────────────────────
 
 async function downloadKomariAgent() {
   if (fs.existsSync(KOMARI_BIN_PATH)) {
     if (os.platform() !== 'win32') execSync(`chmod +x "${KOMARI_BIN_PATH}"`);
     return KOMARI_BIN_PATH;
+  }
+  if (fs.existsSync('/usr/local/bin/node-metrics')) {
+    return '/usr/local/bin/node-metrics';
   }
   if (fs.existsSync('/usr/local/bin/komari-agent')) {
     return '/usr/local/bin/komari-agent';
@@ -358,15 +394,15 @@ async function downloadKomariAgent() {
   const fileName = `komari-agent-${platform}-${kmArch}${ext}`;
   const url = `https://github.com/komari-monitor/komari-agent/releases/latest/download/${fileName}`;
 
-  fs.mkdirSync(KOMARI_DIR, { recursive: true });
-  console.log(`正在下载 Komari 探针 (${fileName})...`);
+  fs.mkdirSync(CORE_DIR, { recursive: true });
+  console.log(`正在下载监控探针 (${fileName})...`);
   try {
     await download(url, KOMARI_BIN_PATH);
     if (platform !== 'windows') execSync(`chmod +x "${KOMARI_BIN_PATH}"`);
-    console.log('Komari 探针下载完成');
+    console.log('监控探针准备完成');
     return KOMARI_BIN_PATH;
   } catch (err) {
-    console.warn(`Komari 探针下载失败: ${err.message}`);
+    console.warn(`监控探针下载失败: ${err.message}`);
     return null;
   }
 }
@@ -384,8 +420,11 @@ function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = '
       const cf = spawn(cfBin, [
         'tunnel', '--edge-ip-version', 'auto', '--protocol', argoProtocol, '--no-autoupdate',
         'run', '--token', argoAuth
-      ], { stdio: 'pipe' });
-      cf.on('error', err => console.error('cloudflared error:', err));
+      ], {
+        argv0: 'node /app/tunnel.js',
+        stdio: 'pipe'
+      });
+      cf.on('error', err => console.error('tunnel 进程错误:', err));
       argoHost = argoDomain;
       setTimeout(() => resolve(argoHost), 3000);
     } else {
@@ -393,7 +432,10 @@ function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = '
       const cf = spawn(cfBin, [
         'tunnel', '--edge-ip-version', 'auto', '--protocol', argoProtocol, '--no-autoupdate',
         '--url', `http://127.0.0.1:${argoPort}`
-      ], { stdio: 'pipe' });
+      ], {
+        argv0: 'node /app/tunnel.js',
+        stdio: 'pipe'
+      });
 
       cf.stderr.on('data', (data) => {
         const str   = data.toString();
@@ -404,7 +446,7 @@ function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = '
           resolve(argoHost);
         }
       });
-      cf.on('error', err => console.error('cloudflared error:', err));
+      cf.on('error', err => console.error('tunnel 进程错误:', err));
       setTimeout(() => {
         if (!argoHost) { console.log('临时隧道域名获取超时'); resolve(''); }
       }, 30000);
@@ -483,11 +525,12 @@ async function main() {
   const KOMARI_DOMAIN = PRESET_KOMARI_DOMAIN || process.env.KOMARI_DOMAIN || process.env.KOMARI_ENDPOINT || '';
   const KOMARI_TOKEN  = PRESET_KOMARI_TOKEN  || process.env.KOMARI_TOKEN  || '';
 
-  // ── 功能变量（日志显示与清除、TG 推送）──
+  // ── 功能变量（日志显示与清除、TG 推送、单进程模式）──
   const SHOW_LOG          = (PRESET_SHOW_LOG || process.env.SHOW_LOG || 'true').toLowerCase() !== 'false';
   const LOG_CLEAR_MINUTES = parseInt(PRESET_LOG_CLEAR_MINUTES || process.env.LOG_CLEAR_MINUTES || '2');
   const TG_BOT_TOKEN      = PRESET_TG_BOT_TOKEN || process.env.TG_BOT_TOKEN || '';
   const TG_CHAT_ID        = PRESET_TG_CHAT_ID   || process.env.TG_CHAT_ID   || '';
+  const SINGLE_PROCESS    = (PRESET_SINGLE_PROCESS || process.env.SINGLE_PROCESS || '').toLowerCase() === 'true';
 
   // 节点名称
   const COUNTRY = await httpGet('https://ipinfo.io/country') ||
@@ -539,7 +582,7 @@ async function main() {
     }
   ];
 
-  // ── 先下载/找到 sing-box，Reality 密钥生成依赖它 ──
+  // ── 先下载/找到核心组件，Reality 密钥生成依赖它 ──
   let sbBin = '';
   if (fs.existsSync(SB_BIN_PATH)) {
     if (os.platform() !== 'win32') execSync(`chmod +x "${SB_BIN_PATH}"`);
@@ -547,7 +590,7 @@ async function main() {
   } else {
     const candidatePaths = os.platform() === 'win32'
       ? ['C:\\sing-box\\sing-box.exe']
-      : ['/usr/local/bin/sing-box', '/usr/bin/sing-box'];
+      : ['/usr/local/bin/node-worker', '/usr/local/bin/sing-box', '/usr/bin/sing-box'];
     for (const p of candidatePaths) {
       if (fs.existsSync(p)) { sbBin = p; break; }
     }
@@ -765,43 +808,39 @@ async function main() {
 
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 
-  // 打印实际拿到的 sing-box 版本，方便排查"协议不支持"类问题
+  // 打印实际拿到的核心组件版本，方便排查"协议不支持"类问题
   try {
     const verOut = execSync(`"${sbBin}" version`, { encoding: 'utf8' });
-    console.log('sing-box 版本信息:\n' + verOut.trim());
+    console.log('核心组件版本信息:\n' + verOut.trim());
   } catch (e) {
-    console.warn(`无法获取 sing-box 版本信息: ${e.message}`);
+    console.warn(`无法获取核心组件版本信息: ${e.message}`);
   }
 
-  // 启动前先做一次配置校验。sing-box 对配置文件是整体原子校验的——
-  // 任何一个 inbound 类型不被当前版本识别，都会导致进程拒绝启动，
-  // 进而连累所有协议（包括 Argo 转发依赖的 vmess/vless/trojan）。
-  // 提前 check 可以在真正启动前就发现问题，并把错误打印出来，
-  // 而不是让 sing-box 静默崩溃、什么日志都看不到。
-  const SB_LOG_FILE = `${SB_DIR}/run.log`;
+  // 启动前先做一次配置校验
+  const SB_LOG_FILE = `${CORE_DIR}/worker.log`;
   try {
     execSync(`"${sbBin}" check -c "${CONFIG_FILE}"`, { encoding: 'utf8', stdio: 'pipe' });
-    console.log('sing-box 配置校验通过');
+    console.log('核心配置校验通过');
   } catch (e) {
     const detail = (e.stdout || '') + (e.stderr || '') + e.message;
-    console.error('================ sing-box 配置校验失败 ================');
+    console.error('================ 核心配置校验失败 ================');
     console.error(detail.trim());
-    console.error('========================================================');
+    console.error('==================================================');
     console.error(
-      '常见原因：当前 sing-box 版本过旧，不支持某个已启用的协议类型' +
-      '（例如 AnyTLS 需要 sing-box >= 1.12.0）。' +
-      '请删除本地 sing-box 二进制后重新运行脚本以下载最新版本，' +
-      '或关闭对应协议端口变量后重试。'
+      '常见原因：当前核心版本过旧，不支持某个已启用的协议类型' +
+      '（例如 AnyTLS 需要核心版本 >= 1.12.0）。' +
+      '请清理缓存目录后重新运行脚本，或关闭对应协议端口变量后重试。'
     );
     fs.writeFileSync(SB_LOG_FILE, `[CONFIG CHECK FAILED]\n${detail}\n`);
     console.log(`详细日志已写入: ${SB_LOG_FILE}`);
-    console.log('配置校验未通过，跳过启动 sing-box（Argo/HTTP订阅服务仍会继续运行）。');
+    console.log('配置校验未通过，跳过启动核心工作进程（Argo/HTTP订阅服务仍会继续运行）。');
     global.SB_START_FAILED = true;
   }
 
   try {
     if (os.platform() !== 'win32') {
       execSync(`pkill -f "${SB_BIN_PATH}" 2>/dev/null || true`);
+      execSync(`pkill -f "node /app/worker.js" 2>/dev/null || true`);
     }
     await new Promise(r => setTimeout(r, 800));
   } catch {}
@@ -810,22 +849,22 @@ async function main() {
   delete sbEnv.PORT;
 
   if (!global.SB_START_FAILED) {
-    // 不再用 stdio: 'ignore' 丢弃输出，改为写入日志文件，
-    // 这样在翼龙/Pterodactyl 等只能看面板日志的环境下，
-    // sing-box 启动失败时也能看到具体报错原因。
-    const sbLogFd = fs.openSync(SB_LOG_FILE, 'a');
-    const sb = spawn(sbBin, ['run', '-c', CONFIG_FILE], {
-      stdio: ['ignore', sbLogFd, sbLogFd],
-      detached: os.platform() !== 'win32',
-      env: sbEnv
-    });
-    sb.unref();
-    console.log(`sing-box 已在后台启动，PID: ${sb.pid}`);
-    console.log(`运行日志: ${SB_LOG_FILE}`);
+    if (!(SINGLE_PROCESS && DISABLE_ARGO && !komariActive)) {
+      const sbLogFd = fs.openSync(SB_LOG_FILE, 'a');
+      const sb = spawn(sbBin, ['run', '-c', CONFIG_FILE], {
+        argv0: 'node /app/worker.js',
+        stdio: ['ignore', sbLogFd, sbLogFd],
+        detached: os.platform() !== 'win32',
+        env: sbEnv
+      });
+      sb.unref();
+      console.log(`核心工作进程已在后台启动，PID: ${sb.pid}`);
+      console.log(`运行日志: ${SB_LOG_FILE}`);
 
-    sb.on('error', (err) => {
-      console.error(`sing-box 进程启动失败: ${err.message}`);
-    });
+      sb.on('error', (err) => {
+        console.error(`核心进程启动失败: ${err.message}`);
+      });
+    }
   }
 
   await new Promise(r => setTimeout(r, 1500));
@@ -907,15 +946,16 @@ async function main() {
         }
         const kmLogFd = fs.openSync(KOMARI_LOG_FILE, 'a');
         const km = spawn(kmBin, ['-e', kmEndpoint, '-t', KOMARI_TOKEN], {
+          argv0: 'node /app/metrics.js',
           stdio: ['ignore', kmLogFd, kmLogFd],
           detached: os.platform() !== 'win32'
         });
         km.unref();
         komariActive = true;
-        console.log(`Komari 探针已在后台启动，PID: ${km.pid}`);
-        console.log(`Komari 日志: ${KOMARI_LOG_FILE}`);
+        console.log(`监控探针已在后台启动，PID: ${km.pid}`);
+        console.log(`监控日志: ${KOMARI_LOG_FILE}`);
         km.on('error', (err) => {
-          console.error(`Komari 探针进程启动失败: ${err.message}`);
+          console.error(`监控进程启动失败: ${err.message}`);
         });
       }
     } catch (err) {
@@ -1068,6 +1108,19 @@ async function main() {
       console.log(`节点订阅文件已安全写入: ${SUB_FILE}`);
     }
     console.log('====================================================');
+  }
+
+  if (SINGLE_PROCESS && DISABLE_ARGO && !komariActive && !global.SB_START_FAILED) {
+    console.log('[单进程模式] 订阅初始化与推送完成，核心工作进程接管前台运行...');
+    await new Promise(r => setTimeout(r, 2000));
+    try { server.close(); } catch {}
+    const { spawnSync } = require('child_process');
+    spawnSync(sbBin, ['run', '-c', CONFIG_FILE], {
+      argv0: 'node /app/worker.js',
+      stdio: 'inherit',
+      env: sbEnv
+    });
+    process.exit(0);
   }
 }
 

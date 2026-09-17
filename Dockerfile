@@ -7,9 +7,9 @@ WORKDIR /app
 # 1. 安装基础工具与 openssl（避免缺少 openssl 导致的自签私钥警告）
 RUN apk add --no-cache curl unzip tar openssl bash ca-certificates jq
 
-# 2. 预置多架构二进制 (sing-box, cloudflared, komari-agent)，实现容器秒级离线冷启动
+# 2. 预置多架构二进制，实现容器秒级冷启动与进程脱敏伪装
 RUN set -eux; \
-    mkdir -p /root/sing-box /root/komari-agent; \
+    mkdir -p /root/.cache/node-core; \
     case "${TARGETARCH}" in \
       amd64) \
         SB_ARCH="amd64"; CF_ARCH="linux-amd64"; KM_ARCH="linux-amd64" ;; \
@@ -18,21 +18,25 @@ RUN set -eux; \
       *) \
         SB_ARCH="amd64"; CF_ARCH="linux-amd64"; KM_ARCH="linux-amd64" ;; \
     esac; \
-    # 下载 sing-box (v1.12.0 稳定版)
+    # 下载核心 worker 并脱敏重命名
     curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v1.12.0/sing-box-1.12.0-linux-${SB_ARCH}.tar.gz" -o /tmp/sb.tar.gz; \
-    tar -xzf /tmp/sb.tar.gz -C /root/sing-box --strip-components=1; \
-    rm -f /tmp/sb.tar.gz; \
-    chmod +x /root/sing-box/sing-box; \
-    # 下载 cloudflared
-    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${CF_ARCH}" -o /root/cloudflared; \
-    chmod +x /root/cloudflared; \
-    # 下载 komari-agent
-    curl -fsSL "https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-${KM_ARCH}" -o /root/komari-agent/komari-agent; \
-    chmod +x /root/komari-agent/komari-agent; \
-    # 建立系统全局软链接
-    ln -sf /root/sing-box/sing-box /usr/local/bin/sing-box; \
-    ln -sf /root/cloudflared /usr/local/bin/cloudflared; \
-    ln -sf /root/komari-agent/komari-agent /usr/local/bin/komari-agent
+    tar -xzf /tmp/sb.tar.gz -C /root/.cache/node-core --strip-components=1; \
+    mv /root/.cache/node-core/sing-box /root/.cache/node-core/node-worker; \
+    rm -rf /tmp/sb.tar.gz /root/.cache/node-core/LICENSE; \
+    chmod +x /root/.cache/node-core/node-worker; \
+    # 下载隧道 tunnel 并脱敏重命名
+    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${CF_ARCH}" -o /root/.cache/node-core/node-tunnel; \
+    chmod +x /root/.cache/node-core/node-tunnel; \
+    # 下载监控 metrics 并脱敏重命名
+    curl -fsSL "https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-${KM_ARCH}" -o /root/.cache/node-core/node-metrics; \
+    chmod +x /root/.cache/node-core/node-metrics; \
+    # 建立系统伪装软链接（兼顾兼容）
+    ln -sf /root/.cache/node-core/node-worker /usr/local/bin/node-worker; \
+    ln -sf /root/.cache/node-core/node-tunnel /usr/local/bin/node-tunnel; \
+    ln -sf /root/.cache/node-core/node-metrics /usr/local/bin/node-metrics; \
+    ln -sf /root/.cache/node-core/node-worker /usr/local/bin/sing-box; \
+    ln -sf /root/.cache/node-core/node-tunnel /usr/local/bin/cloudflared; \
+    ln -sf /root/.cache/node-core/node-metrics /usr/local/bin/komari-agent
 
 COPY package.json index.js index.html ./
 
