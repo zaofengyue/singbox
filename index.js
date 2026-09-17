@@ -976,11 +976,43 @@ async function main() {
 
   const server = http.createServer((req, res) => {
     const url = req.url.split('?')[0];
+
+    // 标准 Web 服务器响应头伪装（掩盖 Node.js 指纹）
+    const baseHeaders = {
+      'Server': 'nginx/1.24.0',
+      'Connection': 'keep-alive'
+    };
+
+    if (url === '/favicon.ico') {
+      res.writeHead(204, baseHeaders);
+      res.end();
+      return;
+    }
+
+    if (url === '/robots.txt') {
+      res.writeHead(200, { ...baseHeaders, 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('User-agent: *\nDisallow: /');
+      return;
+    }
+
+    if (url === '/health' || url === '/healthz') {
+      res.writeHead(200, { ...baseHeaders, 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('ok');
+      return;
+    }
+
     if (url === SUB_PATH) {
-      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.writeHead(200, {
+        ...baseHeaders,
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store, no-cache, must-revalidate'
+      });
       res.end(global.SUB_CONTENT || '');
     } else {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.writeHead(200, {
+        ...baseHeaders,
+        'Content-Type': 'text/html; charset=utf-8'
+      });
       res.end(INDEX_HTML);
     }
   });
