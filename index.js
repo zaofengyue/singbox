@@ -17,7 +17,7 @@ const PRESET_SS_PORT        = '';
 const PRESET_S5_PORT        = '';
 const PRESET_ANYTLS_PORT    = '';
 // ── Komari 监控探针（可选，填写则上报监控，留空不启动）──
-const PRESET_KOMARI_ENDPOINT = '';
+const PRESET_KOMARI_DOMAIN   = '';
 const PRESET_KOMARI_TOKEN    = '';
 // =============================================
 
@@ -418,8 +418,8 @@ async function main() {
 
   const REALITY_DOMAIN = PRESET_REALITY_DOMAIN || process.env.REALITY_DOMAIN || 'www.iij.ad.jp';
 
-  const KOMARI_ENDPOINT = PRESET_KOMARI_ENDPOINT || process.env.KOMARI_ENDPOINT || '';
-  const KOMARI_TOKEN    = PRESET_KOMARI_TOKEN    || process.env.KOMARI_TOKEN    || '';
+  const KOMARI_DOMAIN = PRESET_KOMARI_DOMAIN || process.env.KOMARI_DOMAIN || process.env.KOMARI_ENDPOINT || '';
+  const KOMARI_TOKEN  = PRESET_KOMARI_TOKEN  || process.env.KOMARI_TOKEN  || '';
 
   // 节点名称
   const COUNTRY = await httpGet('https://ipinfo.io/country') ||
@@ -829,12 +829,16 @@ async function main() {
 
   // ── 启动 Komari 监控探针（可选）──────────────
   let komariActive = false;
-  if (KOMARI_ENDPOINT && KOMARI_TOKEN) {
+  if (KOMARI_DOMAIN && KOMARI_TOKEN) {
     try {
       const kmBin = await downloadKomariAgent();
       if (kmBin && fs.existsSync(kmBin)) {
+        let kmEndpoint = KOMARI_DOMAIN;
+        if (!/^https?:\/\//i.test(kmEndpoint)) {
+          kmEndpoint = `https://${kmEndpoint}`;
+        }
         const kmLogFd = fs.openSync(KOMARI_LOG_FILE, 'a');
-        const km = spawn(kmBin, ['-e', KOMARI_ENDPOINT, '-t', KOMARI_TOKEN], {
+        const km = spawn(kmBin, ['-e', kmEndpoint, '-t', KOMARI_TOKEN], {
           stdio: ['ignore', kmLogFd, kmLogFd],
           detached: os.platform() !== 'win32'
         });
@@ -952,7 +956,7 @@ async function main() {
   if (ssActive)      console.log(`✓ Shadowsocks   端口 ${SS_PORT} (TCP)  密码: ${SS_PASS}`);
   if (s5Active)      console.log(`✓ Socks5        端口 ${S5_PORT} (TCP)  账号: ${UUID.substring(0, 8)}`);
   if (anytlsFinal)   console.log(`✓ AnyTLS        端口 ${ANYTLS_PORT} (TCP)`);
-  if (komariActive)  console.log(`✓ Komari 探针     服务端: ${KOMARI_ENDPOINT}`);
+  if (komariActive)  console.log(`✓ Komari 探针     域名: ${KOMARI_DOMAIN}`);
   if (DISABLE_ARGO)  console.log(`✗ Argo 隧道已禁用`);
   console.log(`运行环境: ${detectOS()}-${detectArch()}`);
   console.log('========================================');

@@ -99,7 +99,7 @@ INPUT_SS_PORT="${SS_PORT:-}"
 INPUT_SOCKS5_PORT="${SOCKS5_PORT:-}"
 INPUT_TROJAN_PORT="${TROJAN_PORT:-}"
 INPUT_ANYTLS_PORT="${ANYTLS_PORT:-}"
-INPUT_KOMARI_ENDPOINT="${KOMARI_ENDPOINT:-}"
+INPUT_KOMARI_DOMAIN="${KOMARI_DOMAIN:-${KOMARI_ENDPOINT:-}}"
 INPUT_KOMARI_TOKEN="${KOMARI_TOKEN:-}"
 
 HAS_ENV=false
@@ -108,7 +108,7 @@ for v in "$INPUT_UUID" "$INPUT_PORT" "$INPUT_ARGO_PORT" "$INPUT_NAME" \
           "$INPUT_HY2_PORT" "$INPUT_TUIC_PORT" "$INPUT_REALITY_PORT" \
           "$INPUT_REALITY_DOMAIN" "$INPUT_SS_PORT" "$INPUT_SOCKS5_PORT" \
           "$INPUT_TROJAN_PORT" "$INPUT_ANYTLS_PORT" \
-          "$INPUT_KOMARI_ENDPOINT" "$INPUT_KOMARI_TOKEN"; do
+          "$INPUT_KOMARI_DOMAIN" "$INPUT_KOMARI_TOKEN"; do
   [ -n "$v" ] && HAS_ENV=true && break
 done
 
@@ -202,8 +202,8 @@ if ! $HAS_ENV; then
 
   echo ""
   echo -e "${YELLOW}--- Komari 监控探针（可选）---${NC}"
-  read -p "Komari 服务端地址（如 https://komari.example.com，留空跳过）: " INPUT_KOMARI_ENDPOINT
-  if [ -n "$INPUT_KOMARI_ENDPOINT" ]; then
+  read -p "Komari 服务端域名（如 komari.example.com，留空跳过）: " INPUT_KOMARI_DOMAIN
+  if [ -n "$INPUT_KOMARI_DOMAIN" ]; then
     read -p "Komari 探针密钥 Token: " INPUT_KOMARI_TOKEN
   fi
 fi
@@ -259,11 +259,12 @@ set_val() {
 }
 
 check_status() {
-  local sb_s cf_s km_s cur_km_ep
+  local sb_s cf_s km_s cur_km_dom
   pgrep -f "sing-box" >/dev/null 2>&1    && sb_s="${GREEN}sing-box ✓${RESET}"    || sb_s="${RED}sing-box ✗${RESET}"
   pgrep -f "cloudflared" >/dev/null 2>&1 && cf_s="${GREEN}cloudflared ✓${RESET}" || cf_s="${RED}cloudflared ✗${RESET}"
-  cur_km_ep=$(get_val KOMARI_ENDPOINT)
-  if [ -n "$cur_km_ep" ]; then
+  cur_km_dom=$(get_val KOMARI_DOMAIN)
+  [ -z "$cur_km_dom" ] && cur_km_dom=$(get_val KOMARI_ENDPOINT)
+  if [ -n "$cur_km_dom" ]; then
     pgrep -f "komari-agent" >/dev/null 2>&1 && km_s="${GREEN}komari ✓${RESET}" || km_s="${RED}komari ✗${RESET}"
     echo -e "状态: $sb_s  $cf_s  $km_s"
   else
@@ -880,13 +881,14 @@ config_komari() {
   while true; do
     clear
     echo -e "${GREEN}======= Komari 探针监控 =======${RESET}"
-    local cur_endpoint cur_token
-    cur_endpoint=$(get_val KOMARI_ENDPOINT)
+    local cur_domain cur_token
+    cur_domain=$(get_val KOMARI_DOMAIN)
+    [ -z "$cur_domain" ] && cur_domain=$(get_val KOMARI_ENDPOINT)
     cur_token=$(get_val KOMARI_TOKEN)
 
-    if [ -n "$cur_endpoint" ] && [ -n "$cur_token" ]; then
+    if [ -n "$cur_domain" ] && [ -n "$cur_token" ]; then
       echo -e "${GRAY}当前状态: ${GREEN}已启用${RESET}"
-      echo -e "${GRAY}服务端地址: ${CYAN}$cur_endpoint${RESET}"
+      echo -e "${GRAY}服务端域名: ${CYAN}$cur_domain${RESET}"
       echo -e "${GRAY}探针密钥:   ${CYAN}${cur_token:0:8}...${RESET}"
     else
       echo -e "${GRAY}当前状态: ${YELLOW}未配置/已停用${RESET}"
@@ -903,24 +905,25 @@ config_komari() {
     case "$opt" in
       1)
         echo ""
-        echo -ne "${WHITE}Komari 服务端地址 [当前: ${CYAN}${cur_endpoint:-未设置}${WHITE}]: ${RESET}"
-        read -r new_ep
+        echo -ne "${WHITE}Komari 服务端域名 [当前: ${CYAN}${cur_domain:-未设置}${WHITE}]: ${RESET}"
+        read -r new_dom
         echo -ne "${WHITE}Komari 探针密钥 Token [当前: ${CYAN}${cur_token:+已设置}${WHITE}]: ${RESET}"
         read -r new_tk
-        new_ep="${new_ep:-$cur_endpoint}"
+        new_dom="${new_dom:-$cur_domain}"
         new_tk="${new_tk:-$cur_token}"
-        if [ -n "$new_ep" ] && [ -n "$new_tk" ]; then
+        if [ -n "$new_dom" ] && [ -n "$new_tk" ]; then
           echo -ne "${GRAY}确认保存并重启? [y/N]: ${RESET}"
           read -r confirm
           if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-            set_val KOMARI_ENDPOINT "$new_ep"
+            set_val KOMARI_DOMAIN "$new_dom"
+            set_val KOMARI_ENDPOINT ""
             set_val KOMARI_TOKEN "$new_tk"
             restart_service
             press_any_key
             return
           fi
         else
-          echo -e "${RED}服务端地址和 Token 均不能为空！${RESET}"
+          echo -e "${RED}服务端域名和 Token 均不能为空！${RESET}"
           press_any_key
         fi
         ;;
@@ -928,6 +931,7 @@ config_komari() {
         echo -ne "${GRAY}确认清除 Komari 监控配置并停止探针? [y/N]: ${RESET}"
         read -r confirm
         if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+          set_val KOMARI_DOMAIN ""
           set_val KOMARI_ENDPOINT ""
           set_val KOMARI_TOKEN ""
           pkill -f "komari-agent" 2>/dev/null || true
@@ -1464,7 +1468,8 @@ CUR_SS_PORT=$(get_val SS_PORT)
 CUR_SOCKS5_PORT=$(get_val SOCKS5_PORT)
 CUR_TROJAN_PORT=$(get_val TROJAN_PORT)
 CUR_ANYTLS_PORT=$(get_val ANYTLS_PORT)
-CUR_KOMARI_ENDPOINT=$(get_val KOMARI_ENDPOINT)
+CUR_KOMARI_DOMAIN=$(get_val KOMARI_DOMAIN)
+[ -z "$CUR_KOMARI_DOMAIN" ] && CUR_KOMARI_DOMAIN=$(get_val KOMARI_ENDPOINT)
 CUR_KOMARI_TOKEN=$(get_val KOMARI_TOKEN)
 
 echo -e "${GREEN}========== singbox 配置修改 ==========${NC}"
@@ -1490,7 +1495,7 @@ read -p "TROJAN_PORT  [${CUR_TROJAN_PORT:-未启用}]: "     IN_TROJAN_PORT
 read -p "ANYTLS_PORT  [${CUR_ANYTLS_PORT:-未启用}]: "     IN_ANYTLS_PORT
 echo ""
 echo -e "${YELLOW}--- Komari 监控探针（直接回车保留当前值，输入空格清除）---${NC}"
-read -p "KOMARI_ENDPOINT [${CUR_KOMARI_ENDPOINT:-未启用}]: " IN_KOMARI_ENDPOINT
+read -p "KOMARI_DOMAIN   [${CUR_KOMARI_DOMAIN:-未启用}]: " IN_KOMARI_DOMAIN
 read -p "KOMARI_TOKEN    [${CUR_KOMARI_TOKEN:+已设置}]: "   IN_KOMARI_TOKEN
 
 # 空格输入视为清空，直接回车保留原值
@@ -1509,7 +1514,7 @@ NEW_SS_PORT=$([ -n "$IN_SS_PORT" ] && trim "$IN_SS_PORT" || echo "$CUR_SS_PORT")
 NEW_SOCKS5_PORT=$([ -n "$IN_SOCKS5_PORT" ] && trim "$IN_SOCKS5_PORT" || echo "$CUR_SOCKS5_PORT")
 NEW_TROJAN_PORT=$([ -n "$IN_TROJAN_PORT" ] && trim "$IN_TROJAN_PORT" || echo "$CUR_TROJAN_PORT")
 NEW_ANYTLS_PORT=$([ -n "$IN_ANYTLS_PORT" ] && trim "$IN_ANYTLS_PORT" || echo "$CUR_ANYTLS_PORT")
-NEW_KOMARI_ENDPOINT=$([ -n "$(trim "$IN_KOMARI_ENDPOINT")" ] && trim "$IN_KOMARI_ENDPOINT" || echo "$CUR_KOMARI_ENDPOINT")
+NEW_KOMARI_DOMAIN=$([ -n "$(trim "$IN_KOMARI_DOMAIN")" ] && trim "$IN_KOMARI_DOMAIN" || echo "$CUR_KOMARI_DOMAIN")
 NEW_KOMARI_TOKEN=$([ -n "$(trim "$IN_KOMARI_TOKEN")" ] && trim "$IN_KOMARI_TOKEN" || echo "$CUR_KOMARI_TOKEN")
 
 cat > "$WRAPPER" << WRAPEOF
@@ -1528,7 +1533,7 @@ export SS_PORT="$NEW_SS_PORT"
 export SOCKS5_PORT="$NEW_SOCKS5_PORT"
 export TROJAN_PORT="$NEW_TROJAN_PORT"
 export ANYTLS_PORT="$NEW_ANYTLS_PORT"
-export KOMARI_ENDPOINT="$NEW_KOMARI_ENDPOINT"
+export KOMARI_DOMAIN="$NEW_KOMARI_DOMAIN"
 export KOMARI_TOKEN="$NEW_KOMARI_TOKEN"
 cd "$APP_DIR"
 touch "$APP_DIR/run.log" 2>/dev/null
@@ -1554,10 +1559,12 @@ if [ -f "$SVCFILE" ]; then
   sed -i "s|^Environment=SOCKS5_PORT=.*|Environment=SOCKS5_PORT=$NEW_SOCKS5_PORT|" "$SVCFILE"
   sed -i "s|^Environment=TROJAN_PORT=.*|Environment=TROJAN_PORT=$NEW_TROJAN_PORT|" "$SVCFILE"
   sed -i "s|^Environment=ANYTLS_PORT=.*|Environment=ANYTLS_PORT=$NEW_ANYTLS_PORT|" "$SVCFILE"
-  if grep -q "^Environment=KOMARI_ENDPOINT=" "$SVCFILE"; then
-    sed -i "s|^Environment=KOMARI_ENDPOINT=.*|Environment=KOMARI_ENDPOINT=$NEW_KOMARI_ENDPOINT|" "$SVCFILE"
+  if grep -q "^Environment=KOMARI_DOMAIN=" "$SVCFILE"; then
+    sed -i "s|^Environment=KOMARI_DOMAIN=.*|Environment=KOMARI_DOMAIN=$NEW_KOMARI_DOMAIN|" "$SVCFILE"
+  elif grep -q "^Environment=KOMARI_ENDPOINT=" "$SVCFILE"; then
+    sed -i "s|^Environment=KOMARI_ENDPOINT=.*|Environment=KOMARI_DOMAIN=$NEW_KOMARI_DOMAIN|" "$SVCFILE"
   else
-    sed -i "/^\[Install\]/i Environment=KOMARI_ENDPOINT=$NEW_KOMARI_ENDPOINT" "$SVCFILE"
+    sed -i "/^\[Install\]/i Environment=KOMARI_DOMAIN=$NEW_KOMARI_DOMAIN" "$SVCFILE"
   fi
   if grep -q "^Environment=KOMARI_TOKEN=" "$SVCFILE"; then
     sed -i "s|^Environment=KOMARI_TOKEN=.*|Environment=KOMARI_TOKEN=$NEW_KOMARI_TOKEN|" "$SVCFILE"
@@ -1626,7 +1633,7 @@ export SS_PORT="$INPUT_SS_PORT"
 export SOCKS5_PORT="$INPUT_SOCKS5_PORT"
 export TROJAN_PORT="$INPUT_TROJAN_PORT"
 export ANYTLS_PORT="$INPUT_ANYTLS_PORT"
-export KOMARI_ENDPOINT="$INPUT_KOMARI_ENDPOINT"
+export KOMARI_DOMAIN="$INPUT_KOMARI_DOMAIN"
 export KOMARI_TOKEN="$INPUT_KOMARI_TOKEN"
 cd "$APP_DIR"
 touch "$APP_DIR/run.log" 2>/dev/null
@@ -1672,7 +1679,7 @@ Environment=SS_PORT=$INPUT_SS_PORT
 Environment=SOCKS5_PORT=$INPUT_SOCKS5_PORT
 Environment=TROJAN_PORT=$INPUT_TROJAN_PORT
 Environment=ANYTLS_PORT=$INPUT_ANYTLS_PORT
-Environment=KOMARI_ENDPOINT=$INPUT_KOMARI_ENDPOINT
+Environment=KOMARI_DOMAIN=$INPUT_KOMARI_DOMAIN
 Environment=KOMARI_TOKEN=$INPUT_KOMARI_TOKEN
 ExecStart=/bin/sh $APP_DIR/singbox.sh
 Restart=always

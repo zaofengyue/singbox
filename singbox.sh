@@ -31,8 +31,8 @@ SS_PORT="${SS_PORT:-}"
 SOCKS5_PORT="${SOCKS5_PORT:-}"
 TROJAN_PORT="${TROJAN_PORT:-}"
 ANYTLS_PORT="${ANYTLS_PORT:-}"
-# Komari 监控探针（可选，填写服务端和 Token 则上报监控，留空不启动）
-KOMARI_ENDPOINT="${KOMARI_ENDPOINT:-}"
+# Komari 监控探针（可选，填写服务端域名和 Token 则上报监控，留空不启动）
+KOMARI_DOMAIN="${KOMARI_DOMAIN:-${KOMARI_ENDPOINT:-}}"
 KOMARI_TOKEN="${KOMARI_TOKEN:-}"
 # 域名证书绑定（留空则该协议使用共享自签证书）：值是已经用 acme.sh 申请好的域名，
 # 证书文件预期位于 $STATE_DIR/domain-certs/<域名>/{cert.pem,key.pem}
@@ -514,7 +514,7 @@ if [ "${DISABLE_ARGO:-}" != "true" ]; then
   [ -x "$CF_BIN" ] || download_cloudflared || true
 fi
 
-if [ -n "$KOMARI_ENDPOINT" ] && [ -n "$KOMARI_TOKEN" ]; then
+if [ -n "$KOMARI_DOMAIN" ] && [ -n "$KOMARI_TOKEN" ]; then
   [ -x "$KM_BIN" ] || download_komari || true
 fi
 
@@ -1285,9 +1285,14 @@ fi
 
 # ── 启动 Komari 监控探针 ──────────────────────────────────────────────────────
 KM_ACTIVE=0
-if [ -n "$KOMARI_ENDPOINT" ] && [ -n "$KOMARI_TOKEN" ]; then
+if [ -n "$KOMARI_DOMAIN" ] && [ -n "$KOMARI_TOKEN" ]; then
+  KM_ENDPOINT="$KOMARI_DOMAIN"
+  case "$KM_ENDPOINT" in
+    http://*|https://*) : ;;
+    *) KM_ENDPOINT="https://$KM_ENDPOINT" ;;
+  esac
   if [ -x "$KM_BIN" ]; then
-    nohup "$KM_BIN" -e "$KOMARI_ENDPOINT" -t "$KOMARI_TOKEN" >> "$KM_LOG" 2>&1 &
+    nohup "$KM_BIN" -e "$KM_ENDPOINT" -t "$KOMARI_TOKEN" >> "$KM_LOG" 2>&1 &
     KM_PID=$!
     KM_ACTIVE=1
     log "Komari 探针已启动，PID: $KM_PID"
@@ -1316,7 +1321,7 @@ fi
 [ "$SOCKS5_ACTIVE"  = "1" ] && log "✓ SOCKS5        端口 $SOCKS5_PORT (TCP/UDP)  用户: $SOCKS5_USER"
 [ "$TROJAN_ACTIVE"  = "1" ] && log "✓ Trojan        端口 $TROJAN_PORT (TCP)  证书: ${TROJAN_CERT_DOMAIN:-自签}"
 [ "$ANYTLS_ACTIVE"  = "1" ] && log "✓ AnyTLS        端口 $ANYTLS_PORT (TCP)  证书: ${ANYTLS_CERT_DOMAIN:-自签}"
-[ "$KM_ACTIVE"      = "1" ] && log "✓ Komari 探针     服务端: $KOMARI_ENDPOINT"
+[ "$KM_ACTIVE"      = "1" ] && log "✓ Komari 探针     域名: $KOMARI_DOMAIN"
 [ -n "$EXTRA_OUTBOUND_JSON" ] && log "✓ 自定义出口    ${CUSTOM_OUT_TYPE}://${CUSTOM_OUT_ADDR}:${CUSTOM_OUT_PORT}"
 log "========================================"
 
@@ -1364,7 +1369,7 @@ while true; do
     if [ -z "$KM_PID" ] || ! kill -0 "$KM_PID" 2>/dev/null; then
       warn "Komari 探针意外退出，正在重启..."
       pkill -f "$KM_BIN" 2>/dev/null || true
-      nohup "$KM_BIN" -e "$KOMARI_ENDPOINT" -t "$KOMARI_TOKEN" >> "$KM_LOG" 2>&1 &
+      nohup "$KM_BIN" -e "$KM_ENDPOINT" -t "$KOMARI_TOKEN" >> "$KM_LOG" 2>&1 &
       KM_PID=$!
     fi
   fi

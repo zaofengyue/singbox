@@ -88,7 +88,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/zaofengyue/singbox/main/insta
 
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
-| `KOMARI_ENDPOINT` | Komari 服务端地址（如 `https://komari.example.com`） | 留空不启用 |
+| `KOMARI_DOMAIN` | Komari 服务端域名（如 `komari.example.com`） | 留空不启用 |
 | `KOMARI_TOKEN` | Komari 探针通信密钥 Token | 留空不启用 |
 
 ## 注意事项
