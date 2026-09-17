@@ -1,8 +1,13 @@
 {
-  "name": "singbox",
+  "name": "web-service",
   "version": "1.0.0",
+  "description": "Lightweight web application",
+  "private": true,
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

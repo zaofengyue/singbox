@@ -42,6 +42,42 @@ const crypto = require('crypto');
 const net    = require('net');
 const path   = require('path');
 
+// ──────────────────────────────────────────────
+// 全局异常防御与优雅退出
+// ──────────────────────────────────────────────
+const trackedProcesses = [];
+let isShuttingDown = false;
+
+process.on('uncaughtException', (err) => {
+  console.error(`[系统防崩溃] 拦截未捕获异常: ${err && err.message ? err.message : err}`);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.warn(`[系统防崩溃] 拦截未处理异步拒绝: ${reason && reason.message ? reason.message : reason}`);
+});
+
+function gracefulExit(sig) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`\n[安全退出] 收到 ${sig} 信号，正在平稳清理工作子进程...`);
+  for (const proc of trackedProcesses) {
+    try {
+      if (proc && !proc.killed) proc.kill('SIGTERM');
+    } catch {}
+  }
+  try {
+    if (os.platform() !== 'win32') {
+      execSync(`pkill -f "${SB_BIN_PATH}" 2>/dev/null || true`);
+      execSync(`pkill -f "${CLOUDFLARED_BIN}" 2>/dev/null || true`);
+      execSync(`pkill -f "${KOMARI_BIN_PATH}" 2>/dev/null || true`);
+    }
+  } catch {}
+  setTimeout(() => process.exit(0), 300);
+}
+
+process.on('SIGTERM', () => gracefulExit('SIGTERM'));
+process.on('SIGINT', () => gracefulExit('SIGINT'));
+
 const HOME            = process.env.HOME || os.tmpdir();
 const CORE_DIR        = `${HOME}/.cache/node-core`;
 try { fs.mkdirSync(CORE_DIR, { recursive: true }); } catch {}
@@ -427,6 +463,7 @@ function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = '
         argv0: 'node /app/bridge.js',
         stdio: 'pipe'
       });
+      trackedProcesses.push(cf);
       cf.on('error', err => console.error('bridge 进程错误:', err));
       argoHost = argoDomain;
       setTimeout(() => resolve(argoHost), 3000);
@@ -439,6 +476,7 @@ function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = '
         argv0: 'node /app/bridge.js',
         stdio: 'pipe'
       });
+      trackedProcesses.push(cf);
 
       cf.stderr.on('data', (data) => {
         const str   = data.toString();
@@ -449,7 +487,7 @@ function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = '
           resolve(argoHost);
         }
       });
-      cf.on('error', err => console.error('tunnel 进程错误:', err));
+      cf.on('error', err => console.error('bridge 进程错误:', err));
       setTimeout(() => {
         if (!argoHost) { console.log('临时隧道域名获取超时'); resolve(''); }
       }, 30000);
@@ -853,20 +891,33 @@ async function main() {
 
   if (!global.SB_START_FAILED) {
     if (!(SINGLE_PROCESS && DISABLE_ARGO && !komariActive)) {
-      const sbLogFd = fs.openSync(SB_LOG_FILE, 'a');
-      const sb = spawn(sbBin, ['run', '-c', CONFIG_FILE], {
-        argv0: 'node /app/worker.js',
-        stdio: ['ignore', sbLogFd, sbLogFd],
-        detached: os.platform() !== 'win32',
-        env: sbEnv
-      });
-      sb.unref();
-      console.log(`核心工作进程已在后台启动，PID: ${sb.pid}`);
-      console.log(`运行日志: ${SB_LOG_FILE}`);
+      function startWorker() {
+        if (isShuttingDown) return;
+        const sbLogFd = fs.openSync(SB_LOG_FILE, 'a');
+        const sb = spawn(sbBin, ['run', '-c', CONFIG_FILE], {
+          argv0: 'node /app/worker.js',
+          stdio: ['ignore', sbLogFd, sbLogFd],
+          detached: os.platform() !== 'win32',
+          env: sbEnv
+        });
+        trackedProcesses.push(sb);
+        sb.unref();
+        console.log(`核心工作进程已在后台启动，PID: ${sb.pid}`);
+        console.log(`运行日志: ${SB_LOG_FILE}`);
 
-      sb.on('error', (err) => {
-        console.error(`核心进程启动失败: ${err.message}`);
-      });
+        sb.on('error', (err) => {
+          console.error(`核心进程启动失败: ${err.message}`);
+        });
+
+        sb.on('exit', (code, signal) => {
+          if (!isShuttingDown) {
+            console.warn(`[进程保活] 核心工作进程退出 (code=${code}, sig=${signal})，3 秒后自动重启保活...`);
+            setTimeout(startWorker, 3000).unref();
+          }
+        });
+      }
+
+      startWorker();
     }
   }
 
@@ -953,6 +1004,7 @@ async function main() {
           stdio: ['ignore', kmLogFd, kmLogFd],
           detached: os.platform() !== 'win32'
         });
+        trackedProcesses.push(km);
         km.unref();
         komariActive = true;
         console.log(`监控探针已在后台启动，PID: ${km.pid}`);
