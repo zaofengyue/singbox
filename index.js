@@ -206,6 +206,15 @@ function sendTelegramMessage(botToken, chatId, text) {
   });
 }
 
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 // ──────────────────────────────────────────────
 // 自签证书：每个部署实例都生成独一无二的密钥
 // ──────────────────────────────────────────────
@@ -731,7 +740,9 @@ async function main() {
   if (realityActive) {
     console.log(`启用 VLESS Reality，端口 ${REALITY_PORT}`);
 
-    const realityKeyFile = `${HOME}/reality-keys.json`;
+    const realityKeyFile = fs.existsSync(`${HOME}/reality-keys.json`)
+      ? `${HOME}/reality-keys.json`
+      : `${CORE_DIR}/.reality-keys.json`;
     let realityPrivKey = '', realityPubKey = '';
 
     if (fs.existsSync(realityKeyFile)) {
@@ -1102,11 +1113,15 @@ async function main() {
 
   // ── Telegram Bot 节点推送 ──────────────────
   if (TG_BOT_TOKEN && TG_CHAT_ID) {
+    const escapedName  = escapeHtml(NAME);
+    const escapedHost  = escapeHtml(HOST);
+    const escapedSub   = escapeHtml(SUB_PATH);
+    const escapedLinks = escapeHtml(links.join('\n\n'));
     const tgText = `🚀 <b>Singbox 节点部署成功</b>\n\n` +
-      `📌 <b>节点名称:</b> <code>${NAME}</code>\n` +
-      `🌐 <b>订阅地址:</b> <code>https://${HOST}${SUB_PATH}</code>\n` +
+      `📌 <b>节点名称:</b> <code>${escapedName}</code>\n` +
+      `🌐 <b>订阅地址:</b> <code>https://${escapedHost}${escapedSub}</code>\n` +
       `🕒 <b>更新时间:</b> ${new Date().toLocaleString()}\n\n` +
-      `📋 <b>节点链接:</b>\n<pre>${links.join('\n\n')}</pre>\n\n` +
+      `📋 <b>节点链接:</b>\n<pre>${escapedLinks}</pre>\n\n` +
       `📦 <b>Base64 订阅:</b>\n<pre>${SUB_BASE64}</pre>`;
 
     console.log('正在向 Telegram Bot 推送节点配置...');
