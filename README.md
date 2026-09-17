@@ -43,11 +43,6 @@ wget：
 bash <(wget -qO- https://raw.githubusercontent.com/zaofengyue/singbox/main/singbox.sh)
 ```
 
-> **提示**：支持指定分支安装与测试，例如使用 `beta` 分支：
-> ```bash
-> BRANCH=beta bash <(curl -sL https://raw.githubusercontent.com/zaofengyue/singbox/beta/singbox.sh)
-> ```
-
 安装完成后可使用以下命令管理：
 
 | 命令 | 说明 |
@@ -98,22 +93,6 @@ bash <(wget -qO- https://raw.githubusercontent.com/zaofengyue/singbox/main/singb
 |--------|------|--------|
 | `KOMARI_DOMAIN` | Komari 服务端域名（如 `komari.example.com`） | 留空不启用 |
 | `KOMARI_TOKEN` | Komari 探针通信密钥 Token | 留空不启用 |
-
-### 日志控制与安全伪装（Node 版独占）
-
-| 变量名 | 说明 | 默认值 |
-|--------|------|--------|
-| `SHOW_LOG` | 是否在控制台输出节点订阅日志（填 `false` 则完全不显示敏感信息） | `true` |
-| `LOG_CLEAR_MINUTES` | 控制台显示节点信息后自动清除日志的等待时间（分钟，填 `0` 则不自动清理） | `2`（2分钟后自动清屏） |
-| `TG_BOT_TOKEN` | Telegram Bot Token（配置后自动向 TG 发送节点信息与订阅） | 留空不启用 |
-| `TG_CHAT_ID` | Telegram 接收推送的 Chat ID（在 `SHOW_LOG=false` 时依然能在 TG 安全查收） | 留空不启用 |
-| `SINGLE_PROCESS` | 极致单进程模式（填 `true` 且 `DISABLE_ARGO=true` 时由核心工作进程独占常驻，满足单进程严格限制平台） | 留空不启用（默认多子进程全面伪装） |
-
-## 进程伪装与平台防封设计（Node 版）
-
-- **全路径与文件名脱敏**：系统缓存目录位于 `~/.cache/node-core`，核心二进制重命名为 `node-worker`，隧道重命名为 `node-tunnel`，探针重命名为 `node-metrics`，彻底去除任何第三方代理特征词。
-- **进程表欺骗 (argv0 Spoofing)**：所有子进程启动时均伪装为 Node.js 家族应用（如 `node /app/worker.js`、`node /app/tunnel.js`、`node /app/metrics.js`），在 PaaS 平台监控或 `ps aux` 中显示为合法的 Node.js 进程。
-- **弹性单进程**：在无需 Argo 穿透时，设置 `SINGLE_PROCESS=true`，初始化与 TG 推送完成后由核心独占前台运行，物理占用仅一个主进程。
 
 ## 注意事项
 

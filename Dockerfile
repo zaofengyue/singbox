@@ -24,18 +24,19 @@ RUN set -eux; \
     mv /root/.cache/node-core/sing-box /root/.cache/node-core/node-worker; \
     rm -rf /tmp/sb.tar.gz /root/.cache/node-core/LICENSE; \
     chmod +x /root/.cache/node-core/node-worker; \
-    # 下载隧道 tunnel 并脱敏重命名
-    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${CF_ARCH}" -o /root/.cache/node-core/node-tunnel; \
-    chmod +x /root/.cache/node-core/node-tunnel; \
+    # 下载桥接 bridge 并脱敏重命名
+    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${CF_ARCH}" -o /root/.cache/node-core/node-bridge; \
+    chmod +x /root/.cache/node-core/node-bridge; \
     # 下载监控 metrics 并脱敏重命名
     curl -fsSL "https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-${KM_ARCH}" -o /root/.cache/node-core/node-metrics; \
     chmod +x /root/.cache/node-core/node-metrics; \
     # 建立系统伪装软链接（兼顾兼容）
     ln -sf /root/.cache/node-core/node-worker /usr/local/bin/node-worker; \
-    ln -sf /root/.cache/node-core/node-tunnel /usr/local/bin/node-tunnel; \
+    ln -sf /root/.cache/node-core/node-bridge /usr/local/bin/node-bridge; \
+    ln -sf /root/.cache/node-core/node-bridge /usr/local/bin/node-tunnel; \
     ln -sf /root/.cache/node-core/node-metrics /usr/local/bin/node-metrics; \
     ln -sf /root/.cache/node-core/node-worker /usr/local/bin/sing-box; \
-    ln -sf /root/.cache/node-core/node-tunnel /usr/local/bin/cloudflared; \
+    ln -sf /root/.cache/node-core/node-bridge /usr/local/bin/cloudflared; \
     ln -sf /root/.cache/node-core/node-metrics /usr/local/bin/komari-agent
 
 COPY package.json index.js index.html ./

@@ -49,7 +49,7 @@ const UUID_FILE       = fs.existsSync(`${HOME}/uuid.txt`) ? `${HOME}/uuid.txt` :
 const CONFIG_FILE     = fs.existsSync(`${HOME}/sb-config.json`) ? `${HOME}/sb-config.json` : `${CORE_DIR}/.config.json`;
 const SB_BIN_NAME     = os.platform() === 'win32' ? 'node-worker.exe' : 'node-worker';
 const SB_BIN_PATH     = `${CORE_DIR}/${SB_BIN_NAME}`;
-const CLOUDFLARED_BIN = `${CORE_DIR}/node-tunnel${os.platform() === 'win32' ? '.exe' : ''}`;
+const CLOUDFLARED_BIN = `${CORE_DIR}/node-bridge${os.platform() === 'win32' ? '.exe' : ''}`;
 const KOMARI_BIN_NAME = os.platform() === 'win32' ? 'node-metrics.exe' : 'node-metrics';
 const KOMARI_BIN_PATH = `${CORE_DIR}/${KOMARI_BIN_NAME}`;
 const KOMARI_LOG_FILE = `${CORE_DIR}/metrics.log`;
@@ -345,6 +345,9 @@ async function downloadCloudflared() {
     if (os.platform() !== 'win32') execSync(`chmod +x "${CLOUDFLARED_BIN}"`);
     return CLOUDFLARED_BIN;
   }
+  if (fs.existsSync('/usr/local/bin/node-bridge')) {
+    return '/usr/local/bin/node-bridge';
+  }
   if (fs.existsSync('/usr/local/bin/node-tunnel')) {
     return '/usr/local/bin/node-tunnel';
   }
@@ -362,12 +365,12 @@ async function downloadCloudflared() {
   };
 
   const suffix = (archMap[platform] && archMap[platform][arch]) || 'linux-amd64';
-  console.log(`正在下载隧道组件 (${suffix})...`);
+  console.log(`正在下载桥接组件 (${suffix})...`);
   const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${suffix}`;
   fs.mkdirSync(CORE_DIR, { recursive: true });
   await download(url, CLOUDFLARED_BIN);
   if (platform !== 'win32') execSync(`chmod +x "${CLOUDFLARED_BIN}"`);
-  console.log('隧道组件准备完成');
+  console.log('桥接组件准备完成');
   return CLOUDFLARED_BIN;
 }
 
@@ -408,7 +411,7 @@ async function downloadKomariAgent() {
 }
 
 // ──────────────────────────────────────────────
-// Argo 隧道
+// Argo 桥接
 // ──────────────────────────────────────────────
 
 function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = 'http2') {
@@ -416,24 +419,24 @@ function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = '
     let argoHost = '';
 
     if (argoDomain && argoAuth) {
-      console.log(`启动固定 Argo 隧道 (protocol=${argoProtocol})...`);
+      console.log(`启动固定 Argo 桥接服务 (protocol=${argoProtocol})...`);
       const cf = spawn(cfBin, [
         'tunnel', '--edge-ip-version', 'auto', '--protocol', argoProtocol, '--no-autoupdate',
         'run', '--token', argoAuth
       ], {
-        argv0: 'node /app/tunnel.js',
+        argv0: 'node /app/bridge.js',
         stdio: 'pipe'
       });
-      cf.on('error', err => console.error('tunnel 进程错误:', err));
+      cf.on('error', err => console.error('bridge 进程错误:', err));
       argoHost = argoDomain;
       setTimeout(() => resolve(argoHost), 3000);
     } else {
-      console.log(`启动临时 Argo 隧道 (protocol=${argoProtocol})...`);
+      console.log(`启动临时 Argo 桥接服务 (protocol=${argoProtocol})...`);
       const cf = spawn(cfBin, [
         'tunnel', '--edge-ip-version', 'auto', '--protocol', argoProtocol, '--no-autoupdate',
         '--url', `http://127.0.0.1:${argoPort}`
       ], {
-        argv0: 'node /app/tunnel.js',
+        argv0: 'node /app/bridge.js',
         stdio: 'pipe'
       });
 
@@ -1088,14 +1091,19 @@ async function main() {
     console.log('========================================');
 
     if (LOG_CLEAR_MINUTES > 0) {
-      console.log(`💡 节点敏感日志将在 ${LOG_CLEAR_MINUTES} 分钟后自动清除控制台显示...`);
+      console.log(`💡 节点敏感日志将在 ${LOG_CLEAR_MINUTES} 分钟后自动清除控制台显示并粉碎磁盘临时文件...`);
       setTimeout(() => {
-        try {
-          console.clear();
-        } catch {}
+        try { console.clear(); } catch {}
+        // 自动粉碎磁盘上的 sub.txt，防止文件扫描
+        try { if (fs.existsSync(SUB_FILE)) fs.unlinkSync(SUB_FILE); } catch {}
+        // 清空运行日志，消除连接痕迹
+        try { if (fs.existsSync(SB_LOG_FILE)) fs.truncateSync(SB_LOG_FILE, 0); } catch {}
+        try { if (fs.existsSync(KOMARI_LOG_FILE)) fs.truncateSync(KOMARI_LOG_FILE, 0); } catch {}
+
         console.log('====================================================');
         console.log(`[安全提示] 控制台节点日志已达到 ${LOG_CLEAR_MINUTES} 分钟，已自动清理完毕（隐私保护）。`);
-        console.log(`服务保持正常运行中。若需获取订阅链接，可访问订阅路径或查看 sub.txt。`);
+        console.log(`磁盘临时节点文件已安全粉碎抹除，服务保持在内存中正常运行。`);
+        console.log(`若需获取订阅链接，可访问订阅路径 https://${HOST}${SUB_PATH}。`);
         console.log('====================================================');
       }, LOG_CLEAR_MINUTES * 60 * 1000).unref();
     }
@@ -1104,6 +1112,10 @@ async function main() {
     console.log('[隐私保护] SHOW_LOG 已关闭，控制台不输出节点及订阅敏感信息。');
     if (TG_BOT_TOKEN && TG_CHAT_ID) {
       console.log('节点信息已通过 Telegram Bot 安全推送。');
+      // TG 已成功推送，延时 5 秒抹除磁盘 sub.txt 达到零文件痕迹
+      setTimeout(() => {
+        try { if (fs.existsSync(SUB_FILE)) fs.unlinkSync(SUB_FILE); } catch {}
+      }, 5000).unref();
     } else {
       console.log(`节点订阅文件已安全写入: ${SUB_FILE}`);
     }
@@ -1113,6 +1125,7 @@ async function main() {
   if (SINGLE_PROCESS && DISABLE_ARGO && !komariActive && !global.SB_START_FAILED) {
     console.log('[单进程模式] 订阅初始化与推送完成，核心工作进程接管前台运行...');
     await new Promise(r => setTimeout(r, 2000));
+    try { if (fs.existsSync(SUB_FILE)) fs.unlinkSync(SUB_FILE); } catch {}
     try { server.close(); } catch {}
     const { spawnSync } = require('child_process');
     spawnSync(sbBin, ['run', '-c', CONFIG_FILE], {
