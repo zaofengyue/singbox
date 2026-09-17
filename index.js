@@ -1,25 +1,36 @@
-// ========== 预留配置，留空则自动识别 ==========
-const PRESET_UUID           = '';
-const PRESET_PORT           = '';
-const PRESET_ARGO_PORT      = '';
-const PRESET_NAME           = '';
-const PRESET_SUB            = '';
-const PRESET_ARGO_DOMAIN    = '';
-const PRESET_ARGO_AUTH      = '';
-// ── 填 'true' 禁用 Argo，留空则启用 ──
-const PRESET_DISABLE_ARGO   = '';
-// ── 可选协议，填写端口则启动对应协议，留空不启动 ──
-const PRESET_HY2_PORT       = '';
-const PRESET_TUIC_PORT      = '';
-const PRESET_REALITY_PORT   = '';
-const PRESET_REALITY_DOMAIN = '';
-const PRESET_SS_PORT        = '';
-const PRESET_S5_PORT        = '';
-const PRESET_ANYTLS_PORT    = '';
-// ── Komari 监控探针（可选，填写则上报监控，留空不启动）──
-const PRESET_KOMARI_DOMAIN   = '';
-const PRESET_KOMARI_TOKEN    = '';
-// =============================================
+// ==================== 预留配置（留空则读取环境变量或自动识别） ====================
+// ── 1. 基础配置 ──
+const PRESET_UUID           = ''; // 节点 UUID（留空自动生成）
+const PRESET_PORT           = ''; // HTTP 服务端口（默认自动寻找可用端口）
+const PRESET_NAME           = ''; // 节点名称前缀（留空自动识别 IP 所在国家与组织）
+const PRESET_SUB            = ''; // 订阅路径后缀（默认 'sub'，即 /sub）
+
+// ── 2. Argo 隧道配置 ──
+const PRESET_DISABLE_ARGO   = ''; // 填 'true' 禁用 Argo，留空则启用
+const PRESET_ARGO_DOMAIN    = ''; // 固定隧道域名（留空使用临时隧道）
+const PRESET_ARGO_AUTH      = ''; // 固定隧道 Token / 凭证
+const PRESET_ARGO_PORT      = ''; // Argo 内部端口（固定隧道默认 8001，临时隧道自动分配）
+const PRESET_ARGO_PROTOCOL  = ''; // Argo 隧道协议（默认 'http2'，可选 'quic'、'auto'）
+
+// ── 3. 可选直连协议配置（填写端口则启动对应协议，留空不启动）──
+const PRESET_HY2_PORT       = ''; // Hysteria2 端口 (UDP)
+const PRESET_TUIC_PORT      = ''; // TUIC v5 端口 (UDP)
+const PRESET_REALITY_PORT   = ''; // VLESS Reality 端口 (TCP)
+const PRESET_REALITY_DOMAIN = ''; // Reality 伪装域名（默认 'www.iij.ad.jp'）
+const PRESET_SS_PORT        = ''; // Shadowsocks 2022 端口 (TCP)
+const PRESET_S5_PORT        = ''; // SOCKS5 端口 (TCP)
+const PRESET_ANYTLS_PORT    = ''; // AnyTLS 端口 (TCP)
+
+// ── 4. Komari 探针监控配置（可选，填写则上报监控，留空不启动）──
+const PRESET_KOMARI_DOMAIN  = ''; // Komari 服务端域名（如 komari.example.com）
+const PRESET_KOMARI_TOKEN   = ''; // Komari 探针密钥 Token
+
+// ── 5. 日志与推送功能配置 ──
+const PRESET_SHOW_LOG          = ''; // 是否在控制台显示节点订阅日志（默认 'true'，填 'false' 关闭显示）
+const PRESET_LOG_CLEAR_MINUTES = ''; // 控制台显示节点后自动清除的等待时间（默认 '2' 分钟，填 '0' 则不清除）
+const PRESET_TG_BOT_TOKEN      = ''; // Telegram Bot Token（用于推送节点信息）
+const PRESET_TG_CHAT_ID        = ''; // Telegram Chat ID
+// ==============================================================================
 
 const { execSync, spawn } = require('child_process');
 const fs     = require('fs');
@@ -115,6 +126,46 @@ function downloadWithNode(url, dest) {
 function deriveSSPassword(uuid) {
   const hex = uuid.replace(/-/g, '').slice(0, 32);
   return Buffer.from(hex, 'hex').toString('base64');
+}
+
+// Telegram 推送消息函数
+function sendTelegramMessage(botToken, chatId, text) {
+  return new Promise((resolve) => {
+    if (!botToken || !chatId || !text) return resolve(false);
+    const postData = JSON.stringify({
+      chat_id: chatId,
+      text: text,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true
+    });
+    const options = {
+      hostname: 'api.telegram.org',
+      port: 443,
+      path: `/bot${botToken}/sendMessage`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(postData)
+      },
+      timeout: 10000
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve(res.statusCode === 200));
+    });
+    req.on('error', (err) => {
+      console.warn(`Telegram 推送失败: ${err.message}`);
+      resolve(false);
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      console.warn('Telegram 推送超时');
+      resolve(false);
+    });
+    req.write(postData);
+    req.end();
+  });
 }
 
 // ──────────────────────────────────────────────
@@ -324,23 +375,23 @@ async function downloadKomariAgent() {
 // Argo 隧道
 // ──────────────────────────────────────────────
 
-function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth) {
+function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = 'http2') {
   return new Promise((resolve) => {
     let argoHost = '';
 
     if (argoDomain && argoAuth) {
-      console.log('启动固定 Argo 隧道...');
+      console.log(`启动固定 Argo 隧道 (protocol=${argoProtocol})...`);
       const cf = spawn(cfBin, [
-        'tunnel', '--edge-ip-version', 'auto', '--no-autoupdate',
+        'tunnel', '--edge-ip-version', 'auto', '--protocol', argoProtocol, '--no-autoupdate',
         'run', '--token', argoAuth
       ], { stdio: 'pipe' });
       cf.on('error', err => console.error('cloudflared error:', err));
       argoHost = argoDomain;
       setTimeout(() => resolve(argoHost), 3000);
     } else {
-      console.log('启动临时 Argo 隧道...');
+      console.log(`启动临时 Argo 隧道 (protocol=${argoProtocol})...`);
       const cf = spawn(cfBin, [
-        'tunnel', '--edge-ip-version', 'auto', '--no-autoupdate',
+        'tunnel', '--edge-ip-version', 'auto', '--protocol', argoProtocol, '--no-autoupdate',
         '--url', `http://127.0.0.1:${argoPort}`
       ], { stdio: 'pipe' });
 
@@ -410,25 +461,33 @@ async function main() {
     ? parseInt(PRESET_ARGO_PORT || process.env.ARGO_PORT || '8001')
     : await getFreePort();
 
-  // 可选协议端口
+  const ARGO_PROTOCOL = PRESET_ARGO_PROTOCOL || process.env.ARGO_PROTOCOL || 'http2';
+
+  // 可选协议端口（兼容 S5_PORT 与 SOCKS5_PORT）
   const HY2_PORT_RAW     = PRESET_HY2_PORT     || process.env.HY2_PORT     || '';
   const TUIC_PORT_RAW    = PRESET_TUIC_PORT    || process.env.TUIC_PORT    || '';
   const REALITY_PORT_RAW = PRESET_REALITY_PORT || process.env.REALITY_PORT || '';
   const SS_PORT_RAW      = PRESET_SS_PORT      || process.env.SS_PORT      || '';
-  const S5_PORT_RAW      = PRESET_S5_PORT      || process.env.S5_PORT      || '';
+  const S5_PORT_RAW      = PRESET_S5_PORT      || process.env.SOCKS5_PORT  || process.env.S5_PORT || '';
   const ANYTLS_PORT_RAW  = PRESET_ANYTLS_PORT  || process.env.ANYTLS_PORT  || '';
 
   const HY2_PORT     = HY2_PORT_RAW     ? parseInt(HY2_PORT_RAW)     : 0;
   const TUIC_PORT    = TUIC_PORT_RAW    ? parseInt(TUIC_PORT_RAW)    : 0;
   const REALITY_PORT = REALITY_PORT_RAW ? parseInt(REALITY_PORT_RAW) : 0;
   const SS_PORT      = SS_PORT_RAW      ? parseInt(SS_PORT_RAW)      : 0;
-  const S5_PORT       = S5_PORT_RAW     ? parseInt(S5_PORT_RAW)      : 0;
-  const ANYTLS_PORT   = ANYTLS_PORT_RAW ? parseInt(ANYTLS_PORT_RAW)  : 0;
+  const S5_PORT      = S5_PORT_RAW      ? parseInt(S5_PORT_RAW)      : 0;
+  const ANYTLS_PORT  = ANYTLS_PORT_RAW  ? parseInt(ANYTLS_PORT_RAW)  : 0;
 
   const REALITY_DOMAIN = PRESET_REALITY_DOMAIN || process.env.REALITY_DOMAIN || 'www.iij.ad.jp';
 
   const KOMARI_DOMAIN = PRESET_KOMARI_DOMAIN || process.env.KOMARI_DOMAIN || process.env.KOMARI_ENDPOINT || '';
   const KOMARI_TOKEN  = PRESET_KOMARI_TOKEN  || process.env.KOMARI_TOKEN  || '';
+
+  // ── 功能变量（日志显示与清除、TG 推送）──
+  const SHOW_LOG          = (PRESET_SHOW_LOG || process.env.SHOW_LOG || 'true').toLowerCase() !== 'false';
+  const LOG_CLEAR_MINUTES = parseInt(PRESET_LOG_CLEAR_MINUTES || process.env.LOG_CLEAR_MINUTES || '2');
+  const TG_BOT_TOKEN      = PRESET_TG_BOT_TOKEN || process.env.TG_BOT_TOKEN || '';
+  const TG_CHAT_ID        = PRESET_TG_CHAT_ID   || process.env.TG_CHAT_ID   || '';
 
   // 节点名称
   const COUNTRY = await httpGet('https://ipinfo.io/country') ||
@@ -830,7 +889,7 @@ async function main() {
   let HOST = 'your-domain.com';
   if (!DISABLE_ARGO) {
     const cfBin    = await downloadCloudflared();
-    const argoHost = await startArgoTunnel(cfBin, ARGO_PORT, ARGO_DOMAIN, ARGO_AUTH);
+    const argoHost = await startArgoTunnel(cfBin, ARGO_PORT, ARGO_DOMAIN, ARGO_AUTH, ARGO_PROTOCOL);
     HOST = argoHost || 'your-domain.com';
   } else {
     console.log('Argo 隧道已禁用，跳过 cloudflared');
@@ -946,29 +1005,70 @@ async function main() {
   const SUB_FILE = `${process.cwd()}/sub.txt`;
   fs.writeFileSync(SUB_FILE, SUB_BASE64);
 
-  console.log('================= 订阅内容 =================');
-  console.log(SUB_BASE64);
-  console.log('============================================');
-  console.log(`订阅地址: https://${HOST}${SUB_PATH}`);
-  console.log(`节点文件: ${SUB_FILE}`);
+  // ── Telegram Bot 节点推送 ──────────────────
+  if (TG_BOT_TOKEN && TG_CHAT_ID) {
+    const tgText = `🚀 <b>Singbox 节点部署成功</b>\n\n` +
+      `📌 <b>节点名称:</b> <code>${NAME}</code>\n` +
+      `🌐 <b>订阅地址:</b> <code>https://${HOST}${SUB_PATH}</code>\n` +
+      `🕒 <b>更新时间:</b> ${new Date().toLocaleString()}\n\n` +
+      `📋 <b>节点链接:</b>\n<pre>${links.join('\n\n')}</pre>\n\n` +
+      `📦 <b>Base64 订阅:</b>\n<pre>${SUB_BASE64}</pre>`;
 
-  // 输出已启用协议汇总
-  console.log('============== 已启用协议 ==============');
-  if (!DISABLE_ARGO) {
-    console.log(`✓ VMess  + WS + Argo TLS`);
-    console.log(`✓ VLESS  + WS + Argo TLS`);
-    console.log(`✓ Trojan + WS + Argo TLS`);
+    console.log('正在向 Telegram Bot 推送节点配置...');
+    sendTelegramMessage(TG_BOT_TOKEN, TG_CHAT_ID, tgText).then((ok) => {
+      if (ok) console.log('Telegram 节点推送成功');
+      else console.warn('Telegram 节点推送失败，请检查 Token 与 Chat ID');
+    });
   }
-  if (hy2Final)      console.log(`✓ Hysteria2     端口 ${HY2_PORT} (UDP)`);
-  if (tuicFinal)     console.log(`✓ TUIC v5       端口 ${TUIC_PORT} (UDP)`);
-  if (realityActive) console.log(`✓ VLESS Reality 端口 ${REALITY_PORT}  PubKey: ${global.REALITY_PUB_KEY || '生成中'}`);
-  if (ssActive)      console.log(`✓ Shadowsocks   端口 ${SS_PORT} (TCP)  密码: ${SS_PASS}`);
-  if (s5Active)      console.log(`✓ Socks5        端口 ${S5_PORT} (TCP)  账号: ${UUID.substring(0, 8)}`);
-  if (anytlsFinal)   console.log(`✓ AnyTLS        端口 ${ANYTLS_PORT} (TCP)`);
-  if (komariActive)  console.log(`✓ Komari 探针     域名: ${KOMARI_DOMAIN}`);
-  if (DISABLE_ARGO)  console.log(`✗ Argo 隧道已禁用`);
-  console.log(`运行环境: ${detectOS()}-${detectArch()}`);
-  console.log('========================================');
+
+  // ── 控制台日志显示与自动清除 ────────────────
+  if (SHOW_LOG) {
+    console.log('================= 订阅内容 =================');
+    console.log(SUB_BASE64);
+    console.log('============================================');
+    console.log(`订阅地址: https://${HOST}${SUB_PATH}`);
+    console.log(`节点文件: ${SUB_FILE}`);
+
+    // 输出已启用协议汇总
+    console.log('============== 已启用协议 ==============');
+    if (!DISABLE_ARGO) {
+      console.log(`✓ VMess  + WS + Argo TLS`);
+      console.log(`✓ VLESS  + WS + Argo TLS`);
+      console.log(`✓ Trojan + WS + Argo TLS`);
+    }
+    if (hy2Final)      console.log(`✓ Hysteria2     端口 ${HY2_PORT} (UDP)`);
+    if (tuicFinal)     console.log(`✓ TUIC v5       端口 ${TUIC_PORT} (UDP)`);
+    if (realityActive) console.log(`✓ VLESS Reality 端口 ${REALITY_PORT}  PubKey: ${global.REALITY_PUB_KEY || '生成中'}`);
+    if (ssActive)      console.log(`✓ Shadowsocks   端口 ${SS_PORT} (TCP)  密码: ${SS_PASS}`);
+    if (s5Active)      console.log(`✓ Socks5        端口 ${S5_PORT} (TCP)  账号: ${UUID.substring(0, 8)}`);
+    if (anytlsFinal)   console.log(`✓ AnyTLS        端口 ${ANYTLS_PORT} (TCP)`);
+    if (komariActive)  console.log(`✓ Komari 探针     域名: ${KOMARI_DOMAIN}`);
+    if (DISABLE_ARGO)  console.log(`✗ Argo 隧道已禁用`);
+    console.log(`运行环境: ${detectOS()}-${detectArch()}`);
+    console.log('========================================');
+
+    if (LOG_CLEAR_MINUTES > 0) {
+      console.log(`💡 节点敏感日志将在 ${LOG_CLEAR_MINUTES} 分钟后自动清除控制台显示...`);
+      setTimeout(() => {
+        try {
+          console.clear();
+        } catch {}
+        console.log('====================================================');
+        console.log(`[安全提示] 控制台节点日志已达到 ${LOG_CLEAR_MINUTES} 分钟，已自动清理完毕（隐私保护）。`);
+        console.log(`服务保持正常运行中。若需获取订阅链接，可访问订阅路径或查看 sub.txt。`);
+        console.log('====================================================');
+      }, LOG_CLEAR_MINUTES * 60 * 1000).unref();
+    }
+  } else {
+    console.log('====================================================');
+    console.log('[隐私保护] SHOW_LOG 已关闭，控制台不输出节点及订阅敏感信息。');
+    if (TG_BOT_TOKEN && TG_CHAT_ID) {
+      console.log('节点信息已通过 Telegram Bot 安全推送。');
+    } else {
+      console.log(`节点订阅文件已安全写入: ${SUB_FILE}`);
+    }
+    console.log('====================================================');
+  }
 }
 
 main().catch(err => {

@@ -65,19 +65,21 @@ bash <(wget -qO- https://raw.githubusercontent.com/zaofengyue/singbox/main/singb
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
 | `UUID` | 节点唯一 ID | 自动生成 |
-| `PORT` | 对外监听端口 | 3000 |
-| `NAME` | 节点名称前缀 | 自动识别|
+| `PORT` | 对外 HTTP 监听端口（Web 伪装页与订阅） | 3000 |
+| `NAME` | 节点名称前缀 | 自动识别 IP 所在国家与组织 |
+| `SUB` | 订阅路径后缀（如 `/sub`） | `sub` |
 
 ### Argo 隧道
 
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
-| `ARGO_DOMAIN` | 固定隧道域名 | 留空使用临时隧道 |
-| `ARGO_AUTH` | 固定隧道 Token | 留空使用临时隧道 |
-| `ARGO_PORT` | Argo 内部端口 | 临时隧道随机，固定隧道默认 8001 |
 | `DISABLE_ARGO` | 禁用 Argo 隧道 | 留空启用，填 `true` 禁用 |
+| `ARGO_DOMAIN` | 固定隧道域名 | 留空使用临时隧道 |
+| `ARGO_AUTH` | 固定隧道 Token / 凭证 | 留空使用临时隧道 |
+| `ARGO_PORT` | Argo 内部转发端口 | 固定隧道默认 8001，临时隧道随机 |
+| `ARGO_PROTOCOL` | Argo 隧道协议（`http2` / `quic` / `auto`） | `http2` |
 
-### 可选协议（填写端口则启用，留空不启动）
+### 可选协议（填写端口则启用对应协议，留空不启动）
 
 | 变量名 | 说明 | 协议类型 |
 |--------|------|----------|
@@ -86,7 +88,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/zaofengyue/singbox/main/singb
 | `REALITY_PORT` | VLESS Reality 端口 | TCP |
 | `REALITY_DOMAIN` | Reality 伪装域名 | 默认 `www.iij.ad.jp` |
 | `SS_PORT` | Shadowsocks 2022 端口 | TCP |
-| `SOCKS5_PORT` | SOCKS5 端口 | TCP/UDP |
+| `SOCKS5_PORT` / `S5_PORT` | SOCKS5 端口 | TCP/UDP |
 | `TROJAN_PORT` | Trojan 端口 | TCP |
 | `ANYTLS_PORT` | AnyTLS 端口 | TCP |
 
@@ -96,6 +98,15 @@ bash <(wget -qO- https://raw.githubusercontent.com/zaofengyue/singbox/main/singb
 |--------|------|--------|
 | `KOMARI_DOMAIN` | Komari 服务端域名（如 `komari.example.com`） | 留空不启用 |
 | `KOMARI_TOKEN` | Komari 探针通信密钥 Token | 留空不启用 |
+
+### 日志控制与 Telegram 推送（Node 版独占）
+
+| 变量名 | 说明 | 默认值 |
+|--------|------|--------|
+| `SHOW_LOG` | 是否在控制台输出节点订阅日志（填 `false` 则完全不显示敏感信息） | `true` |
+| `LOG_CLEAR_MINUTES` | 控制台显示节点信息后自动清除日志的等待时间（分钟，填 `0` 则不自动清理） | `2`（2分钟后自动清屏） |
+| `TG_BOT_TOKEN` | Telegram Bot Token（配置后自动向 TG 发送节点信息与订阅） | 留空不启用 |
+| `TG_CHAT_ID` | Telegram 接收推送的 Chat ID（在 `SHOW_LOG=false` 时依然能在 TG 安全查收） | 留空不启用 |
 
 ## 注意事项
 
