@@ -1,132 +1,164 @@
-#!/bin/sh
+#!/bin/bash
+# ==============================================================================
+# singbox.sh - 一体化 Sing-box 跨平台服务端管理脚本
+# 功能支持: 安装部署 / 守护进程 / 交互面板 / 订阅查看 / 证书申请 / 出口分流 / 探针监控
+# ==============================================================================
+
+# Alpine ash 兼容性处理：若当前不是 bash 则尝试唤起 bash
+if [ -z "${BASH_VERSION:-}" ]; then
+  if command -v bash >/dev/null 2>&1; then
+    exec bash "$0" "$@"
+  else
+    echo "本脚本需要 bash 才能运行，当前系统未检测到 bash。"
+    [ -x "$(command -v apk 2>/dev/null)" ] && echo "Alpine 用户请先执行: apk add --no-cache bash"
+    [ -x "$(command -v apt-get 2>/dev/null)" ] && echo "Debian/Ubuntu 用户请先执行: apt-get install -y bash"
+    exit 1
+  fi
+fi
+
+set -e
+
 export TERM="${TERM:-xterm}"
 export LANG="${LANG:-C.UTF-8}"
 export LC_ALL="${LC_ALL:-C.UTF-8}"
 
-# ========== 配置变量 ==========
-UUID="${UUID:-}"
-PORT="${PORT:-3000}"
-ARGO_PORT="${ARGO_PORT:-}"
-NAME="${NAME:-}"
-ARGO_DOMAIN="${ARGO_DOMAIN:-}"
-ARGO_AUTH="${ARGO_AUTH:-}"
-DISABLE_ARGO="${DISABLE_ARGO:-}"
-# cloudflared 默认会优先探测 QUIC(UDP)连边缘节点，NAT 型 VPS/UDP 受限网络下经常
-# 连不上或者降级过程不可靠，导致 Argo 隧道时通时不通。默认强制走 http2(TCP)，
-# 需要的话可以自己覆盖成 quic 或 auto。
-ARGO_PROTOCOL="${ARGO_PROTOCOL:-http2}"
-case "$ARGO_PROTOCOL" in
-  http2|quic|auto) : ;;
-  *)
-    echo "[WARN] ARGO_PROTOCOL 值不合法(${ARGO_PROTOCOL})，只支持 http2/quic/auto，已回退为 http2"
-    ARGO_PROTOCOL="http2"
-    ;;
-esac
-# 可选协议端口（填写则启用，留空不启动）
-HY2_PORT="${HY2_PORT:-}"
-TUIC_PORT="${TUIC_PORT:-}"
-REALITY_PORT="${REALITY_PORT:-}"
-REALITY_DOMAIN="${REALITY_DOMAIN:-www.iij.ad.jp}"
-SS_PORT="${SS_PORT:-}"
-SOCKS5_PORT="${SOCKS5_PORT:-}"
-TROJAN_PORT="${TROJAN_PORT:-}"
-ANYTLS_PORT="${ANYTLS_PORT:-}"
-# Komari 监控探针（可选，填写服务端域名和 Token 则上报监控，留空不启动）
-KOMARI_DOMAIN="${KOMARI_DOMAIN:-${KOMARI_ENDPOINT:-}}"
-KOMARI_TOKEN="${KOMARI_TOKEN:-}"
-# 域名证书绑定（留空则该协议使用共享自签证书）：值是已经用 acme.sh 申请好的域名，
-# 证书文件预期位于 $STATE_DIR/domain-certs/<域名>/{cert.pem,key.pem}
-HY2_CERT_DOMAIN="${HY2_CERT_DOMAIN:-}"
-TUIC_CERT_DOMAIN="${TUIC_CERT_DOMAIN:-}"
-TROJAN_CERT_DOMAIN="${TROJAN_CERT_DOMAIN:-}"
-ANYTLS_CERT_DOMAIN="${ANYTLS_CERT_DOMAIN:-}"
-# HY2/TUIC 多端口：
-# *_EXTRA_PORTS = 逗号分隔的额外固定端口，跟主端口一样独立监听、共享同一套凭证/证书
-# *_HOP_RANGE   = 端口跳跃范围如 "20000-30000"，只在真正监听的主端口上生效，
-#                 靠 nftables/iptables 把这段 UDP 范围整体转发到主端口，需要 root
-HY2_EXTRA_PORTS="${HY2_EXTRA_PORTS:-}"
-HY2_HOP_RANGE="${HY2_HOP_RANGE:-}"
-TUIC_EXTRA_PORTS="${TUIC_EXTRA_PORTS:-}"
-TUIC_HOP_RANGE="${TUIC_HOP_RANGE:-}"
-# 优选地址
-CF_PREFER_HOST="${CF_PREFER_HOST:-cdns.doon.eu.org}"
-WS_PATH="${WS_PATH:-/fengyue}"
-# ==============================
+# ── 颜色与输出定义 ────────────────────────────────────────────────────────────
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+GRAY='\033[0;90m'
+WHITE='\033[0;97m'
+NC='\033[0m'
+RESET='\033[0m'
 
-HOME_DIR="${HOME:-/tmp}"
+log()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+die()  { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+
+# ── 路径与常量定义 ────────────────────────────────────────────────────────────
+BRANCH="${BRANCH:-main}"
+REPO_BASE="https://raw.githubusercontent.com/zaofengyue/singbox/${BRANCH}"
+
+HOME_DIR="${HOME:-/root}"
 APP_DIR="$HOME_DIR/singbox"
-# 所有含密钥/密码的文件集中放这一个目录下，目录本身 chmod 700，
-# 不再散落在 $HOME 根目录（uuid.txt / sb-config.json / reality-keys.txt / outbound.conf / certs 到处都是）。
 STATE_DIR="$APP_DIR/state"
-mkdir -p "$STATE_DIR" "$APP_DIR"
-chmod 700 "$STATE_DIR" 2>/dev/null || true
+ENV_FILE="$APP_DIR/config.env"
+LEGACY_WRAPPER="$APP_DIR/start.sh"
+SUB_FILE="$APP_DIR/sub.txt"
+LOG_FILE="$APP_DIR/run.log"
+CF_LOG="$APP_DIR/cf.log"
+KM_LOG="$APP_DIR/komari.log"
+PID_FILE="$APP_DIR/singbox.pid"
+SVCFILE="$HOME_DIR/.config/systemd/user/singbox.service"
+LOCAL_BIN="$HOME_DIR/.local/bin"
 
+# 密钥与证书集中存放
 UUID_FILE="$STATE_DIR/uuid.txt"
 CONFIG_FILE="$STATE_DIR/sb-config.json"
 REALITY_KEY_FILE="$STATE_DIR/reality-keys.txt"
 OUTBOUND_FILE="$STATE_DIR/outbound.conf"
 CERT_DIR="$STATE_DIR/certs"
 DOMAIN_CERT_DIR="$STATE_DIR/domain-certs"
-SUB_FILE="$APP_DIR/sub.txt"
-CF_LOG="$APP_DIR/cf.log"
-KM_LOG="$APP_DIR/komari.log"
+ACME_HOME="$STATE_DIR/acme.sh"
 
-# 兼容旧版本：把之前散落在 $HOME 根目录下的文件自动迁移到新位置，避免升级后 UUID/密钥丢失
-for _pair in "uuid.txt:$UUID_FILE" "sb-config.json:$CONFIG_FILE" \
-             "reality-keys.txt:$REALITY_KEY_FILE" "outbound.conf:$OUTBOUND_FILE"; do
-  _legacy_src="$HOME_DIR/${_pair%%:*}"
-  _legacy_dst="${_pair#*:}"
-  if [ -f "$_legacy_src" ] && [ ! -f "$_legacy_dst" ]; then
-    mv "$_legacy_src" "$_legacy_dst" 2>/dev/null || true
-  fi
-done
-if [ -d "$HOME_DIR/certs" ] && [ ! -d "$CERT_DIR" ]; then
-  mv "$HOME_DIR/certs" "$CERT_DIR" 2>/dev/null || true
-fi
-
-# 二进制优先落在 /tmp，避免 $HOME noexec 问题
+# 二进制存放目录（优先 /tmp/sb-bin 避开 noexec，备用 $HOME_DIR/sb-bin）
 BIN_DIR="/tmp/sb-bin"
 SB_DIR="$BIN_DIR/singbox"
 SB_BIN="$SB_DIR/sing-box"
 CF_BIN="$BIN_DIR/cloudflared"
 KM_BIN="$BIN_DIR/komari-agent"
 
-# ── 工具函数 ──────────────────────────────────────────────────────────────────
+USED_PORTS_FILE="/tmp/sb-used-ports.txt"
 
-log()  { echo "[INFO] $*"; }
-warn() { echo "[WARN] $*"; }
-die()  { echo "[ERROR] $*"; exit 1; }
+# ── 配置文件读写工具 ──────────────────────────────────────────────────────────
+get_val() {
+  local key="$1"
+  if [ -f "$ENV_FILE" ]; then
+    grep "^${key}=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d'=' -f2- | sed -e 's/^"//' -e 's/"$//'
+  elif [ -f "$LEGACY_WRAPPER" ]; then
+    grep "^export ${key}=" "$LEGACY_WRAPPER" 2>/dev/null | head -1 | sed 's/.*="\(.*\)"/\1/'
+  fi
+}
 
-# 在 Alpine/musl 等极简发行版上，curl/tar 甚至 openssl 都可能没预装。
-# 这里尝试自动装（仅在识别到 apk/apt 且是 root 时），装不了就明确报错退出，
-# 而不是让脚本在后面某个 http_get/dl 调用里悄悄返回空字符串、最后死得不明不白。
+set_val() {
+  local key="$1" val="$2"
+  mkdir -p "$APP_DIR"
+  if [ ! -f "$ENV_FILE" ]; then
+    touch "$ENV_FILE"
+    chmod 600 "$ENV_FILE" 2>/dev/null || true
+  fi
+
+  if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=\"${val}\"|" "$ENV_FILE"
+  else
+    echo "${key}=\"${val}\"" >> "$ENV_FILE"
+  fi
+
+  if [ -f "$LEGACY_WRAPPER" ]; then
+    if grep -q "^export ${key}=" "$LEGACY_WRAPPER" 2>/dev/null; then
+      sed -i "s|^export ${key}=.*|export ${key}=\"${val}\"|" "$LEGACY_WRAPPER"
+    else
+      sed -i "/^cd /i export ${key}=\"${val}\"" "$LEGACY_WRAPPER" 2>/dev/null || true
+    fi
+  fi
+
+  if [ -f "$SVCFILE" ]; then
+    if grep -q "^Environment=${key}=" "$SVCFILE" 2>/dev/null; then
+      sed -i "s|^Environment=${key}=.*|Environment=${key}=${val}|" "$SVCFILE"
+    else
+      sed -i "/^\[Install\]/i Environment=${key}=${val}" "$SVCFILE" 2>/dev/null || true
+    fi
+    systemctl --user daemon-reload 2>/dev/null || true
+  fi
+}
+
+load_env_file() {
+  if [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+  elif [ -f "$LEGACY_WRAPPER" ]; then
+    log "从历史配置 start.sh 迁移配置项..."
+    touch "$ENV_FILE"
+    chmod 600 "$ENV_FILE" 2>/dev/null || true
+    grep "^export " "$LEGACY_WRAPPER" | sed 's/^export //' >> "$ENV_FILE"
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+  fi
+}
+
+# ── 基础依赖自动安装 ──────────────────────────────────────────────────────────
 try_install_pkg() {
-  _pkg="$1"
+  local _pkg="$1"
   if command -v apk >/dev/null 2>&1; then
-    [ "$(id -u)" = "0" ] && apk add --no-cache "$_pkg" >/dev/null 2>&1
+    [ "$(id -u)" = "0" ] && apk add --no-cache $_pkg >/dev/null 2>&1 || true
   elif command -v apt-get >/dev/null 2>&1; then
-    [ "$(id -u)" = "0" ] && { apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq "$_pkg" >/dev/null 2>&1; }
+    [ "$(id -u)" = "0" ] && { apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq $_pkg >/dev/null 2>&1 || true; }
   fi
 }
 
 ensure_basic_deps() {
+  local _missing=""
+  command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || _missing="$_missing curl"
+  command -v tar     >/dev/null 2>&1 || _missing="$_missing tar"
+  command -v openssl >/dev/null 2>&1 || _missing="$_missing openssl"
+  [ -z "$_missing" ] && return 0
+
+  warn "检测到缺少基础工具:${_missing}，尝试自动安装..."
+  try_install_pkg "$_missing"
   if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-    warn "缺少 curl/wget，尝试自动安装 curl..."
-    try_install_pkg curl
+    die "缺少 curl/wget 且自动安装失败。Alpine: apk add --no-cache curl；Debian/Ubuntu: apt-get install -y curl"
   fi
   if ! command -v tar >/dev/null 2>&1; then
-    warn "缺少 tar，尝试自动安装..."
-    try_install_pkg tar
-  fi
-  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-    die "缺少 curl/wget，且自动安装失败。Alpine 请手动执行: apk add --no-cache curl；Debian/Ubuntu: apt-get install -y curl"
-  fi
-  if ! command -v tar >/dev/null 2>&1; then
-    die "缺少 tar，且自动安装失败。Alpine 请手动执行: apk add --no-cache tar"
+    die "缺少 tar 且自动安装失败。Alpine: apk add --no-cache tar"
   fi
 }
-ensure_basic_deps
 
+# ── 通用工具函数 ──────────────────────────────────────────────────────────────
 http_get() {
   if command -v curl >/dev/null 2>&1; then
     curl -sL --max-time 5 "$1" 2>/dev/null || true
@@ -136,17 +168,14 @@ http_get() {
 }
 
 dl() {
-  # 下载并校验：失败(网络错误/HTTP错误码/空文件)会重试，最终仍失败则返回非零
-  _url="$1"; _out="$2"; _tries=0
+  local _url="$1" _out="$2" _tries=0
   while [ "$_tries" -lt 3 ]; do
     if command -v curl >/dev/null 2>&1; then
       curl -sL --fail --max-time 60 "$_url" -o "$_out" 2>/dev/null
     else
       wget -q --timeout=60 "$_url" -O "$_out" 2>/dev/null
     fi
-    if [ -s "$_out" ]; then
-      return 0
-    fi
+    if [ -s "$_out" ]; then return 0; fi
     _tries=$((_tries + 1))
     warn "下载失败(第 ${_tries} 次): $_url"
     rm -f "$_out"
@@ -155,32 +184,21 @@ dl() {
   return 1
 }
 
-# base64 编码，兼容无 -w0 的环境
 b64() {
   printf '%s' "$1" | base64 -w0 2>/dev/null || printf '%s' "$1" | base64 | tr -d '\n'
 }
 
-# URL 编码（只编码空格和常见特殊字符）
 url_encode() {
   printf '%s' "$1" | sed \
-    -e 's/ /%20/g' \
-    -e 's/#/%23/g' \
-    -e 's/&/%26/g' \
-    -e 's/+/%2B/g' \
-    -e 's/,/%2C/g' \
-    -e 's/:/%3A/g' \
-    -e 's/;/%3B/g' \
-    -e 's/=/%3D/g' \
-    -e 's/?/%3F/g' \
-    -e 's/@/%40/g'
+    -e 's/ /%20/g' -e 's/#/%23/g' -e 's/&/%26/g' -e 's/+/%2B/g' \
+    -e 's/,/%2C/g' -e 's/:/%3A/g' -e 's/;/%3B/g' -e 's/=/%3D/g' \
+    -e 's/?/%3F/g' -e 's/@/%40/g'
 }
 
-# JSON 字符串转义（反斜杠和双引号），用于任何可能包含特殊字符的用户输入
 json_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
-# IPv6 地址加方括号包裹，IPv4 原样返回
 format_addr() {
   case "$1" in
     *:*) printf '[%s]' "$1" ;;
@@ -188,64 +206,48 @@ format_addr() {
   esac
 }
 
-# 端口合法性检查（参数：端口值，协议 tcp/udp，已用端口列表文件）
-USED_PORTS_FILE="/tmp/sb-used-ports.txt"
+press_any_key() {
+  echo ""
+  echo -e "${GRAY}按回车键返回...${RESET}"
+  read -r
+}
 
-# 探测端口是否已被系统上其他进程占用（TCP 和 UDP 都查），
-# 这是 sing-box check 覆盖不到的：check 只校验配置语法，不做实际 bind 测试，
-# 真正 bind 失败要等到 run 时才会暴露，而且会导致整个多协议进程直接退出。
 port_in_use_os() {
-  _p="$1"
+  local _p="$1"
   if command -v ss >/dev/null 2>&1; then
     ss -ltn 2>/dev/null | grep -q ":${_p} " && return 0
     ss -lun 2>/dev/null | grep -q ":${_p} " && return 0
-    return 1
   elif command -v netstat >/dev/null 2>&1; then
     netstat -ltn 2>/dev/null | grep -q ":${_p} " && return 0
     netstat -lun 2>/dev/null | grep -q ":${_p} " && return 0
-    return 1
   fi
   return 1
 }
 
 port_ok() {
-  _p="$1"
+  local _p="$1"
   [ -z "$_p" ] && return 1
-  case "$_p" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
+  case "$_p" in ''|*[!0-9]*) return 1 ;; esac
   [ "$_p" -lt 1 ] || [ "$_p" -gt 65535 ] && return 1
   grep -qx "$_p" "$USED_PORTS_FILE" 2>/dev/null && return 1
-  if port_in_use_os "$_p"; then
-    return 1
-  fi
+  if port_in_use_os "$_p"; then return 1; fi
   echo "$_p" >> "$USED_PORTS_FILE"
   return 0
 }
 
-# 校验 "20000-30000" 这种端口范围格式，用于端口跳跃(port hopping)
 valid_port_range() {
-  _r="$1"
-  case "$_r" in
-    *[!0-9-]*) return 1 ;;
-  esac
-  _start="${_r%%-*}"
-  _end="${_r##*-}"
+  local _r="$1"
+  case "$_r" in *[!0-9-]*) return 1 ;; esac
+  local _start="${_r%%-*}"
+  local _end="${_r##*-}"
   [ "$_r" = "${_start}-${_end}" ] || return 1
   case "$_start" in ''|*[!0-9]*) return 1 ;; esac
   case "$_end" in ''|*[!0-9]*) return 1 ;; esac
   [ "$_start" -ge 1 ] && [ "$_end" -le 65535 ] && [ "$_start" -lt "$_end" ]
 }
 
-# 解析逗号分隔的额外端口列表，逐个跑 port_ok 校验，输出通过校验的端口(空格分隔)
 parse_extra_ports() {
-  # 注意：这个函数的 stdout 会被调用方用 $(...) 捕获当返回值，
-  # 所以内部绝对不能调用会写 stdout 的 warn()/log()，否则警告文字会混进
-  # 端口列表里，把后面所有基于这个列表的处理全部搞坏（曾经实际导致过
-  # sing-box 因为端口列表被污染而重复绑定同一端口，启动时直接崩溃）。
-  _list="$1"
-  _out=""
-  _old_ifs="$IFS"
+  local _list="$1" _out="" _old_ifs="$IFS"
   IFS=','
   for _p in $_list; do
     IFS="$_old_ifs"
@@ -263,32 +265,24 @@ parse_extra_ports() {
 }
 
 get_free_port() {
-  # 优先用 ss/netstat 找空闲端口，不依赖 Python
-  _port=10086
+  local _port=10086
   if command -v ss >/dev/null 2>&1; then
     for _try in 10086 10087 10088 10089 10090; do
       ss -ltn 2>/dev/null | grep -q ":${_try} " || { _port=$_try; break; }
     done
   elif command -v python3 >/dev/null 2>&1; then
     _port=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); p=s.getsockname()[1]; s.close(); print(p)" 2>/dev/null) || _port=10086
-  elif command -v python >/dev/null 2>&1; then
-    _port=$(python -c "import socket; s=socket.socket(); s.bind(('',0)); p=s.getsockname()[1]; s.close(); print(p)" 2>/dev/null) || _port=10086
   fi
   echo "$_port"
 }
 
-# 等待端口就绪（最多等 N 秒）
 wait_port() {
-  _host="$1"; _port="$2"; _max="${3:-10}"
-  _i=0
+  local _host="$1" _port="$2" _max="${3:-10}" _i=0
   while [ "$_i" -lt "$_max" ]; do
     if command -v nc >/dev/null 2>&1; then
       nc -z "$_host" "$_port" 2>/dev/null && return 0
     elif command -v ss >/dev/null 2>&1; then
       ss -ltn 2>/dev/null | grep -q ":${_port} " && return 0
-    else
-      sleep 1
-      return 0
     fi
     sleep 1
     _i=$((_i + 1))
@@ -296,10 +290,6 @@ wait_port() {
   return 1
 }
 
-# ── UUID 管理 ─────────────────────────────────────────────────────────────────
-# 严格校验 UUID 格式：UUID 可能来自外部环境变量/表单输入，
-# 不校验的话它会被原样拼进下面的 python -c "..." 源码字符串里，
-# 精心构造的值（比如带单引号和分号）可以借此执行任意 python 代码。
 valid_uuid() {
   case "$1" in
     [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F])
@@ -308,252 +298,8 @@ valid_uuid() {
   esac
 }
 
-if [ -n "$UUID" ]; then
-  valid_uuid "$UUID" || die "UUID 格式不合法: ${UUID}（必须是标准格式，如 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）"
-  echo "$UUID" > "$UUID_FILE"
-elif [ -f "$UUID_FILE" ]; then
-  UUID="$(cat "$UUID_FILE")"
-  valid_uuid "$UUID" || die "uuid.txt 中的 UUID 格式已损坏，请删除该文件后重试: $UUID_FILE"
-else
-  UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null \
-    || python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null \
-    || python  -c 'import uuid; print(uuid.uuid4())' 2>/dev/null \
-    || od -x /dev/urandom | head -1 | awk '{print $2$3"-"$4"-"$5"-"$6"-"$7$8$9}')"
-  echo "$UUID" > "$UUID_FILE"
-fi
-chmod 600 "$UUID_FILE" 2>/dev/null || true
-
-# SOCKS5 凭证从 UUID 派生：用户名取前 8 位（第一段），密码取后 12 位（最后一段），
-# 不用额外再管理一套单独的用户名/密码。
-SOCKS5_USER="${UUID%%-*}"
-SOCKS5_PASS="${UUID##*-}"
-
-# SS2022 密码：取 UUID 前 16 字节做 base64（24字符）
-# 优先 python3，备选 openssl（不再依赖 xxd，Alpine/busybox 环境通常没有 xxd）
-SS_PASS=""
-if command -v python3 >/dev/null 2>&1; then
-  SS_PASS="$(python3 -c "
-u='$UUID'.replace('-','')[:32]
-import base64, binascii
-print(base64.b64encode(binascii.unhexlify(u)).decode())
-" 2>/dev/null)" || SS_PASS=""
-fi
-if [ -z "$SS_PASS" ] && command -v python >/dev/null 2>&1; then
-  SS_PASS="$(python -c "
-u='$UUID'.replace('-','')[:32]
-import base64, binascii
-print(base64.b64encode(binascii.unhexlify(u)).decode())
-" 2>/dev/null)" || SS_PASS=""
-fi
-if [ -z "$SS_PASS" ] && [ -n "$SS_PORT" ] && ! command -v openssl >/dev/null 2>&1; then
-  warn "缺少 openssl，尝试自动安装..."
-  try_install_pkg openssl
-fi
-if [ -z "$SS_PASS" ] && command -v openssl >/dev/null 2>&1; then
-  _hex="$(echo "$UUID" | tr -d '-' | cut -c1-32)"
-  # 把十六进制字符串转成 \xHH 转义序列交给 printf 还原成原始字节，不再需要 xxd
-  _hexesc="$(printf '%s' "$_hex" | sed 's/\(..\)/\\x\1/g')"
-  SS_PASS="$(printf "$_hexesc" | openssl base64 -A 2>/dev/null)" || SS_PASS=""
-fi
-if [ -z "$SS_PASS" ] && [ -n "$SS_PORT" ]; then
-  warn "SS2022 密码生成失败（需要 python3/python/openssl），Shadowsocks 将被跳过"
-fi
-
-# ── 架构检测 ──────────────────────────────────────────────────────────────────
-case "$(uname -m)" in
-  x86_64|amd64)  SB_ARCH="amd64";  CF_ARCH="linux-amd64"; KM_ARCH="linux-amd64" ;;
-  aarch64|arm64) SB_ARCH="arm64";  CF_ARCH="linux-arm64"; KM_ARCH="linux-arm64" ;;
-  armv7*|armv6*) SB_ARCH="armv7";  CF_ARCH="linux-arm";   KM_ARCH="linux-arm"   ;;
-  i386|i686)     SB_ARCH="386";    CF_ARCH="linux-386";   KM_ARCH="linux-386"   ;;
-  *)
-    warn "未知架构 $(uname -m)，fallback 到 amd64"
-    SB_ARCH="amd64"; CF_ARCH="linux-amd64"; KM_ARCH="linux-amd64"
-    ;;
-esac
-
-# ── 二进制目录：优先 /tmp，fallback $HOME ─────────────────────────────────────
-mkdir -p "$BIN_DIR" 2>/dev/null || {
-  warn "/tmp/sb-bin 不可用，fallback 到 $HOME_DIR/sb-bin"
-  BIN_DIR="$HOME_DIR/sb-bin"
-  SB_DIR="$BIN_DIR/singbox"
-  SB_BIN="$SB_DIR/sing-box"
-  CF_BIN="$BIN_DIR/cloudflared"
-  KM_BIN="$BIN_DIR/komari-agent"
-  mkdir -p "$BIN_DIR"
-}
-
-# 验证目录可执行
-_test_bin="$BIN_DIR/.exectest"
-printf '#!/bin/sh\nexit 0\n' > "$_test_bin" 2>/dev/null
-chmod +x "$_test_bin" 2>/dev/null
-if ! "$_test_bin" 2>/dev/null; then
-  warn "$BIN_DIR 挂载为 noexec，尝试其他路径..."
-  for _try_dir in /var/tmp /dev/shm "$HOME_DIR"; do
-    _test_bin2="$_try_dir/.exectest"
-    printf '#!/bin/sh\nexit 0\n' > "$_test_bin2" 2>/dev/null
-    chmod +x "$_test_bin2" 2>/dev/null
-    if "$_test_bin2" 2>/dev/null; then
-      BIN_DIR="$_try_dir/sb-bin"
-      SB_DIR="$BIN_DIR/singbox"
-      SB_BIN="$SB_DIR/sing-box"
-      CF_BIN="$BIN_DIR/cloudflared"
-      KM_BIN="$BIN_DIR/komari-agent"
-      mkdir -p "$BIN_DIR"
-      rm -f "$_test_bin2"
-      log "使用可执行目录: $BIN_DIR"
-      break
-    fi
-    rm -f "$_test_bin2"
-  done
-fi
-rm -f "$_test_bin"
-
-# ── 下载 sing-box ─────────────────────────────────────────────────────────────
-download_singbox() {
-  mkdir -p "$SB_DIR"
-  log "正在获取 sing-box 最新版本..."
-  SB_VER="$(http_get 'https://api.github.com/repos/SagerNet/sing-box/releases/latest' \
-    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
-  SB_FALLBACK_VER="v1.12.0"
-  if [ -z "$SB_VER" ]; then
-    SB_VER="$SB_FALLBACK_VER"
-    warn "获取最新版本号失败（可能是 GitHub API 限流），回退到 ${SB_VER}，较新协议（如 AnyTLS）可能不受支持"
-  fi
-
-  # 尝试下载+校验指定版本：官方发行版里 "linux-${ARCH}.tar.gz"（不带后缀）是动态
-  # 链接 glibc 的构建，系统 glibc 版本不够新、或者是 musl 系统（Alpine 等）时会
-  # 直接跑不起来——这才是"架构不匹配"报错的真正原因，不是 CPU 指令集不对。
-  # 优先尝试 "-musl" 静态编译构建（零运行时依赖，随便什么系统都能跑），
-  # 这个变体不存在再退回默认构建。全部尝试完还是不行，返回 1 交给调用方决定
-  # 要不要换版本重试。
-  _try_fetch_singbox() {
-    _v="$1"
-    _vnum="${_v#v}"
-    for _suffix in "-musl" ""; do
-      _asset="sing-box-${_vnum}-linux-${SB_ARCH}${_suffix}.tar.gz"
-      log "下载 sing-box ${_v} (${SB_ARCH}${_suffix:+ 静态musl})..."
-      if ! dl "https://github.com/SagerNet/sing-box/releases/download/${_v}/${_asset}" /tmp/sing-box.tar.gz; then
-        warn "sing-box ${_v}${_suffix} 下载失败（该变体可能不存在，或网络问题）"
-        continue
-      fi
-      if ! tar -tzf /tmp/sing-box.tar.gz >/dev/null 2>&1; then
-        rm -f /tmp/sing-box.tar.gz
-        warn "sing-box ${_v}${_suffix} 压缩包已损坏（下载不完整）"
-        continue
-      fi
-      rm -rf "$SB_DIR"
-      mkdir -p "$SB_DIR"
-      tar -xzf /tmp/sing-box.tar.gz -C "$SB_DIR" --strip-components=1
-      chmod +x "$SB_BIN"
-      rm -f /tmp/sing-box.tar.gz
-      if "$SB_BIN" version >/dev/null 2>&1; then
-        return 0
-      fi
-      warn "sing-box ${_v}${_suffix} 二进制下载完整但无法执行"
-      rm -f "$SB_BIN"
-    done
-    return 1
-  }
-
-  if _try_fetch_singbox "$SB_VER"; then
-    log "sing-box 下载完成: $("$SB_BIN" version 2>/dev/null | head -1)"
-    return 0
-  fi
-
-  if [ "$SB_VER" != "$SB_FALLBACK_VER" ]; then
-    warn "${SB_VER} 不可用，尝试回退到已知版本 ${SB_FALLBACK_VER}..."
-    if _try_fetch_singbox "$SB_FALLBACK_VER"; then
-      log "sing-box 下载完成（回退版本）: $("$SB_BIN" version 2>/dev/null | head -1)"
-      return 0
-    fi
-  fi
-
-  die "sing-box 下载/校验失败（已尝试 ${SB_ARCH} 架构下 musl/glibc 两种构建，最新版 ${SB_VER} 和回退版 ${SB_FALLBACK_VER} 均不可用），请检查网络或系统架构"
-}
-
-# ── 下载 cloudflared ──────────────────────────────────────────────────────────
-download_cloudflared() {
-  log "正在下载 cloudflared (${CF_ARCH})..."
-  if ! dl "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${CF_ARCH}" "$CF_BIN"; then
-    warn "cloudflared 下载失败，Argo 隧道本次将被禁用"
-    DISABLE_ARGO="true"
-    return 1
-  fi
-  chmod +x "$CF_BIN"
-  if ! "$CF_BIN" --version >/dev/null 2>&1; then
-    warn "cloudflared 二进制无法执行（架构可能不匹配: ${CF_ARCH}），Argo 隧道本次将被禁用"
-    rm -f "$CF_BIN"
-    DISABLE_ARGO="true"
-    return 1
-  fi
-  log "cloudflared 下载完成"
-}
-
-# ── 下载 komari-agent ─────────────────────────────────────────────────────────
-download_komari() {
-  log "正在下载 Komari 探针 (${KM_ARCH})..."
-  if ! dl "https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-${KM_ARCH}" "$KM_BIN"; then
-    warn "Komari 探针下载失败，本次将跳过监控"
-    return 1
-  fi
-  chmod +x "$KM_BIN"
-  log "Komari 探针下载完成"
-}
-
-# 清理旧进程
-pkill -f "$SB_BIN"    2>/dev/null || true
-pkill -f "$CF_BIN"    2>/dev/null || true
-pkill -f "$KM_BIN"    2>/dev/null || true
-sleep 1
-
-[ -x "$SB_BIN" ] && ! "$SB_BIN" version >/dev/null 2>&1 && { warn "已存在的 sing-box 二进制无法运行，重新下载"; rm -f "$SB_BIN"; }
-[ -x "$SB_BIN" ] || download_singbox
-
-if [ "${DISABLE_ARGO:-}" != "true" ]; then
-  [ -x "$CF_BIN" ] && ! "$CF_BIN" --version >/dev/null 2>&1 && { warn "已存在的 cloudflared 二进制无法运行，重新下载"; rm -f "$CF_BIN"; }
-  [ -x "$CF_BIN" ] || download_cloudflared || true
-fi
-
-if [ -n "$KOMARI_DOMAIN" ] && [ -n "$KOMARI_TOKEN" ]; then
-  [ -x "$KM_BIN" ] || download_komari || true
-fi
-
-# ── 端口分配 ──────────────────────────────────────────────────────────────────
-rm -f "$USED_PORTS_FILE"
-
-if [ "${DISABLE_ARGO:-}" != "true" ]; then
-  if [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_AUTH" ]; then
-    ARGO_PORT="${ARGO_PORT:-8001}"
-  else
-    ARGO_PORT="${ARGO_PORT:-$(get_free_port)}"
-  fi
-  echo "$ARGO_PORT" >> "$USED_PORTS_FILE"
-fi
-
-# ── 节点名称 ──────────────────────────────────────────────────────────────────
-if [ -z "$NAME" ]; then
-  COUNTRY="$(http_get 'https://ipinfo.io/country' | tr -d '[:space:]')"
-  ASN_ORG="$(http_get 'https://ipinfo.io/org' \
-    | sed 's/^AS[0-9]* //' \
-    | sed 's/,\? *Inc\.*//' | sed 's/,\? *LLC\.*//' \
-    | sed 's/,\? *Ltd\.*//' | sed 's/,\? *Corp\.*//' \
-    | sed 's/[[:space:]]*$//' | cut -c1-20)"
-  if [ -n "$COUNTRY" ] && [ -n "$ASN_ORG" ]; then
-    NAME="${COUNTRY}-${ASN_ORG}"
-  elif [ -n "$COUNTRY" ]; then
-    NAME="${COUNTRY}-sbx"
-  else
-    NAME="sbx"
-  fi
-fi
-NAME_ENCODED="$(url_encode "$NAME")"
-
-# ── 公网 IP ───────────────────────────────────────────────────────────────────
-# 校验拿到的到底像不像一个 IP：出口网络异常时，ipinfo.io 之类的接口可能返回
-# 代理拦截页/验证码页/captive portal 的 HTML，而不是纯 IP 文本。不校验的话，
-# 这段垃圾内容会被原样拼进 SOCKS5/Trojan/Hysteria2 等订阅链接里。
 valid_ip() {
-  _v="$1"
+  local _v="$1"
   [ -z "$_v" ] && return 1
   [ "${#_v}" -gt 45 ] && return 1
   case "$_v" in
@@ -564,815 +310,1559 @@ valid_ip() {
   return 0
 }
 
-PUBLIC_IP=""
-if [ -n "$HY2_PORT" ] || [ -n "$TUIC_PORT" ] || [ -n "$REALITY_PORT" ] || [ -n "$SS_PORT" ] || [ -n "$SOCKS5_PORT" ] || [ -n "$TROJAN_PORT" ] || [ -n "$ANYTLS_PORT" ]; then
-  for _ipsrc in 'https://ipinfo.io/ip' 'https://ifconfig.co/ip' 'https://api64.ipify.org' 'https://v6.ident.me'; do
-    _cand="$(http_get "$_ipsrc" | tr -d '[:space:]')"
-    if valid_ip "$_cand"; then
-      PUBLIC_IP="$_cand"
-      break
-    fi
-  done
-  if [ -z "$PUBLIC_IP" ]; then
-    warn "公网 IP 获取失败或返回内容不像有效 IP，依赖公网 IP 的协议（HY2/TUIC/Reality/SS/SOCKS5/Trojan/AnyTLS）本次订阅链接将缺失对应节点"
-  fi
-fi
-
-# ── 自签证书（HY2 / TUIC 用）─────────────────────────────────────────────────
-CERT_PATH=""
-KEY_PATH=""
-if [ -n "$HY2_PORT" ] || [ -n "$TUIC_PORT" ] || [ -n "$TROJAN_PORT" ] || [ -n "$ANYTLS_PORT" ]; then
-  mkdir -p "$CERT_DIR"
-  CERT_PATH="$CERT_DIR/cert.pem"
-  KEY_PATH="$CERT_DIR/key.pem"
-  if [ ! -f "$CERT_PATH" ] || [ ! -f "$KEY_PATH" ]; then
-    if ! command -v openssl >/dev/null 2>&1; then
-      warn "缺少 openssl，尝试自动安装（否则将回退到内置的共享自签证书）..."
-      try_install_pkg openssl
-    fi
-    if command -v openssl >/dev/null 2>&1; then
-      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days 3650 -nodes \
-        -keyout "$KEY_PATH" -out "$CERT_PATH" \
-        -subj "/CN=bing.com/O=Microsoft/C=US" 2>/dev/null
-    else
-      cat > "$KEY_PATH" << 'KEYEOF'
------BEGIN EC PARAMETERS-----
-BggqhkjOPQMBBw==
------END EC PARAMETERS-----
------BEGIN EC PRIVATE KEY-----
-MHcCAQEEIM4792SEtPqIt1ywqTd/0bYidBqpYV/++siNnfBYsdUYoAoGCCqGSM49
-AwEHoUQDQgAE1kHafPj07rJG+HboH2ekAI4r+e6TL38GWASANnngZreoQDF16ARa
-/TsyLyFoPkhLxSbehH/NBEjHtSZGaDhMqQ==
------END EC PRIVATE KEY-----
-KEYEOF
-      cat > "$CERT_PATH" << 'CERTEOF'
------BEGIN CERTIFICATE-----
-MIIBejCCASGgAwIBAgIUfWeQL3556PNJLp/veCFxGNj9crkwCgYIKoZIzj0EAwIw
-EzERMA8GA1UEAwwIYmluZy5jb20wHhcNMjUwOTE4MTgyMDIyWhcNMzUwOTE2MTgy
-MDIyWjATMREwDwYDVQQDDAhiaW5nLmNvbTBZMBMGByqGSM49AgEGCCqGSM49AwEH
-A0IABNZB2nz49O6yRvh26B9npACOK/nuky9/BlgEgDZ54Ga3qEAxdegEWv07Mi8h
-aD5IS8Um3oR/zQRIx7UmRmg4TKmjUzBRMB0GA1UdDgQWBBTV1cFID7UISE7PLTBR
-BfGbgkrMNzAfBgNVHSMEGDAWgBTV1cFID7UISE7PLTBRBfGbgkrMNzAPBgNVHRMB
-Af8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIAIDAJvg0vd/ytrQVvEcSm6XTlB+
-eQ6OFb9LbLYL9f+sAiAffoMbi4y/0YUSlTtz7as9S8/lciBF5VCUoVIKS+vX2g==
------END CERTIFICATE-----
-CERTEOF
-    fi
-  fi
-  chmod 600 "$KEY_PATH" 2>/dev/null || true
-fi
-
-# ── 域名证书解析 ──────────────────────────────────────────────────────────────
-# 每个协议独立决定自己用哪份证书：如果绑定了域名（通过管理面板"域名证书"功能用
-# acme.sh 申请），并且对应的 cert.pem/key.pem 确实存在，就用域名证书（客户端可以
-# 正常做证书链校验，不用 insecure/allowInsecure）；否则回退到上面的共享自签证书。
-resolve_cert_for() {
-  # $1=域名(可能为空)，结果写进 _RC_CERT / _RC_KEY / _RC_SNI / _RC_INSECURE
-  _dom="$1"
-  if [ -n "$_dom" ] && [ -f "$DOMAIN_CERT_DIR/$_dom/cert.pem" ] && [ -f "$DOMAIN_CERT_DIR/$_dom/key.pem" ]; then
-    _RC_CERT="$DOMAIN_CERT_DIR/$_dom/cert.pem"
-    _RC_KEY="$DOMAIN_CERT_DIR/$_dom/key.pem"
-    _RC_SNI="$_dom"
-    _RC_INSECURE=0
+# ── 服务控制与状态 ────────────────────────────────────────────────────────────
+check_status() {
+  local sb_s cf_s km_s cur_km_dom
+  pgrep -f "sing-box" >/dev/null 2>&1    && sb_s="${GREEN}sing-box ✓${RESET}"    || sb_s="${RED}sing-box ✗${RESET}"
+  pgrep -f "cloudflared" >/dev/null 2>&1 && cf_s="${GREEN}cloudflared ✓${RESET}" || cf_s="${RED}cloudflared ✗${RESET}"
+  cur_km_dom=$(get_val KOMARI_DOMAIN)
+  [ -z "$cur_km_dom" ] && cur_km_dom=$(get_val KOMARI_ENDPOINT)
+  if [ -n "$cur_km_dom" ]; then
+    pgrep -f "komari-agent" >/dev/null 2>&1 && km_s="${GREEN}komari ✓${RESET}" || km_s="${RED}komari ✗${RESET}"
+    echo -e "状态: $sb_s  $cf_s  $km_s"
   else
-    [ -n "$_dom" ] && warn "协议绑定的域名证书 ${_dom} 不存在或文件不完整，本次回退为自签证书"
-    _RC_CERT="$CERT_PATH"
-    _RC_KEY="$KEY_PATH"
-    _RC_SNI=""
-    _RC_INSECURE=1
+    echo -e "状态: $sb_s  $cf_s"
   fi
 }
 
-resolve_cert_for "$HY2_CERT_DOMAIN"
-HY2_TLS_CERT="$_RC_CERT"; HY2_TLS_KEY="$_RC_KEY"; HY2_TLS_SNI="$_RC_SNI"; HY2_TLS_INSECURE="$_RC_INSECURE"
-resolve_cert_for "$TUIC_CERT_DOMAIN"
-TUIC_TLS_CERT="$_RC_CERT"; TUIC_TLS_KEY="$_RC_KEY"; TUIC_TLS_SNI="$_RC_SNI"; TUIC_TLS_INSECURE="$_RC_INSECURE"
-resolve_cert_for "$TROJAN_CERT_DOMAIN"
-TROJAN_TLS_CERT="$_RC_CERT"; TROJAN_TLS_KEY="$_RC_KEY"; TROJAN_TLS_SNI="$_RC_SNI"; TROJAN_TLS_INSECURE="$_RC_INSECURE"
-resolve_cert_for "$ANYTLS_CERT_DOMAIN"
-ANYTLS_TLS_CERT="$_RC_CERT"; ANYTLS_TLS_KEY="$_RC_KEY"; ANYTLS_TLS_SNI="$_RC_SNI"; ANYTLS_TLS_INSECURE="$_RC_INSECURE"
-
-# ── Reality 密钥 ──────────────────────────────────────────────────────────────
-REALITY_PRIV=""
-REALITY_PUB=""
-if [ -n "$REALITY_PORT" ]; then
-  if [ -f "$REALITY_KEY_FILE" ]; then
-    REALITY_PRIV="$(grep '^PrivateKey:' "$REALITY_KEY_FILE" | sed 's/PrivateKey: *//')"
-    REALITY_PUB="$(grep  '^PublicKey:'  "$REALITY_KEY_FILE" | sed 's/PublicKey: *//')"
-  fi
-  if [ -z "$REALITY_PRIV" ] || [ -z "$REALITY_PUB" ]; then
-    KEYPAIR="$("$SB_BIN" generate reality-keypair 2>/dev/null || true)"
-    REALITY_PRIV="$(echo "$KEYPAIR" | grep PrivateKey | sed 's/PrivateKey: *//')"
-    REALITY_PUB="$(echo  "$KEYPAIR" | grep PublicKey  | sed 's/PublicKey: *//')"
-    if [ -n "$REALITY_PRIV" ] && [ -n "$REALITY_PUB" ]; then
-      printf 'PrivateKey: %s\nPublicKey: %s\n' "$REALITY_PRIV" "$REALITY_PUB" > "$REALITY_KEY_FILE"
-      chmod 600 "$REALITY_KEY_FILE" 2>/dev/null || true
-      log "Reality 密钥生成完成"
-    else
-      warn "Reality 密钥生成失败，VLESS Reality 将被跳过"
-      REALITY_PORT=""
-    fi
-  else
-    log "已从文件读取 Reality 密钥对"
-  fi
-fi
-
-# ── 自定义出口（SOCKS/HTTP）──────────────────────────────────────────────────
-CUSTOM_OUT_TYPE=""
-CUSTOM_OUT_ADDR=""
-CUSTOM_OUT_PORT=""
-CUSTOM_OUT_USER=""
-CUSTOM_OUT_PASS=""
-EXTRA_OUTBOUND_JSON=""
-
-if [ -f "$OUTBOUND_FILE" ]; then
-  CUSTOM_OUT_TYPE="$(grep '^TYPE=' "$OUTBOUND_FILE" | sed 's/^TYPE=//')"
-  CUSTOM_OUT_ADDR="$(grep '^ADDR=' "$OUTBOUND_FILE" | sed 's/^ADDR=//')"
-  CUSTOM_OUT_PORT="$(grep '^PORT=' "$OUTBOUND_FILE" | sed 's/^PORT=//')"
-  CUSTOM_OUT_USER="$(grep '^USER=' "$OUTBOUND_FILE" | sed 's/^USER=//')"
-  CUSTOM_OUT_PASS="$(grep '^PASS=' "$OUTBOUND_FILE" | sed 's/^PASS=//')"
-fi
-
-if [ "$CUSTOM_OUT_TYPE" = "socks" ] || [ "$CUSTOM_OUT_TYPE" = "http" ]; then
-  if [ -n "$CUSTOM_OUT_ADDR" ] && [ -n "$CUSTOM_OUT_PORT" ]; then
-    log "检测到自定义出口配置: ${CUSTOM_OUT_TYPE}://${CUSTOM_OUT_ADDR}:${CUSTOM_OUT_PORT}"
-    if [ -n "$CUSTOM_OUT_USER" ]; then
-      EXTRA_OUTBOUND_JSON=",
-    {
-      \"type\": \"${CUSTOM_OUT_TYPE}\",
-      \"tag\": \"custom-out\",
-      \"server\": \"${CUSTOM_OUT_ADDR}\",
-      \"server_port\": ${CUSTOM_OUT_PORT},
-      \"username\": \"${CUSTOM_OUT_USER}\",
-      \"password\": \"${CUSTOM_OUT_PASS}\"
-    }"
-    else
-      EXTRA_OUTBOUND_JSON=",
-    {
-      \"type\": \"${CUSTOM_OUT_TYPE}\",
-      \"tag\": \"custom-out\",
-      \"server\": \"${CUSTOM_OUT_ADDR}\",
-      \"server_port\": ${CUSTOM_OUT_PORT}
-    }"
-    fi
-  else
-    warn "outbound.conf 配置不完整，自定义出口已跳过"
-  fi
-fi
-
-# ── 端口合法性检查 ────────────────────────────────────────────────────────────
-HY2_ACTIVE=0; TUIC_ACTIVE=0; REALITY_ACTIVE=0; SS_ACTIVE=0; SOCKS5_ACTIVE=0; TROJAN_ACTIVE=0; ANYTLS_ACTIVE=0
-
-if [ -n "$HY2_PORT" ]; then
-  if port_ok "$HY2_PORT"; then HY2_ACTIVE=1;
-  else warn "HY2_PORT(${HY2_PORT}) 无效或冲突，Hysteria2 已跳过"; fi
-fi
-if [ -n "$TUIC_PORT" ]; then
-  if port_ok "$TUIC_PORT"; then TUIC_ACTIVE=1;
-  else warn "TUIC_PORT(${TUIC_PORT}) 无效或冲突，TUIC 已跳过"; fi
-fi
-if [ -n "$REALITY_PORT" ]; then
-  if port_ok "$REALITY_PORT"; then REALITY_ACTIVE=1;
-  else warn "REALITY_PORT(${REALITY_PORT}) 无效或冲突，Reality 已跳过"; fi
-fi
-if [ -n "$SS_PORT" ] && [ -n "$SS_PASS" ]; then
-  if port_ok "$SS_PORT"; then SS_ACTIVE=1;
-  else warn "SS_PORT(${SS_PORT}) 无效或冲突，Shadowsocks 已跳过"; fi
-fi
-if [ -n "$SOCKS5_PORT" ]; then
-  if port_ok "$SOCKS5_PORT"; then SOCKS5_ACTIVE=1;
-  else warn "SOCKS5_PORT(${SOCKS5_PORT}) 无效或冲突，SOCKS5 已跳过"; fi
-fi
-if [ -n "$TROJAN_PORT" ]; then
-  if port_ok "$TROJAN_PORT"; then TROJAN_ACTIVE=1;
-  else warn "TROJAN_PORT(${TROJAN_PORT}) 无效或冲突，Trojan 已跳过"; fi
-fi
-if [ -n "$ANYTLS_PORT" ]; then
-  if port_ok "$ANYTLS_PORT"; then ANYTLS_ACTIVE=1;
-  else warn "ANYTLS_PORT(${ANYTLS_PORT}) 无效或冲突，AnyTLS 已跳过"; fi
-fi
-
-# ── 生成 sing-box 配置 ────────────────────────────────────────────────────────
-# 逐协议增量校验：每加入一个 inbound 就用 sing-box check 单独验证一次，
-# 校验失败只跳过该协议（并关闭其 _ACTIVE 标记，保证后续订阅/日志展示一致），
-# 不再因为某一个协议不兼容当前 sing-box 版本就让整个脚本直接退出。
-# 校验失败时可能要把 sing-box 的报错甚至配置文件本身打到日志(journal)里排查，
-# 但配置里有 UUID / SS 密码 / Reality 私钥，直接照抄会把这些明文写进日志，
-# 尤其是 systemd Restart=always 场景下会一次次重复泄露。统一做脱敏。
-redact_secrets() {
-  sed \
-    -e "s|${UUID:-__no_uuid__}|<UUID>|g" \
-    -e "s|${SS_PASS:-__no_ss_pass__}|<SS_PASSWORD>|g" \
-    -e "s|${REALITY_PRIV:-__no_reality_priv__}|<REALITY_PRIVATE_KEY>|g"
+do_stop() {
+  echo -e "${YELLOW}正在停止服务...${RESET}"
+  systemctl --user stop singbox 2>/dev/null || true
+  pkill -f "singbox.sh run"       2>/dev/null || true
+  pkill -f "singbox/singbox.sh"   2>/dev/null || true
+  pkill -f "sing-box"             2>/dev/null || true
+  pkill -f "cloudflared"          2>/dev/null || true
+  pkill -f "komari-agent"         2>/dev/null || true
+  echo -e "${GREEN}服务已停止${RESET}"
 }
 
-_inbounds=""
-_sep=""
-
-# $1=协议标签(用于日志)  $2=该协议的 inbound JSON 片段（不带前导逗号）
-try_add_inbound() {
-  _label="$1"
-  _snippet="$2"
-  _trial="${_inbounds}${_sep}
-    ${_snippet}"
-  _tc="/tmp/sb-trycfg-$$.json"
-  _tl="/tmp/sb-trylog-$$.log"
-  : > "$_tc"; chmod 600 "$_tc" 2>/dev/null || true
-  : > "$_tl"; chmod 600 "$_tl" 2>/dev/null || true
-  printf '{\n  "log": { "level": "warn" },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct" }]\n}\n' "$_trial" > "$_tc"
-  if "$SB_BIN" check -c "$_tc" >"$_tl" 2>&1; then
-    _inbounds="$_trial"
-    _sep=","
-    rm -f "$_tc" "$_tl"
-    return 0
+do_restart() {
+  echo -e "${YELLOW}正在重启服务...${RESET}"
+  do_stop
+  sleep 1
+  if systemctl --user is-enabled singbox >/dev/null 2>&1; then
+    systemctl --user restart singbox
+  elif [ -f "$LEGACY_WRAPPER" ]; then
+    bash "$LEGACY_WRAPPER"
   else
-    warn "${_label} 配置校验未通过，已跳过该协议（不影响其他协议启动）:"
-    redact_secrets < "$_tl" | sed 's/^/    /'
-    rm -f "$_tc" "$_tl"
-    return 1
+    nohup bash "$APP_DIR/singbox.sh" run >> "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+  fi
+  echo -e "${GREEN}服务已重启${RESET}"
+}
+
+# ── 快捷命令软链接创建 ────────────────────────────────────────────────────────
+create_symlinks() {
+  mkdir -p "$LOCAL_BIN"
+  for cmd in sb sb-sub sb-log sb-del sb-edit; do
+    local subcmd=""
+    case "$cmd" in
+      sb)      subcmd="menu" ;;
+      sb-sub)  subcmd="sub" ;;
+      sb-log)  subcmd="log" ;;
+      sb-del)  subcmd="uninstall" ;;
+      sb-edit) subcmd="edit" ;;
+    esac
+    cat > "$LOCAL_BIN/$cmd" << WRAP
+#!/bin/bash
+exec "$APP_DIR/singbox.sh" $subcmd "\$@"
+WRAP
+    chmod +x "$LOCAL_BIN/$cmd"
+  done
+
+  if [ "$(id -u)" = "0" ] || [ -w /usr/local/bin ] 2>/dev/null; then
+    mkdir -p /usr/local/bin 2>/dev/null || true
+    for cmd in sb sb-sub sb-log sb-del sb-edit; do
+      ln -sf "$LOCAL_BIN/$cmd" "/usr/local/bin/$cmd" 2>/dev/null || true
+    done
+    if [ -x /usr/local/bin/sb ]; then
+      log "命令已链接到 /usr/local/bin，全局终端可直接输入 sb 使用"
+    fi
+  fi
+
+  for RC in "$HOME_DIR/.profile" "$HOME_DIR/.bashrc" "$HOME_DIR/.bash_profile" "$HOME_DIR/.zshrc"; do
+    [ -e "$RC" ] || : > "$RC" 2>/dev/null || true
+    if [ -f "$RC" ] && ! grep -q "# singbox PATH" "$RC" 2>/dev/null; then
+      printf '\n# singbox PATH\nexport PATH="%s:$PATH"\n' "$LOCAL_BIN" >> "$RC" 2>/dev/null || true
+    fi
+  done
+}
+
+# ==============================================================================
+# 模块 1: 安装流程 (do_install)
+# ==============================================================================
+do_install() {
+  echo -e "${YELLOW}==================== singbox 安装向导 ====================${NC}"
+  ensure_basic_deps
+
+  mkdir -p "$APP_DIR" "$STATE_DIR"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+
+  if [ ! -f "$APP_DIR/singbox.sh" ] || [ "$APP_DIR/singbox.sh" -ef "$0" ] 2>/dev/null; then
+    if [ "$0" != "$APP_DIR/singbox.sh" ]; then
+      cp -f "$0" "$APP_DIR/singbox.sh"
+      chmod +x "$APP_DIR/singbox.sh"
+    fi
+  else
+    cp -f "$0" "$APP_DIR/singbox.sh"
+    chmod +x "$APP_DIR/singbox.sh"
+  fi
+
+  local IN_UUID="${UUID:-}"
+  local IN_PORT="${PORT:-}"
+  local IN_ARGO_PORT="${ARGO_PORT:-}"
+  local IN_NAME="${NAME:-}"
+  local IN_ARGO_DOMAIN="${ARGO_DOMAIN:-}"
+  local IN_ARGO_AUTH="${ARGO_AUTH:-}"
+  local IN_DISABLE_ARGO="${DISABLE_ARGO:-}"
+  local IN_HY2_PORT="${HY2_PORT:-}"
+  local IN_TUIC_PORT="${TUIC_PORT:-}"
+  local IN_REALITY_PORT="${REALITY_PORT:-}"
+  local IN_REALITY_DOMAIN="${REALITY_DOMAIN:-}"
+  local IN_SS_PORT="${SS_PORT:-}"
+  local IN_SOCKS5_PORT="${SOCKS5_PORT:-}"
+  local IN_TROJAN_PORT="${TROJAN_PORT:-}"
+  local IN_ANYTLS_PORT="${ANYTLS_PORT:-}"
+  local IN_KOMARI_DOMAIN="${KOMARI_DOMAIN:-${KOMARI_ENDPOINT:-}}"
+  local IN_KOMARI_TOKEN="${KOMARI_TOKEN:-}"
+
+  local HAS_ENV=false
+  for v in "$IN_UUID" "$IN_PORT" "$IN_ARGO_PORT" "$IN_NAME" \
+            "$IN_ARGO_DOMAIN" "$IN_ARGO_AUTH" "$IN_DISABLE_ARGO" \
+            "$IN_HY2_PORT" "$IN_TUIC_PORT" "$IN_REALITY_PORT" \
+            "$IN_REALITY_DOMAIN" "$IN_SS_PORT" "$IN_SOCKS5_PORT" \
+            "$IN_TROJAN_PORT" "$IN_ANYTLS_PORT" \
+            "$IN_KOMARI_DOMAIN" "$IN_KOMARI_TOKEN"; do
+    [ -n "$v" ] && HAS_ENV=true && break
+  done
+
+  if ! $HAS_ENV; then
+    echo ""
+    echo -e "${YELLOW}---------- 基础配置 ----------${NC}"
+    read -p "UUID（留空自动生成）: "              IN_UUID
+    read -p "NAME/节点名称前缀（留空自动识别）: " IN_NAME
+
+    echo ""
+    echo -e "${YELLOW}--- Argo 隧道 ---${NC}"
+    read -p "是否启用 Argo 隧道？[Y/n]: " _ARGO_CHOICE
+    _ARGO_CHOICE="$(echo "$_ARGO_CHOICE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    if [ "$_ARGO_CHOICE" = "n" ]; then
+      IN_DISABLE_ARGO="true"
+      echo -e "${YELLOW}Argo 已禁用${NC}"
+    else
+      IN_DISABLE_ARGO=""
+      echo -e "${GREEN}Argo 已启用（临时隧道），如需固定隧道可通过管理面板 sb 配置${NC}"
+    fi
+
+    echo ""
+    echo -e "${YELLOW}--- 可选直连协议（留空跳过）---${NC}"
+    echo -e "  ${GREEN}a${NC}. Hysteria2    (UDP)"
+    echo -e "  ${GREEN}b${NC}. TUIC v5      (UDP)"
+    echo -e "  ${GREEN}c${NC}. VLESS Reality(TCP)"
+    echo -e "  ${GREEN}d${NC}. Shadowsocks  (TCP)"
+    echo -e "  ${GREEN}e${NC}. SOCKS5       (TCP/UDP)"
+    echo -e "  ${GREEN}f${NC}. Trojan       (TCP)"
+    echo -e "  ${GREEN}g${NC}. AnyTLS       (TCP)"
+    read -p "选择协议（如 ac 表示启用 a 和 c，输入 all 表示全部启用，留空跳过）: " _PROTO_CHOICE
+    echo "$_PROTO_CHOICE" | grep -qi "^all$" && _PROTO_CHOICE="abcdefg"
+
+    local _used_rand_ports=""
+    _gen_rand_port() {
+      local _p _tries=0
+      while [ $_tries -lt 50 ]; do
+        _p=$(( (RANDOM % 29152) + 20000 ))
+        case " $_used_rand_ports " in
+          *" $_p "*) _tries=$((_tries + 1)); continue ;;
+        esac
+        if command -v ss >/dev/null 2>&1 && ss -ltnu 2>/dev/null | grep -q ":${_p} "; then
+          _tries=$((_tries + 1)); continue
+        fi
+        _GEN_PORT="$_p"
+        _used_rand_ports="$_used_rand_ports $_p"
+        return
+      done
+      _GEN_PORT="$_p"
+      _used_rand_ports="$_used_rand_ports $_p"
+    }
+
+    if echo "$_PROTO_CHOICE" | grep -qi "a"; then
+      _gen_rand_port; IN_HY2_PORT="$_GEN_PORT"
+      echo -e "${GREEN}Hysteria2 端口: $IN_HY2_PORT${NC}"
+    fi
+    if echo "$_PROTO_CHOICE" | grep -qi "b"; then
+      _gen_rand_port; IN_TUIC_PORT="$_GEN_PORT"
+      echo -e "${GREEN}TUIC v5 端口: $IN_TUIC_PORT${NC}"
+    fi
+    if echo "$_PROTO_CHOICE" | grep -qi "c"; then
+      _gen_rand_port; IN_REALITY_PORT="$_GEN_PORT"
+      echo -e "${GREEN}VLESS Reality 端口: $IN_REALITY_PORT（伪装域名默认 www.iij.ad.jp）${NC}"
+    fi
+    if echo "$_PROTO_CHOICE" | grep -qi "d"; then
+      _gen_rand_port; IN_SS_PORT="$_GEN_PORT"
+      echo -e "${GREEN}Shadowsocks 端口: $IN_SS_PORT${NC}"
+    fi
+    if echo "$_PROTO_CHOICE" | grep -qi "e"; then
+      _gen_rand_port; IN_SOCKS5_PORT="$_GEN_PORT"
+      echo -e "${GREEN}SOCKS5 端口: $IN_SOCKS5_PORT${NC}"
+    fi
+    if echo "$_PROTO_CHOICE" | grep -qi "f"; then
+      _gen_rand_port; IN_TROJAN_PORT="$_GEN_PORT"
+      echo -e "${GREEN}Trojan 端口: $IN_TROJAN_PORT${NC}"
+    fi
+    if echo "$_PROTO_CHOICE" | grep -qi "g"; then
+      _gen_rand_port; IN_ANYTLS_PORT="$_GEN_PORT"
+      echo -e "${GREEN}AnyTLS 端口: $IN_ANYTLS_PORT${NC}"
+    fi
+
+    echo ""
+    echo -e "${YELLOW}--- Komari 监控探针（可选）---${NC}"
+    read -p "Komari 服务端域名（如 komari.example.com，留空跳过）: " IN_KOMARI_DOMAIN
+    if [ -n "$IN_KOMARI_DOMAIN" ]; then
+      read -p "Komari 探针密钥 Token: " IN_KOMARI_TOKEN
+    fi
+  fi
+
+  cat > "$ENV_FILE" << EOF
+UUID="${IN_UUID}"
+PORT="${IN_PORT}"
+NAME="${IN_NAME}"
+ARGO_PORT="${IN_ARGO_PORT}"
+ARGO_DOMAIN="${IN_ARGO_DOMAIN}"
+ARGO_AUTH="${IN_ARGO_AUTH}"
+DISABLE_ARGO="${IN_DISABLE_ARGO}"
+HY2_PORT="${IN_HY2_PORT}"
+TUIC_PORT="${IN_TUIC_PORT}"
+REALITY_PORT="${IN_REALITY_PORT}"
+REALITY_DOMAIN="${IN_REALITY_DOMAIN:-www.iij.ad.jp}"
+SS_PORT="${IN_SS_PORT}"
+SOCKS5_PORT="${IN_SOCKS5_PORT}"
+TROJAN_PORT="${IN_TROJAN_PORT}"
+ANYTLS_PORT="${IN_ANYTLS_PORT}"
+KOMARI_DOMAIN="${IN_KOMARI_DOMAIN}"
+KOMARI_TOKEN="${IN_KOMARI_TOKEN}"
+ARGO_PROTOCOL="${ARGO_PROTOCOL:-http2}"
+EOF
+  chmod 600 "$ENV_FILE"
+
+  create_symlinks
+
+  local USER_SYSTEMD_OK=false
+  if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
+    USER_SYSTEMD_OK=true
+  fi
+
+  if $USER_SYSTEMD_OK; then
+    local SYSTEMD_DIR="$HOME_DIR/.config/systemd/user"
+    mkdir -p "$SYSTEMD_DIR"
+    cat > "$SYSTEMD_DIR/singbox.service" << SVCEOF
+[Unit]
+Description=singbox service
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=$APP_DIR
+EnvironmentFile=-$ENV_FILE
+ExecStart=/bin/bash $APP_DIR/singbox.sh run
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+SVCEOF
+    systemctl --user daemon-reload
+    systemctl --user enable singbox
+    systemctl --user restart singbox
+    loginctl enable-linger "$USER" 2>/dev/null || true
+    (crontab -l 2>/dev/null | grep -v "singbox autostart") | crontab - 2>/dev/null || true
+    echo ""
+    log "服务已通过用户级 systemd 启动并设置开机自启"
+  else
+    do_restart
+    (crontab -l 2>/dev/null | grep -v "singbox autostart"; \
+     echo "@reboot sleep 20 && bash $APP_DIR/singbox.sh run >> $LOG_FILE 2>&1") | crontab - 2>/dev/null || true
+    echo ""
+    log "服务已通过 nohup 后台启动，开机自启已写入 cron"
+  fi
+
+  echo ""
+  echo -e "${GREEN}==================== 安装完成 ====================${NC}"
+  echo -e "${GREEN}管理面板: sb${NC}"
+  echo -e "${GREEN}查看节点: sb-sub${NC}"
+  echo -e "${GREEN}查看日志: sb-log${NC}"
+  echo -e "${GREEN}修改配置: sb-edit${NC}"
+  echo -e "${GREEN}彻底卸载: sb-del${NC}"
+  echo ""
+  echo -e "${YELLOW}等待服务初始化完成，节点链接将写入 $SUB_FILE${NC}"
+}
+
+# ==============================================================================
+# 模块 2: 交互管理控制面板 (do_menu - 原 sb)
+# ==============================================================================
+do_menu() {
+  while true; do
+    clear
+    echo -e "${GREEN}======= singbox 管理面板 =======${RESET}"
+    check_status
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}1. 查看节点订阅${RESET}"
+    echo -e "${WHITE}2. 查看运行日志${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}3. 重启sing-box${RESET}"
+    echo -e "${WHITE}4. 更新sing-box${RESET}"
+    echo -e "${WHITE}5. 卸载sing-box${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}6. 修改配置${RESET}"
+    echo -e "${WHITE}7. 出口设置${RESET}"
+    echo -e "${WHITE}8. 域名证书${RESET}"
+    echo -e "${WHITE}0. 退出${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -ne "${GRAY}请输入选项: ${RESET}"
+    read -r opt
+    case "$opt" in
+      1) do_sub; press_any_key ;;
+      2) do_log ;;
+      3) do_restart; sleep 2 ;;
+      4) menu_update ;;
+      5) do_uninstall ;;
+      6) menu_config ;;
+      7) menu_outbound ;;
+      8) menu_domain_cert ;;
+      0) exit 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+do_sub() {
+  clear
+  echo -e "${GREEN}======= 节点订阅 =======${RESET}"
+  if [ ! -f "$SUB_FILE" ]; then
+    echo -e "${RED}sub.txt 不存在，请等待服务启动完成${RESET}"
+    return
+  fi
+
+  local decoded
+  decoded=$(base64 -d < "$SUB_FILE" 2>/dev/null)
+  if [ -z "$decoded" ]; then
+    echo -e "${RED}订阅内容为空${RESET}"
+    return
+  fi
+
+  echo -e "${GRAY}已启用协议:${RESET}"
+  echo "$decoded" | while IFS= read -r line; do
+    case "$line" in
+      vmess://*)      echo -e "${GREEN}  ✓ VMess + WS + Argo TLS${RESET}" ;;
+      hysteria2://*)  echo -e "${GREEN}  ✓ Hysteria2${RESET}" ;;
+      tuic://*)       echo -e "${GREEN}  ✓ TUIC v5${RESET}" ;;
+      vless://*)      echo -e "${GREEN}  ✓ VLESS Reality${RESET}" ;;
+      ss://*)         echo -e "${GREEN}  ✓ Shadowsocks${RESET}" ;;
+      socks5://*|socks://*) echo -e "${GREEN}  ✓ SOCKS5${RESET}" ;;
+      trojan://*)     echo -e "${GREEN}  ✓ Trojan${RESET}" ;;
+      anytls://*)     echo -e "${GREEN}  ✓ AnyTLS${RESET}" ;;
+    esac
+  done
+
+  echo -e "${GRAY}--------------------------------${RESET}"
+  echo -e "${GRAY}节点链接:${RESET}"
+  echo "$decoded" | while IFS= read -r line; do
+    [ -n "$line" ] && echo -e "${CYAN}$line${RESET}"
+  done
+}
+
+do_log() {
+  clear
+  echo -e "${GREEN}======= 运行日志（Ctrl+C 退出）=======${RESET}"
+  echo ""
+  if systemctl --user is-active singbox >/dev/null 2>&1; then
+    journalctl --user -u singbox -n 50 -f
+  elif [ -f "$LOG_FILE" ]; then
+    tail -n 50 -f "$LOG_FILE"
+  else
+    echo -e "${RED}未找到日志文件${RESET}"
+    press_any_key
   fi
 }
 
-# Argo VMess inbound
-if [ "${DISABLE_ARGO:-}" != "true" ]; then
-  _vmess_json="{
-      \"type\": \"vmess\",
-      \"tag\": \"vmess-in\",
-      \"listen\": \"127.0.0.1\",
-      \"listen_port\": ${ARGO_PORT},
-      \"users\": [{ \"uuid\": \"${UUID}\", \"alterId\": 0 }],
-      \"transport\": { \"type\": \"ws\", \"path\": \"$(json_escape "$WS_PATH")\" }
-    }"
-  if ! try_add_inbound "VMess/Argo" "$_vmess_json"; then
-    warn "VMess 基础入口校验失败，Argo 隧道本次将不启动"
-    DISABLE_ARGO="true"
-  fi
-fi
-
-HY2_ACTIVE_PORTS=""
-if [ "$HY2_ACTIVE" = "1" ]; then
-  _hy2_ports="$HY2_PORT"
-  if [ -n "$HY2_EXTRA_PORTS" ]; then
-    _hy2_extra="$(parse_extra_ports "$HY2_EXTRA_PORTS")"
-    [ -n "$_hy2_extra" ] && _hy2_ports="$_hy2_ports $_hy2_extra"
-  fi
-  _idx=0
-  for _p in $_hy2_ports; do
-    _idx=$((_idx + 1))
-    _tag="hy2-in"
-    [ "$_idx" -gt 1 ] && _tag="hy2-in-${_idx}"
-    _hy2_json="{
-      \"type\": \"hysteria2\",
-      \"tag\": \"${_tag}\",
-      \"listen\": \"::\",
-      \"listen_port\": ${_p},
-      \"users\": [{ \"password\": \"${UUID}\" }],
-      \"masquerade\": \"https://bing.com\",
-      \"tls\": {
-        \"enabled\": true,
-        \"alpn\": [\"h3\"],
-        \"certificate_path\": \"${HY2_TLS_CERT}\",
-        \"key_path\": \"${HY2_TLS_KEY}\"
-      }
-    }"
-    if try_add_inbound "Hysteria2(${_p})" "$_hy2_json"; then
-      HY2_ACTIVE_PORTS="${HY2_ACTIVE_PORTS}${HY2_ACTIVE_PORTS:+ }${_p}"
-    fi
+menu_config() {
+  while true; do
+    clear
+    echo -e "${GREEN}======= 修改配置 =======${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}1. 修改UUID${RESET}"
+    echo -e "${WHITE}2. Argo隧道管理${RESET}"
+    echo -e "${WHITE}3. 修改协议端口${RESET}"
+    echo -e "${WHITE}4. 域名证书绑定${RESET}"
+    echo -e "${WHITE}5. 添加多端口${RESET}"
+    echo -e "${WHITE}6. 端口跳跃${RESET}"
+    echo -e "${WHITE}7. Komari探针监控${RESET}"
+    echo -e "${WHITE}0. 返回${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -ne "${GRAY}请输入选项: ${RESET}"
+    read -r opt
+    case "$opt" in
+      1) config_uuid ;;
+      2) config_argo ;;
+      3) config_proto ;;
+      4) config_cert_bind ;;
+      5) config_extraports ;;
+      6) config_hop ;;
+      7) config_komari ;;
+      0) return ;;
+      *) ;;
+    esac
   done
-  [ -z "$HY2_ACTIVE_PORTS" ] && HY2_ACTIVE=0
-fi
+}
 
-TUIC_ACTIVE_PORTS=""
-if [ "$TUIC_ACTIVE" = "1" ]; then
-  _tuic_ports="$TUIC_PORT"
-  if [ -n "$TUIC_EXTRA_PORTS" ]; then
-    _tuic_extra="$(parse_extra_ports "$TUIC_EXTRA_PORTS")"
-    [ -n "$_tuic_extra" ] && _tuic_ports="$_tuic_ports $_tuic_extra"
+config_uuid() {
+  clear
+  echo -e "${GREEN}======= 修改 UUID =======${RESET}"
+  local cur
+  cur=$(get_val UUID)
+  echo -e "${GRAY}当前: ${CYAN}${cur:-未设置}${RESET}"
+  echo -e "${GRAY}--------------------------------${RESET}"
+  echo -e "${WHITE}新 UUID（留空自动生成，回车确认）:${RESET}"
+  read -r new_uuid
+  if [ -z "$new_uuid" ]; then
+    new_uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null || od -x /dev/urandom | head -1 | awk '{print $2$3"-"$4"-"$5"-"$6"-"$7$8$9}')
   fi
-  _idx=0
-  for _p in $_tuic_ports; do
-    _idx=$((_idx + 1))
-    _tag="tuic-in"
-    [ "$_idx" -gt 1 ] && _tag="tuic-in-${_idx}"
-    _tuic_json="{
-      \"type\": \"tuic\",
-      \"tag\": \"${_tag}\",
-      \"listen\": \"::\",
-      \"listen_port\": ${_p},
-      \"users\": [{ \"uuid\": \"${UUID}\", \"password\": \"${UUID}\" }],
-      \"congestion_control\": \"bbr\",
-      \"tls\": {
-        \"enabled\": true,
-        \"alpn\": [\"h3\"],
-        \"certificate_path\": \"${TUIC_TLS_CERT}\",
-        \"key_path\": \"${TUIC_TLS_KEY}\"
-      }
-    }"
-    if try_add_inbound "TUIC(${_p})" "$_tuic_json"; then
-      TUIC_ACTIVE_PORTS="${TUIC_ACTIVE_PORTS}${TUIC_ACTIVE_PORTS:+ }${_p}"
+  echo -e "${YELLOW}⚠ 修改后将删除 reality-keys.txt 并重启服务${RESET}"
+  echo -ne "${GRAY}确认修改为 $new_uuid 并重启? [y/N]: ${RESET}"
+  read -r confirm
+  if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+    set_val UUID "$new_uuid"
+    rm -f "$REALITY_KEY_FILE"
+    do_restart
+    echo -e "${GREEN}UUID 已更新${RESET}"
+    press_any_key
+  fi
+}
+
+config_argo() {
+  while true; do
+    clear
+    echo -e "${GREEN}======= Argo 隧道模式 =======${RESET}"
+    local cur_domain cur_auth cur_port cur_disable cur_protocol
+    cur_domain=$(get_val ARGO_DOMAIN)
+    cur_auth=$(get_val ARGO_AUTH)
+    cur_port=$(get_val ARGO_PORT)
+    cur_disable=$(get_val DISABLE_ARGO)
+    cur_protocol=$(get_val ARGO_PROTOCOL)
+
+    if [ "$cur_disable" = "true" ]; then
+      echo -e "${GRAY}当前: ${RED}已禁用${RESET}"
+    elif [ -n "$cur_domain" ] && [ -n "$cur_auth" ]; then
+      echo -e "${GRAY}当前: ${CYAN}固定隧道 ($cur_domain)${RESET}"
+    else
+      echo -e "${GRAY}当前: ${CYAN}临时隧道${RESET}"
     fi
+    echo -e "${GRAY}连接协议: ${CYAN}${cur_protocol:-http2(默认)}${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}1. 切换为临时隧道${RESET}"
+    echo -e "${WHITE}2. 配置固定隧道${RESET}"
+    echo -e "${WHITE}3. 禁用 Argo${RESET}"
+    echo -e "${WHITE}4. 切换连接协议 (http2/quic/auto)${RESET}"
+    echo -e "${WHITE}0. 返回${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -ne "${GRAY}请输入选项: ${RESET}"
+    read -r opt
+    case "$opt" in
+      1)
+        set_val ARGO_DOMAIN ""
+        set_val ARGO_AUTH ""
+        set_val DISABLE_ARGO ""
+        do_restart
+        press_any_key
+        ;;
+      2)
+        echo -ne "${WHITE}ARGO_DOMAIN [当前: ${CYAN}${cur_domain:-空}${WHITE}]: ${RESET}"
+        read -r new_domain
+        echo -ne "${WHITE}ARGO_AUTH   [当前: ${CYAN}${cur_auth:0:12}...${WHITE}]: ${RESET}"
+        read -r new_auth
+        echo -ne "${WHITE}ARGO_PORT   [当前: ${CYAN}${cur_port:-8001}${WHITE}]: ${RESET}"
+        read -r new_port
+        set_val ARGO_DOMAIN "${new_domain:-$cur_domain}"
+        set_val ARGO_AUTH "${new_auth:-$cur_auth}"
+        set_val ARGO_PORT "${new_port:-${cur_port:-8001}}"
+        set_val DISABLE_ARGO ""
+        do_restart
+        press_any_key
+        ;;
+      3)
+        set_val DISABLE_ARGO "true"
+        set_val ARGO_DOMAIN ""
+        set_val ARGO_AUTH ""
+        do_restart
+        press_any_key
+        ;;
+      4)
+        echo -e "${WHITE}1. http2 (默认推荐)  2. quic  3. auto${RESET}"
+        read -p "选择: " popt
+        case "$popt" in
+          1) set_val ARGO_PROTOCOL "http2" ;;
+          2) set_val ARGO_PROTOCOL "quic" ;;
+          3) set_val ARGO_PROTOCOL "auto" ;;
+        esac
+        do_restart
+        press_any_key
+        ;;
+      0) return ;;
+    esac
   done
-  [ -z "$TUIC_ACTIVE_PORTS" ] && TUIC_ACTIVE=0
-fi
+}
 
-# ── 端口跳跃 (port hopping) ───────────────────────────────────────────────────
-# 只转发到"主端口"（HY2_PORT/TUIC_PORT 本身），跟上面的额外固定端口是两回事：
-# 额外端口是多开几个独立监听，端口跳跃是把一段范围整体 NAT 到同一个主端口。
-# 需要 root 权限操作 nftables/iptables，规则不持久化到磁盘，每次脚本启动都会
-# 用固定的表/链幂等地重新下发（flush 掉自己那部分再重建），不影响系统上其它防火墙规则。
-HOP_NFT_TABLE="singbox_hop"
-HOP_BACKEND=""
+config_proto() {
+  while true; do
+    clear
+    echo -e "${GREEN}======= 可选协议端口 =======${RESET}"
+    local hy2 tuic reality reality_domain ss socks5 trojan anytls
+    hy2=$(get_val HY2_PORT)
+    tuic=$(get_val TUIC_PORT)
+    reality=$(get_val REALITY_PORT)
+    reality_domain=$(get_val REALITY_DOMAIN)
+    ss=$(get_val SS_PORT)
+    socks5=$(get_val SOCKS5_PORT)
+    trojan=$(get_val TROJAN_PORT)
+    anytls=$(get_val ANYTLS_PORT)
 
-hop_detect_backend() {
-  [ -n "$HOP_BACKEND" ] && return 0
-  if command -v nft >/dev/null 2>&1; then
-    HOP_BACKEND="nft"; return 0
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}1. Hysteria2    (UDP) [${CYAN}${hy2:-未启用}${WHITE}]${RESET}"
+    echo -e "${WHITE}2. TUIC         (UDP) [${CYAN}${tuic:-未启用}${WHITE}]${RESET}"
+    echo -e "${WHITE}3. VLESS Reality(TCP) [${CYAN}${reality:-未启用}${WHITE}]${RESET}"
+    echo -e "${WHITE}4. Reality 伪装域名   [${CYAN}${reality_domain:-www.iij.ad.jp}${WHITE}]${RESET}"
+    echo -e "${WHITE}5. Shadowsocks  (TCP) [${CYAN}${ss:-未启用}${WHITE}]${RESET}"
+    echo -e "${WHITE}6. SOCKS5  (TCP/UDP)  [${CYAN}${socks5:-未启用}${WHITE}]${RESET}"
+    echo -e "${WHITE}7. Trojan       (TCP) [${CYAN}${trojan:-未启用}${WHITE}]${RESET}"
+    echo -e "${WHITE}8. AnyTLS       (TCP) [${CYAN}${anytls:-未启用}${WHITE}]${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}0. 确认并重启${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -ne "${GRAY}请输入选项: ${RESET}"
+    read -r opt
+
+    _set_port() {
+      local key="$1" cur="$2" proto="$3"
+      echo -ne "${GRAY}${key}（留空禁用）[当前: ${CYAN}${cur:-未启用}${GRAY}]: ${RESET}"
+      read -r val
+      val="$(echo "$val" | tr -d '[:space:]')"
+      set_val "$key" "$val"
+      echo -e "${GREEN}已更新${RESET}"
+      sleep 1
+    }
+
+    case "$opt" in
+      1) _set_port HY2_PORT     "$hy2"     "Hysteria2" ;;
+      2) _set_port TUIC_PORT    "$tuic"    "TUIC" ;;
+      3) _set_port REALITY_PORT "$reality" "VLESS Reality" ;;
+      4)
+        echo -ne "${GRAY}REALITY_DOMAIN [当前: ${CYAN}${reality_domain:-www.iij.ad.jp}${GRAY}]: ${RESET}"
+        read -r val
+        val="$(echo "$val" | tr -d '[:space:]')"
+        [ -n "$val" ] && { set_val REALITY_DOMAIN "$val"; rm -f "$REALITY_KEY_FILE"; }
+        ;;
+      5) _set_port SS_PORT     "$ss"     "Shadowsocks" ;;
+      6) _set_port SOCKS5_PORT "$socks5" "SOCKS5" ;;
+      7) _set_port TROJAN_PORT "$trojan" "Trojan" ;;
+      8) _set_port ANYTLS_PORT "$anytls" "AnyTLS" ;;
+      0) do_restart; return ;;
+    esac
+  done
+}
+
+_list_domain_certs() {
+  [ -d "$DOMAIN_CERT_DIR" ] || return 0
+  for d in "$DOMAIN_CERT_DIR"/*/; do
+    [ -d "$d" ] || continue
+    local dom
+    dom="$(basename "$d")"
+    [ -f "$d/cert.pem" ] && [ -f "$d/key.pem" ] && echo "$dom"
+  done
+}
+
+config_cert_bind() {
+  while true; do
+    clear
+    echo -e "${GREEN}======= 协议证书绑定 =======${RESET}"
+    local avail
+    avail="$(_list_domain_certs)"
+    if [ -z "$avail" ]; then
+      echo -e "${YELLOW}还没有已签发的域名证书，请先到主菜单「8. 域名证书」申请${RESET}"
+      press_any_key; return
+    fi
+    echo -e "${GRAY}可用域名证书: ${CYAN}$(echo "$avail" | tr '\n' ' ')${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}1. Hysteria2  [${CYAN}$(get_val HY2_CERT_DOMAIN || echo '自签')${WHITE}]${RESET}"
+    echo -e "${WHITE}2. TUIC       [${CYAN}$(get_val TUIC_CERT_DOMAIN || echo '自签')${WHITE}]${RESET}"
+    echo -e "${WHITE}3. Trojan     [${CYAN}$(get_val TROJAN_CERT_DOMAIN || echo '自签')${WHITE}]${RESET}"
+    echo -e "${WHITE}4. AnyTLS     [${CYAN}$(get_val ANYTLS_CERT_DOMAIN || echo '自签')${WHITE}]${RESET}"
+    echo -e "${WHITE}0. 返回${RESET}"
+    read -p "选择: " popt
+    local key=""
+    case "$popt" in
+      1) key="HY2_CERT_DOMAIN" ;;
+      2) key="TUIC_CERT_DOMAIN" ;;
+      3) key="TROJAN_CERT_DOMAIN" ;;
+      4) key="ANYTLS_CERT_DOMAIN" ;;
+      0) return ;;
+      *) continue ;;
+    esac
+    echo -e "${WHITE}输入要绑定的域名 (输入 0 恢复自签): ${RESET}"
+    read -r dopt
+    if [ "$dopt" = "0" ]; then
+      set_val "$key" ""
+    elif [ -n "$dopt" ]; then
+      set_val "$key" "$dopt"
+    fi
+    do_restart
+    press_any_key
+  done
+}
+
+config_extraports() {
+  clear
+  echo -e "${GREEN}======= 添加多端口 =======${RESET}"
+  echo -ne "Hysteria2 额外端口(逗号分隔，留空清除)[当前: $(get_val HY2_EXTRA_PORTS)]: "
+  read -r val
+  set_val HY2_EXTRA_PORTS "$val"
+  echo -ne "TUIC 额外端口(逗号分隔，留空清除)[当前: $(get_val TUIC_EXTRA_PORTS)]: "
+  read -r val2
+  set_val TUIC_EXTRA_PORTS "$val2"
+  do_restart
+  press_any_key
+}
+
+config_hop() {
+  clear
+  echo -e "${GREEN}======= 端口跳跃 =======${RESET}"
+  echo -e "${YELLOW}提示：需 root + nftables/iptables${RESET}"
+  echo -ne "Hysteria2 范围(如 20000-30000)[当前: $(get_val HY2_HOP_RANGE)]: "
+  read -r val
+  set_val HY2_HOP_RANGE "$val"
+  echo -ne "TUIC 范围(如 20000-30000)[当前: $(get_val TUIC_HOP_RANGE)]: "
+  read -r val2
+  set_val TUIC_HOP_RANGE "$val2"
+  do_restart
+  press_any_key
+}
+
+config_komari() {
+  clear
+  echo -e "${GREEN}======= Komari 探针监控 =======${RESET}"
+  local cur_dom cur_tk
+  cur_dom=$(get_val KOMARI_DOMAIN)
+  [ -z "$cur_dom" ] && cur_dom=$(get_val KOMARI_ENDPOINT)
+  cur_tk=$(get_val KOMARI_TOKEN)
+  echo -e "当前: 域名=[${CYAN}${cur_dom:-未启用}${RESET}] Token=[${CYAN}${cur_tk:+已配置}${RESET}]"
+  echo -e "${WHITE}1. 修改配置  2. 禁用监控  0. 返回${RESET}"
+  read -p "请选择: " opt
+  case "$opt" in
+    1)
+      read -p "Komari 服务端域名 (如 komari.example.com): " new_dom
+      read -p "Komari 探针密钥 Token: " new_tk
+      if [ -n "$new_dom" ] && [ -n "$new_tk" ]; then
+        set_val KOMARI_DOMAIN "$new_dom"
+        set_val KOMARI_ENDPOINT ""
+        set_val KOMARI_TOKEN "$new_tk"
+        do_restart
+      fi
+      ;;
+    2)
+      set_val KOMARI_DOMAIN ""
+      set_val KOMARI_ENDPOINT ""
+      set_val KOMARI_TOKEN ""
+      pkill -f "komari-agent" 2>/dev/null || true
+      do_restart
+      ;;
+  esac
+  press_any_key
+}
+
+menu_update() {
+  clear
+  echo -e "${GREEN}======= 更新 sing-box =======${RESET}"
+  local latest_ver
+  latest_ver=$(curl -sL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" \
+    | grep '"tag_name"' | sed 's/.*"tag_name": *"v\([^"]*\)".*/\1/' | head -1)
+  echo -e "最新版本: ${GREEN}${latest_ver:+v}${latest_ver:-获取失败}${RESET}"
+  read -p "确认下载并覆盖更新? [y/N]: " confirm
+  if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+    rm -rf "$SB_DIR"
+    do_restart
   fi
+  press_any_key
+}
+
+menu_outbound() {
+  clear
+  echo -e "${GREEN}======= 出口设置 =======${RESET}"
+  local cur_type cur_addr cur_port
+  cur_type=$(grep '^TYPE=' "$OUTBOUND_FILE" 2>/dev/null | cut -d'=' -f2-)
+  cur_addr=$(grep '^ADDR=' "$OUTBOUND_FILE" 2>/dev/null | cut -d'=' -f2-)
+  cur_port=$(grep '^PORT=' "$OUTBOUND_FILE" 2>/dev/null | cut -d'=' -f2-)
+  echo -e "当前出口: ${CYAN}${cur_type:-直连}${cur_addr:+://$cur_addr:$cur_port}${RESET}"
+  echo -e "${WHITE}1. 设置 SOCKS5 出口  2. 设置 HTTP 出口  3. 恢复直连  0. 返回${RESET}"
+  read -p "选项: " opt
+  case "$opt" in
+    1|2)
+      local t="socks"
+      [ "$opt" = "2" ] && t="http"
+      read -p "服务器地址: " a
+      read -p "服务器端口: " p
+      read -p "用户名（留空无认证）: " u
+      local pass=""
+      [ -n "$u" ] && read -p "密码: " pass
+      if [ -n "$a" ] && [ -n "$p" ]; then
+        cat > "$OUTBOUND_FILE" << EOF
+TYPE=${t}
+ADDR=${a}
+PORT=${p}
+USER=${u}
+PASS=${pass}
+EOF
+        chmod 600 "$OUTBOUND_FILE"
+        do_restart
+      fi
+      ;;
+    3)
+      rm -f "$OUTBOUND_FILE"
+      do_restart
+      ;;
+  esac
+  press_any_key
+}
+
+ensure_acme() {
+  [ -x "$ACME_HOME/acme.sh" ] && return 0
+  echo -e "${YELLOW}正在安装 acme.sh...${RESET}"
+  mkdir -p "$STATE_DIR"
+  local tmp_acme="/tmp/acme-install-$$"
+  rm -rf "$tmp_acme" && mkdir -p "$tmp_acme"
+  if command -v curl >/dev/null 2>&1; then
+    curl -sL https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh -o "$tmp_acme/acme.sh"
+  else
+    wget -q https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh -O "$tmp_acme/acme.sh"
+  fi
+  chmod +x "$tmp_acme/acme.sh"
+  (cd "$tmp_acme" && ./acme.sh --install --home "$ACME_HOME" --force >/dev/null 2>&1) || true
+  rm -rf "$tmp_acme"
+  [ -x "$ACME_HOME/acme.sh" ]
+}
+
+menu_domain_cert() {
+  while true; do
+    clear
+    echo -e "${GREEN}======= 域名证书 (acme.sh) =======${RESET}"
+    local certs
+    certs="$(_list_domain_certs)"
+    echo -e "${GRAY}已签发/导入证书:${RESET} ${CYAN}${certs:-无}${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}1. 申请新域名证书 (HTTP-01)${RESET}"
+    echo -e "${WHITE}2. 手动导入已有证书${RESET}"
+    echo -e "${WHITE}3. 续期指定证书${RESET}"
+    echo -e "${WHITE}4. 删除证书${RESET}"
+    echo -e "${WHITE}0. 返回${RESET}"
+    read -p "选项: " opt
+    case "$opt" in
+      1)
+        ensure_acme || { warn "acme.sh 初始化失败"; press_any_key; continue; }
+        read -p "域名（需已解析到本机 IP，80 端口可用）: " domain
+        if [ -n "$domain" ]; then
+          mkdir -p "$DOMAIN_CERT_DIR/$domain"
+          if "$ACME_HOME/acme.sh" --home "$ACME_HOME" --issue -d "$domain" --standalone --httpport 80 --server letsencrypt --force; then
+            "$ACME_HOME/acme.sh" --home "$ACME_HOME" --install-cert -d "$domain" \
+              --key-file "$DOMAIN_CERT_DIR/$domain/key.pem" \
+              --fullchain-file "$DOMAIN_CERT_DIR/$domain/cert.pem" >/dev/null 2>&1
+            echo -e "${GREEN}证书申请成功！可前往「修改配置 -> 协议证书绑定」使用${RESET}"
+          else
+            echo -e "${RED}申请失败，请确认域名解析及 80 端口未被占用${RESET}"
+            rm -rf "$DOMAIN_CERT_DIR/$domain"
+          fi
+          press_any_key
+        fi
+        ;;
+      2)
+        read -p "域名标识: " domain
+        read -p "cert.pem 绝对路径: " cpath
+        read -p "key.pem 绝对路径: " kpath
+        if [ -f "$cpath" ] && [ -f "$kpath" ]; then
+          mkdir -p "$DOMAIN_CERT_DIR/$domain"
+          cp "$cpath" "$DOMAIN_CERT_DIR/$domain/cert.pem"
+          cp "$kpath" "$DOMAIN_CERT_DIR/$domain/key.pem"
+          chmod 600 "$DOMAIN_CERT_DIR/$domain/key.pem"
+          echo -e "${GREEN}证书导入成功！${RESET}"
+        fi
+        press_any_key
+        ;;
+      3)
+        read -p "要续期的域名: " domain
+        if [ -d "$DOMAIN_CERT_DIR/$domain" ] && [ -x "$ACME_HOME/acme.sh" ]; then
+          "$ACME_HOME/acme.sh" --home "$ACME_HOME" --renew -d "$domain" --force --standalone --httpport 80
+          do_restart
+        fi
+        press_any_key
+        ;;
+      4)
+        read -p "要删除的域名: " domain
+        rm -rf "$DOMAIN_CERT_DIR/$domain"
+        [ -x "$ACME_HOME/acme.sh" ] && "$ACME_HOME/acme.sh" --home "$ACME_HOME" --remove -d "$domain" >/dev/null 2>&1 || true
+        echo -e "${GREEN}已删除${RESET}"
+        press_any_key
+        ;;
+      0) return ;;
+    esac
+  done
+}
+
+# ==============================================================================
+# 模块 3: 快捷子命令 (edit / uninstall)
+# ==============================================================================
+do_edit() {
+  load_env_file
+  echo -e "${GREEN}========== 修改配置 (直接回车保留原值) ==========${NC}"
+  read -p "UUID         [${UUID:-自动生成}]: "          IN_UUID
+  read -p "NAME         [${NAME:-自动识别}]: "          IN_NAME
+  read -p "ARGO_DOMAIN  [${ARGO_DOMAIN:-临时隧道}]: "   IN_ARGO_DOMAIN
+  read -p "ARGO_AUTH    [${ARGO_AUTH:+已设置}]: "       IN_ARGO_AUTH
+  read -p "DISABLE_ARGO [${DISABLE_ARGO:-false}]: "     IN_DISABLE_ARGO
+  read -p "HY2_PORT     [${HY2_PORT:-未启用}]: "        IN_HY2_PORT
+  read -p "TUIC_PORT    [${TUIC_PORT:-未启用}]: "       IN_TUIC_PORT
+  read -p "REALITY_PORT [${REALITY_PORT:-未启用}]: "    IN_REALITY_PORT
+  read -p "REALITY_DOMAIN [${REALITY_DOMAIN:-www.iij.ad.jp}]: " IN_REALITY_DOMAIN
+  read -p "SS_PORT      [${SS_PORT:-未启用}]: "         IN_SS_PORT
+  read -p "SOCKS5_PORT  [${SOCKS5_PORT:-未启用}]: "     IN_SOCKS5_PORT
+  read -p "TROJAN_PORT  [${TROJAN_PORT:-未启用}]: "     IN_TROJAN_PORT
+  read -p "ANYTLS_PORT  [${ANYTLS_PORT:-未启用}]: "     IN_ANYTLS_PORT
+  read -p "KOMARI_DOMAIN[${KOMARI_DOMAIN:-未启用}]: "   IN_KOMARI_DOMAIN
+  read -p "KOMARI_TOKEN [${KOMARI_TOKEN:+已设置}]: "     IN_KOMARI_TOKEN
+
+  [ -n "$IN_UUID" ] && set_val UUID "$IN_UUID"
+  [ -n "$IN_NAME" ] && set_val NAME "$IN_NAME"
+  [ -n "$IN_ARGO_DOMAIN" ] && set_val ARGO_DOMAIN "$IN_ARGO_DOMAIN"
+  [ -n "$IN_ARGO_AUTH" ] && set_val ARGO_AUTH "$IN_ARGO_AUTH"
+  [ -n "$IN_DISABLE_ARGO" ] && set_val DISABLE_ARGO "$IN_DISABLE_ARGO"
+  [ -n "$IN_HY2_PORT" ] && set_val HY2_PORT "$IN_HY2_PORT"
+  [ -n "$IN_TUIC_PORT" ] && set_val TUIC_PORT "$IN_TUIC_PORT"
+  [ -n "$IN_REALITY_PORT" ] && set_val REALITY_PORT "$IN_REALITY_PORT"
+  [ -n "$IN_REALITY_DOMAIN" ] && set_val REALITY_DOMAIN "$IN_REALITY_DOMAIN"
+  [ -n "$IN_SS_PORT" ] && set_val SS_PORT "$IN_SS_PORT"
+  [ -n "$IN_SOCKS5_PORT" ] && set_val SOCKS5_PORT "$IN_SOCKS5_PORT"
+  [ -n "$IN_TROJAN_PORT" ] && set_val TROJAN_PORT "$IN_TROJAN_PORT"
+  [ -n "$IN_ANYTLS_PORT" ] && set_val ANYTLS_PORT "$IN_ANYTLS_PORT"
+  [ -n "$IN_KOMARI_DOMAIN" ] && set_val KOMARI_DOMAIN "$IN_KOMARI_DOMAIN"
+  [ -n "$IN_KOMARI_TOKEN" ] && set_val KOMARI_TOKEN "$IN_KOMARI_TOKEN"
+
+  do_restart
+  echo -e "${GREEN}配置已保存并重启${NC}"
+}
+
+do_uninstall() {
+  clear
+  echo -e "${RED}======= 彻底卸载 singbox =======${RESET}"
+  read -p "确认彻底删除所有文件、配置与服务? [yes/N]: " confirm
+  if [ "$confirm" != "yes" ]; then
+    echo "已取消"
+    return
+  fi
+
+  echo "正在清理并停止服务..."
+  systemctl --user stop singbox 2>/dev/null || true
+  systemctl --user disable singbox 2>/dev/null || true
+  rm -f "$SVCFILE"
+  systemctl --user daemon-reload 2>/dev/null || true
+
+  do_stop
+  (crontab -l 2>/dev/null | grep -v "singbox autostart") | crontab - 2>/dev/null || true
+
+  for RC in "$HOME_DIR/.bashrc" "$HOME_DIR/.profile" "$HOME_DIR/.bash_profile" "$HOME_DIR/.zshrc"; do
+    sed -i '/singbox/d' "$RC" 2>/dev/null || true
+  done
+
+  [ -x "$ACME_HOME/acme.sh" ] && "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1 || true
+
+  command -v nft >/dev/null 2>&1 && nft delete table inet singbox_hop >/dev/null 2>&1 || true
   if command -v iptables >/dev/null 2>&1; then
-    HOP_BACKEND="iptables"; return 0
+    iptables -t nat -F SINGBOX_HOP 2>/dev/null || true
+    iptables -t nat -D PREROUTING -j SINGBOX_HOP 2>/dev/null || true
+    iptables -t nat -X SINGBOX_HOP 2>/dev/null || true
   fi
-  warn "缺少 nft/iptables，尝试自动安装..."
-  try_install_pkg nftables
-  if command -v nft >/dev/null 2>&1; then
-    HOP_BACKEND="nft"; return 0
-  fi
-  try_install_pkg iptables
-  if command -v iptables >/dev/null 2>&1; then
-    HOP_BACKEND="iptables"; return 0
-  fi
-  return 1
+
+  rm -rf "$APP_DIR"
+  rm -rf /tmp/sb-bin
+  rm -f "$LOCAL_BIN/sb" "$LOCAL_BIN/sb-sub" "$LOCAL_BIN/sb-log" "$LOCAL_BIN/sb-del" "$LOCAL_BIN/sb-edit"
+  rm -f /usr/local/bin/sb /usr/local/bin/sb-sub /usr/local/bin/sb-log /usr/local/bin/sb-del /usr/local/bin/sb-edit 2>/dev/null || true
+
+  echo -e "${GREEN}卸载完成！${RESET}"
+  exit 0
 }
 
-hop_init_chain() {
-  if [ "$HOP_BACKEND" = "nft" ]; then
-    nft add table inet "$HOP_NFT_TABLE" 2>/dev/null
-    nft "add chain inet $HOP_NFT_TABLE prerouting { type nat hook prerouting priority -100 ; }" 2>/dev/null
-    nft flush chain inet "$HOP_NFT_TABLE" prerouting 2>/dev/null
-  elif [ "$HOP_BACKEND" = "iptables" ]; then
-    iptables -t nat -N SINGBOX_HOP 2>/dev/null
-    iptables -t nat -C PREROUTING -j SINGBOX_HOP 2>/dev/null || iptables -t nat -A PREROUTING -j SINGBOX_HOP 2>/dev/null
-    iptables -t nat -F SINGBOX_HOP 2>/dev/null
-    if command -v ip6tables >/dev/null 2>&1; then
-      ip6tables -t nat -N SINGBOX_HOP 2>/dev/null
-      ip6tables -t nat -C PREROUTING -j SINGBOX_HOP 2>/dev/null || ip6tables -t nat -A PREROUTING -j SINGBOX_HOP 2>/dev/null
-      ip6tables -t nat -F SINGBOX_HOP 2>/dev/null
-    fi
-  fi
-}
+# ==============================================================================
+# 模块 4: 守护进程运行器 (do_run / 原 singbox.sh 核心主体)
+# ==============================================================================
+do_run() {
+  load_env_file
 
-hop_add_rule() {
-  # $1=协议标签 $2=范围(如 20000-30000) $3=转发目标端口(主端口) -> 0=成功
-  _label="$1"; _range="$2"; _port="$3"
-  if ! valid_port_range "$_range"; then
-    warn "${_label}_HOP_RANGE 格式不合法(${_range})，应为如 20000-30000，已跳过"
-    return 1
-  fi
-  if [ "$HOP_BACKEND" = "nft" ]; then
-    if nft add rule inet "$HOP_NFT_TABLE" prerouting udp dport "$_range" redirect to ":${_port}" 2>/dev/null; then
-      log "端口跳跃已生效(nftables): ${_label} UDP ${_range} -> ${_port}"
-      return 0
-    fi
-  elif [ "$HOP_BACKEND" = "iptables" ]; then
-    _dports="$(echo "$_range" | tr '-' ':')"
-    if iptables -t nat -A SINGBOX_HOP -p udp --dport "$_dports" -j REDIRECT --to-port "$_port" 2>/dev/null; then
-      command -v ip6tables >/dev/null 2>&1 && ip6tables -t nat -A SINGBOX_HOP -p udp --dport "$_dports" -j REDIRECT --to-port "$_port" 2>/dev/null
-      log "端口跳跃已生效(iptables): ${_label} UDP ${_range} -> ${_port}"
-      return 0
-    fi
-  fi
-  warn "${_label} 端口跳跃规则下发失败"
-  return 1
-}
+  UUID="${UUID:-}"
+  PORT="${PORT:-3000}"
+  ARGO_PORT="${ARGO_PORT:-}"
+  NAME="${NAME:-}"
+  ARGO_DOMAIN="${ARGO_DOMAIN:-}"
+  ARGO_AUTH="${ARGO_AUTH:-}"
+  DISABLE_ARGO="${DISABLE_ARGO:-}"
+  ARGO_PROTOCOL="${ARGO_PROTOCOL:-http2}"
+  HY2_PORT="${HY2_PORT:-}"
+  TUIC_PORT="${TUIC_PORT:-}"
+  REALITY_PORT="${REALITY_PORT:-}"
+  REALITY_DOMAIN="${REALITY_DOMAIN:-www.iij.ad.jp}"
+  SS_PORT="${SS_PORT:-}"
+  SOCKS5_PORT="${SOCKS5_PORT:-}"
+  TROJAN_PORT="${TROJAN_PORT:-}"
+  ANYTLS_PORT="${ANYTLS_PORT:-}"
+  KOMARI_DOMAIN="${KOMARI_DOMAIN:-${KOMARI_ENDPOINT:-}}"
+  KOMARI_TOKEN="${KOMARI_TOKEN:-}"
+  HY2_CERT_DOMAIN="${HY2_CERT_DOMAIN:-}"
+  TUIC_CERT_DOMAIN="${TUIC_CERT_DOMAIN:-}"
+  TROJAN_CERT_DOMAIN="${TROJAN_CERT_DOMAIN:-}"
+  ANYTLS_CERT_DOMAIN="${ANYTLS_CERT_DOMAIN:-}"
+  HY2_EXTRA_PORTS="${HY2_EXTRA_PORTS:-}"
+  HY2_HOP_RANGE="${HY2_HOP_RANGE:-}"
+  TUIC_EXTRA_PORTS="${TUIC_EXTRA_PORTS:-}"
+  TUIC_HOP_RANGE="${TUIC_HOP_RANGE:-}"
+  CF_PREFER_HOST="${CF_PREFER_HOST:-cdns.doon.eu.org}"
+  WS_PATH="${WS_PATH:-/fengyue}"
 
-HY2_HOP_ACTIVE=0
-TUIC_HOP_ACTIVE=0
-if [ -n "$HY2_HOP_RANGE" ] || [ -n "$TUIC_HOP_RANGE" ]; then
-  if [ "$(id -u)" != "0" ]; then
-    warn "端口跳跃需要 root 权限下发防火墙规则，本次跳过（协议本身仍会用主端口正常工作）"
-  elif hop_detect_backend; then
-    hop_init_chain
-    if [ -n "$HY2_HOP_RANGE" ] && [ "$HY2_ACTIVE" = "1" ]; then
-      hop_add_rule "Hysteria2" "$HY2_HOP_RANGE" "$HY2_PORT" && HY2_HOP_ACTIVE=1
-    fi
-    if [ -n "$TUIC_HOP_RANGE" ] && [ "$TUIC_ACTIVE" = "1" ]; then
-      hop_add_rule "TUIC" "$TUIC_HOP_RANGE" "$TUIC_PORT" && TUIC_HOP_ACTIVE=1
-    fi
+  mkdir -p "$STATE_DIR" "$APP_DIR"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+
+  mkdir -p "$BIN_DIR" 2>/dev/null || {
+    BIN_DIR="$HOME_DIR/sb-bin"
+    SB_DIR="$BIN_DIR/singbox"
+    SB_BIN="$SB_DIR/sing-box"
+    CF_BIN="$BIN_DIR/cloudflared"
+    KM_BIN="$BIN_DIR/komari-agent"
+    mkdir -p "$BIN_DIR"
+  }
+
+  ensure_basic_deps
+
+  if [ -n "$UUID" ]; then
+    valid_uuid "$UUID" || die "UUID 格式不合法: ${UUID}"
+    echo "$UUID" > "$UUID_FILE"
+  elif [ -f "$UUID_FILE" ]; then
+    UUID="$(cat "$UUID_FILE")"
+    valid_uuid "$UUID" || die "uuid.txt 中的 UUID 格式已损坏"
   else
-    warn "缺少 nft/iptables 且自动安装失败，端口跳跃本次未生效"
+    UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null \
+      || python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null \
+      || od -x /dev/urandom | head -1 | awk '{print $2$3"-"$4"-"$5"-"$6"-"$7$8$9}')"
+    echo "$UUID" > "$UUID_FILE"
   fi
-fi
+  chmod 600 "$UUID_FILE" 2>/dev/null || true
 
+  SOCKS5_USER="${UUID%%-*}"
+  SOCKS5_PASS="${UUID##*-}"
 
-if [ "$REALITY_ACTIVE" = "1" ]; then
-  _reality_json="{
-      \"type\": \"vless\",
-      \"tag\": \"reality-in\",
-      \"listen\": \"::\",
-      \"listen_port\": ${REALITY_PORT},
-      \"users\": [{ \"uuid\": \"${UUID}\", \"flow\": \"xtls-rprx-vision\" }],
-      \"tls\": {
-        \"enabled\": true,
-        \"server_name\": \"${REALITY_DOMAIN}\",
-        \"reality\": {
-          \"enabled\": true,
-          \"handshake\": { \"server\": \"${REALITY_DOMAIN}\", \"server_port\": 443 },
-          \"private_key\": \"${REALITY_PRIV}\",
-          \"short_id\": [\"\"]
-        }
-      }
-    }"
-  try_add_inbound "VLESS Reality" "$_reality_json" || REALITY_ACTIVE=0
-fi
+  SS_PASS=""
+  if command -v python3 >/dev/null 2>&1; then
+    SS_PASS="$(python3 -c "u='$UUID'.replace('-','')[:32]; import base64, binascii; print(base64.b64encode(binascii.unhexlify(u)).decode())" 2>/dev/null)" || SS_PASS=""
+  fi
+  if [ -z "$SS_PASS" ] && command -v openssl >/dev/null 2>&1; then
+    _hex="$(echo "$UUID" | tr -d '-' | cut -c1-32)"
+    _hexesc="$(printf '%s' "$_hex" | sed 's/\(..\)/\\x\1/g')"
+    SS_PASS="$(printf "$_hexesc" | openssl base64 -A 2>/dev/null)" || SS_PASS=""
+  fi
 
-if [ "$SS_ACTIVE" = "1" ]; then
-  _ss_json="{
-      \"type\": \"shadowsocks\",
-      \"tag\": \"ss-in\",
-      \"listen\": \"::\",
-      \"listen_port\": ${SS_PORT},
-      \"network\": \"tcp\",
-      \"method\": \"2022-blake3-aes-128-gcm\",
-      \"password\": \"${SS_PASS}\"
-    }"
-  try_add_inbound "Shadowsocks" "$_ss_json" || SS_ACTIVE=0
-fi
+  case "$(uname -m)" in
+    x86_64|amd64)  SB_ARCH="amd64";  CF_ARCH="linux-amd64"; KM_ARCH="linux-amd64" ;;
+    aarch64|arm64) SB_ARCH="arm64";  CF_ARCH="linux-arm64"; KM_ARCH="linux-arm64" ;;
+    armv7*|armv6*) SB_ARCH="armv7";  CF_ARCH="linux-arm";   KM_ARCH="linux-arm"   ;;
+    i386|i686)     SB_ARCH="386";    CF_ARCH="linux-386";   KM_ARCH="linux-386"   ;;
+    *)             SB_ARCH="amd64";  CF_ARCH="linux-amd64"; KM_ARCH="linux-amd64" ;;
+  esac
 
-if [ "$SOCKS5_ACTIVE" = "1" ]; then
-  _socks5_json="{
-      \"type\": \"socks\",
-      \"tag\": \"socks5-in\",
-      \"listen\": \"::\",
-      \"listen_port\": ${SOCKS5_PORT},
-      \"users\": [{ \"username\": \"${SOCKS5_USER}\", \"password\": \"${SOCKS5_PASS}\" }]
-    }"
-  try_add_inbound "SOCKS5" "$_socks5_json" || SOCKS5_ACTIVE=0
-fi
+  download_singbox() {
+    mkdir -p "$SB_DIR"
+    log "正在检查/获取 sing-box..."
+    local SB_VER
+    SB_VER="$(http_get 'https://api.github.com/repos/SagerNet/sing-box/releases/latest' \
+      | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
+    [ -z "$SB_VER" ] && SB_VER="v1.12.0"
 
-if [ "$TROJAN_ACTIVE" = "1" ]; then
-  _trojan_json="{
-      \"type\": \"trojan\",
-      \"tag\": \"trojan-in\",
-      \"listen\": \"::\",
-      \"listen_port\": ${TROJAN_PORT},
-      \"users\": [{ \"password\": \"${UUID}\" }],
-      \"tls\": {
-        \"enabled\": true,
-        \"certificate_path\": \"${TROJAN_TLS_CERT}\",
-        \"key_path\": \"${TROJAN_TLS_KEY}\"
-      }
-    }"
-  try_add_inbound "Trojan" "$_trojan_json" || TROJAN_ACTIVE=0
-fi
-
-if [ "$ANYTLS_ACTIVE" = "1" ]; then
-  _anytls_json="{
-      \"type\": \"anytls\",
-      \"tag\": \"anytls-in\",
-      \"listen\": \"::\",
-      \"listen_port\": ${ANYTLS_PORT},
-      \"users\": [{ \"password\": \"${UUID}\" }],
-      \"tls\": {
-        \"enabled\": true,
-        \"certificate_path\": \"${ANYTLS_TLS_CERT}\",
-        \"key_path\": \"${ANYTLS_TLS_KEY}\"
-      }
-    }"
-  try_add_inbound "AnyTLS" "$_anytls_json" || ANYTLS_ACTIVE=0
-fi
-
-if [ -z "$_inbounds" ]; then
-  die "所有协议均校验失败，没有任何可用入口，终止启动（请检查 sing-box 版本是否过旧）"
-fi
-
-ROUTE_JSON=""
-[ -n "$EXTRA_OUTBOUND_JSON" ] && ROUTE_JSON=',
-  "route": { "final": "custom-out" }'
-
-printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct" }%s]%s\n}\n' \
-  "$_inbounds" "$EXTRA_OUTBOUND_JSON" "$ROUTE_JSON" > "$CONFIG_FILE"
-chmod 600 "$CONFIG_FILE" 2>/dev/null || true
-
-# 最终整体校验：单个 inbound 都已验证过，这一步主要防的是出站/路由部分的问题
-# （比如自定义出口配置有误）。如果失败，先尝试去掉自定义出口再试一次，仍失败才终止。
-_fc="/tmp/sb-finalcheck-$$.log"
-: > "$_fc"; chmod 600 "$_fc" 2>/dev/null || true
-if ! "$SB_BIN" check -c "$CONFIG_FILE" 2>"$_fc"; then
-  warn "整体配置校验失败，尝试去除自定义出口后重试："
-  redact_secrets < "$_fc" | sed 's/^/    /'
-  if [ -n "$EXTRA_OUTBOUND_JSON" ]; then
-    EXTRA_OUTBOUND_JSON=""
-    ROUTE_JSON=""
-    printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct" }]\n}\n' \
-      "$_inbounds" > "$CONFIG_FILE"
-    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
-    if "$SB_BIN" check -c "$CONFIG_FILE" 2>/dev/null; then
-      warn "已回退为直连出口，自定义出口本次未生效"
-    else
-      warn "sing-box 配置校验仍然失败，输出配置内容以供排查（已脱敏 UUID/密码/私钥）："
-      redact_secrets < "$CONFIG_FILE"
-      rm -f "$_fc"
-      # 持续性故障标记：如果 60 秒内已经因为同样的原因失败过，
-      # 说明这不是偶发问题（比如配置本身就有问题），额外等待，
-      # 避免 systemd Restart=always 把同样的报错每 10 秒刷一遍日志。
-      _failmark="$STATE_DIR/.last-config-fail"
-      _now="$(date +%s 2>/dev/null || echo 0)"
-      if [ -f "$_failmark" ]; then
-        _last="$(cat "$_failmark" 2>/dev/null || echo 0)"
-        if [ $((_now - _last)) -lt 60 ]; then
-          warn "60 秒内已重复失败，额外等待 60 秒再退出，避免刷屏..."
-          sleep 60
+    local _vnum="${SB_VER#v}"
+    for _suffix in "-musl" ""; do
+      local _asset="sing-box-${_vnum}-linux-${SB_ARCH}${_suffix}.tar.gz"
+      if dl "https://github.com/SagerNet/sing-box/releases/download/${SB_VER}/${_asset}" /tmp/sing-box.tar.gz; then
+        if tar -tzf /tmp/sing-box.tar.gz >/dev/null 2>&1; then
+          tar -xzf /tmp/sing-box.tar.gz -C "$SB_DIR" --strip-components=1
+          chmod +x "$SB_BIN"
+          rm -f /tmp/sing-box.tar.gz
+          if "$SB_BIN" version >/dev/null 2>&1; then return 0; fi
         fi
       fi
-      echo "$_now" > "$_failmark" 2>/dev/null || true
-      die "配置无效，终止启动"
-    fi
-  else
-    warn "sing-box 配置校验仍然失败，输出配置内容以供排查（已脱敏 UUID/密码/私钥）："
-    redact_secrets < "$CONFIG_FILE"
-    rm -f "$_fc"
-    die "配置无效，终止启动"
-  fi
-else
-  rm -f "$_fc"
-fi
-
-# ── 启动 sing-box（守护循环）─────────────────────────────────────────────────
-start_singbox() {
-  "$SB_BIN" run -c "$CONFIG_FILE" &
-  SB_PID=$!
-  # 等待端口就绪，最多 10 秒
-  if [ "${DISABLE_ARGO:-}" != "true" ]; then
-    wait_port 127.0.0.1 "$ARGO_PORT" 10
-  fi
-  if ! kill -0 $SB_PID 2>/dev/null; then
-    warn "sing-box 进程已退出"
+    done
     return 1
+  }
+
+  download_cloudflared() {
+    log "正在下载 cloudflared..."
+    if dl "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${CF_ARCH}" "$CF_BIN"; then
+      chmod +x "$CF_BIN"
+      if "$CF_BIN" --version >/dev/null 2>&1; then return 0; fi
+    fi
+    warn "cloudflared 下载或校验失败，Argo 隧道本次将禁用"
+    DISABLE_ARGO="true"
+    return 1
+  }
+
+  download_komari() {
+    log "正在下载 Komari 探针..."
+    if dl "https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-${KM_ARCH}" "$KM_BIN"; then
+      chmod +x "$KM_BIN"
+      return 0
+    fi
+    warn "Komari 探针下载失败"
+    return 1
+  }
+
+  pkill -f "$SB_BIN" 2>/dev/null || true
+  pkill -f "$CF_BIN" 2>/dev/null || true
+  pkill -f "$KM_BIN" 2>/dev/null || true
+
+  [ -x "$SB_BIN" ] || download_singbox || die "sing-box 下载失败"
+  if [ "${DISABLE_ARGO:-}" != "true" ]; then
+    [ -x "$CF_BIN" ] || download_cloudflared || true
   fi
-  log "sing-box 已启动 (PID: $SB_PID)"
-  return 0
-}
+  if [ -n "$KOMARI_DOMAIN" ] && [ -n "$KOMARI_TOKEN" ]; then
+    [ -x "$KM_BIN" ] || download_komari || true
+  fi
 
-start_singbox || die "sing-box 首次启动失败"
-
-# ── Argo 隧道启动/重连函数 ────────────────────────────────────────────────────
-# 临时隧道每次(重新)连接都会拿到一个新的随机 trycloudflare.com 域名，
-# 所以这个函数封装了"启动 cloudflared + 解析新域名"，并在结尾统一调用
-# generate_sub 用新域名重写订阅文件。看门狗每次重启 cloudflared 都会调用它，
-# 而不再是只在脚本启动时解析一次域名。
-ARGO_HOST=""
-CF_PID=""
-
-start_cloudflared() {
-  if [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_AUTH" ]; then
-    log "启动固定 Argo 隧道 (protocol=${ARGO_PROTOCOL})..."
-    "$CF_BIN" tunnel --edge-ip-version auto --protocol "$ARGO_PROTOCOL" --no-autoupdate \
-      run --token "$ARGO_AUTH" >/dev/null 2>&1 &
-    CF_PID=$!
-    sleep 3
-    ARGO_HOST="$ARGO_DOMAIN"
-  else
-    log "启动临时 Argo 隧道 (protocol=${ARGO_PROTOCOL})..."
-    rm -f "$CF_LOG"
-    "$CF_BIN" tunnel --edge-ip-version auto --protocol "$ARGO_PROTOCOL" --no-autoupdate \
-      --url "http://127.0.0.1:${ARGO_PORT}" \
-      --logfile "$CF_LOG" >/dev/null 2>&1 &
-    CF_PID=$!
-    _new_host=""
-    i=0
-    while [ $i -lt 30 ]; do
-      _new_host="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$CF_LOG" 2>/dev/null \
-        | head -1 | sed 's|https://||')"
-      [ -n "$_new_host" ] && break
-      sleep 1
-      i=$((i+1))
-    done
-    if [ -n "$_new_host" ]; then
-      ARGO_HOST="$_new_host"
+  rm -f "$USED_PORTS_FILE"
+  if [ "${DISABLE_ARGO:-}" != "true" ]; then
+    if [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_AUTH" ]; then
+      ARGO_PORT="${ARGO_PORT:-8001}"
     else
-      warn "隧道域名获取失败，沿用上一次的域名（如果有），订阅可能暂时无法使用"
-      [ -z "$ARGO_HOST" ] && ARGO_HOST="your-domain.com"
+      ARGO_PORT="${ARGO_PORT:-$(get_free_port)}"
+    fi
+    echo "$ARGO_PORT" >> "$USED_PORTS_FILE"
+  fi
+
+  if [ -z "$NAME" ]; then
+    local COUNTRY ASN_ORG
+    COUNTRY="$(http_get 'https://ipinfo.io/country' | tr -d '[:space:]')"
+    ASN_ORG="$(http_get 'https://ipinfo.io/org' | sed -e 's/^AS[0-9]* //' -e 's/,\? *Inc\.*//' | cut -c1-20)"
+    if [ -n "$COUNTRY" ] && [ -n "$ASN_ORG" ]; then
+      NAME="${COUNTRY}-${ASN_ORG}"
+    elif [ -n "$COUNTRY" ]; then
+      NAME="${COUNTRY}-sbx"
+    else
+      NAME="sbx"
+    fi
+  fi
+  NAME_ENCODED="$(url_encode "$NAME")"
+
+  PUBLIC_IP=""
+  if [ -n "$HY2_PORT" ] || [ -n "$TUIC_PORT" ] || [ -n "$REALITY_PORT" ] || [ -n "$SS_PORT" ] || [ -n "$SOCKS5_PORT" ] || [ -n "$TROJAN_PORT" ] || [ -n "$ANYTLS_PORT" ]; then
+    for _ipsrc in 'https://ipinfo.io/ip' 'https://ifconfig.co/ip' 'https://api64.ipify.org'; do
+      _cand="$(http_get "$_ipsrc" | tr -d '[:space:]')"
+      if valid_ip "$_cand"; then PUBLIC_IP="$_cand"; break; fi
+    done
+  fi
+
+  CERT_PATH=""
+  KEY_PATH=""
+  if [ -n "$HY2_PORT" ] || [ -n "$TUIC_PORT" ] || [ -n "$TROJAN_PORT" ] || [ -n "$ANYTLS_PORT" ]; then
+    mkdir -p "$CERT_DIR"
+    CERT_PATH="$CERT_DIR/cert.pem"
+    KEY_PATH="$CERT_DIR/key.pem"
+    if [ ! -f "$CERT_PATH" ] || [ ! -f "$KEY_PATH" ]; then
+      if command -v openssl >/dev/null 2>&1; then
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days 3650 -nodes \
+          -keyout "$KEY_PATH" -out "$CERT_PATH" \
+          -subj "/CN=bing.com/O=Microsoft/C=US" 2>/dev/null
+      fi
+    fi
+    chmod 600 "$KEY_PATH" 2>/dev/null || true
+  fi
+
+  resolve_cert_for() {
+    local _dom="$1"
+    if [ -n "$_dom" ] && [ -f "$DOMAIN_CERT_DIR/$_dom/cert.pem" ] && [ -f "$DOMAIN_CERT_DIR/$_dom/key.pem" ]; then
+      _RC_CERT="$DOMAIN_CERT_DIR/$_dom/cert.pem"
+      _RC_KEY="$DOMAIN_CERT_DIR/$_dom/key.pem"
+      _RC_SNI="$_dom"
+      _RC_INSECURE=0
+    else
+      _RC_CERT="$CERT_PATH"
+      _RC_KEY="$KEY_PATH"
+      _RC_SNI=""
+      _RC_INSECURE=1
+    fi
+  }
+
+  resolve_cert_for "$HY2_CERT_DOMAIN"; HY2_TLS_CERT="$_RC_CERT"; HY2_TLS_KEY="$_RC_KEY"; HY2_TLS_SNI="$_RC_SNI"; HY2_TLS_INSECURE="$_RC_INSECURE"
+  resolve_cert_for "$TUIC_CERT_DOMAIN"; TUIC_TLS_CERT="$_RC_CERT"; TUIC_TLS_KEY="$_RC_KEY"; TUIC_TLS_SNI="$_RC_SNI"; TUIC_TLS_INSECURE="$_RC_INSECURE"
+  resolve_cert_for "$TROJAN_CERT_DOMAIN"; TROJAN_TLS_CERT="$_RC_CERT"; TROJAN_TLS_KEY="$_RC_KEY"; TROJAN_TLS_SNI="$_RC_SNI"; TROJAN_TLS_INSECURE="$_RC_INSECURE"
+  resolve_cert_for "$ANYTLS_CERT_DOMAIN"; ANYTLS_TLS_CERT="$_RC_CERT"; ANYTLS_TLS_KEY="$_RC_KEY"; ANYTLS_TLS_SNI="$_RC_SNI"; ANYTLS_TLS_INSECURE="$_RC_INSECURE"
+
+  REALITY_PRIV=""
+  REALITY_PUB=""
+  if [ -n "$REALITY_PORT" ]; then
+    if [ -f "$REALITY_KEY_FILE" ]; then
+      REALITY_PRIV="$(grep '^PrivateKey:' "$REALITY_KEY_FILE" | sed 's/PrivateKey: *//')"
+      REALITY_PUB="$(grep  '^PublicKey:'  "$REALITY_KEY_FILE" | sed 's/PublicKey: *//')"
+    fi
+    if [ -z "$REALITY_PRIV" ] || [ -z "$REALITY_PUB" ]; then
+      local KEYPAIR
+      KEYPAIR="$("$SB_BIN" generate reality-keypair 2>/dev/null || true)"
+      REALITY_PRIV="$(echo "$KEYPAIR" | grep PrivateKey | sed 's/PrivateKey: *//')"
+      REALITY_PUB="$(echo  "$KEYPAIR" | grep PublicKey  | sed 's/PublicKey: *//')"
+      if [ -n "$REALITY_PRIV" ] && [ -n "$REALITY_PUB" ]; then
+        printf 'PrivateKey: %s\nPublicKey: %s\n' "$REALITY_PRIV" "$REALITY_PUB" > "$REALITY_KEY_FILE"
+        chmod 600 "$REALITY_KEY_FILE"
+      else
+        REALITY_PORT=""
+      fi
     fi
   fi
 
-  if [ "$ARGO_HOST" = "your-domain.com" ]; then
-    warn "隧道域名仍为占位符，订阅链接将暂时无效"
-  else
-    log "隧道域名: $ARGO_HOST"
+  EXTRA_OUTBOUND_JSON=""
+  CUSTOM_OUT_TYPE=""
+  if [ -f "$OUTBOUND_FILE" ]; then
+    CUSTOM_OUT_TYPE="$(grep '^TYPE=' "$OUTBOUND_FILE" | cut -d'=' -f2-)"
+    local o_addr o_port o_user o_pass
+    o_addr="$(grep '^ADDR=' "$OUTBOUND_FILE" | cut -d'=' -f2-)"
+    o_port="$(grep '^PORT=' "$OUTBOUND_FILE" | cut -d'=' -f2-)"
+    o_user="$(grep '^USER=' "$OUTBOUND_FILE" | cut -d'=' -f2-)"
+    o_pass="$(grep '^PASS=' "$OUTBOUND_FILE" | cut -d'=' -f2-)"
+    if [ -n "$o_addr" ] && [ -n "$o_port" ]; then
+      if [ -n "$o_user" ]; then
+        EXTRA_OUTBOUND_JSON=",
+    {
+      \"type\": \"${CUSTOM_OUT_TYPE}\",
+      \"tag\": \"custom-out\",
+      \"server\": \"${o_addr}\",
+      \"server_port\": ${o_port},
+      \"username\": \"${o_user}\",
+      \"password\": \"${o_pass}\"
+    }"
+      else
+        EXTRA_OUTBOUND_JSON=",
+    {
+      \"type\": \"${CUSTOM_OUT_TYPE}\",
+      \"tag\": \"custom-out\",
+      \"server\": \"${o_addr}\",
+      \"server_port\": ${o_port}
+    }"
+      fi
+    fi
   fi
 
-  # 每次(重新)拿到域名后都要重写订阅文件，这是修复"重启后订阅永久失效"的关键
-  generate_sub
-}
+  HY2_ACTIVE=0; TUIC_ACTIVE=0; REALITY_ACTIVE=0; SS_ACTIVE=0; SOCKS5_ACTIVE=0; TROJAN_ACTIVE=0; ANYTLS_ACTIVE=0
+  [ -n "$HY2_PORT" ]     && port_ok "$HY2_PORT"     && HY2_ACTIVE=1     || true
+  [ -n "$TUIC_PORT" ]    && port_ok "$TUIC_PORT"    && TUIC_ACTIVE=1    || true
+  [ -n "$REALITY_PORT" ] && port_ok "$REALITY_PORT" && REALITY_ACTIVE=1 || true
+  [ -n "$SS_PORT" ] && [ -n "$SS_PASS" ] && port_ok "$SS_PORT" && SS_ACTIVE=1 || true
+  [ -n "$SOCKS5_PORT" ]  && port_ok "$SOCKS5_PORT"  && SOCKS5_ACTIVE=1  || true
+  [ -n "$TROJAN_PORT" ]  && port_ok "$TROJAN_PORT"  && TROJAN_ACTIVE=1  || true
+  [ -n "$ANYTLS_PORT" ]  && port_ok "$ANYTLS_PORT"  && ANYTLS_ACTIVE=1  || true
 
-# ── 生成订阅链接（可重复调用，用于隧道重连后刷新 sub.txt）────────────────────
-generate_sub() {
-  ALL_LINKS=""
+  _inbounds=""
+  _sep=""
+
+  try_add_inbound() {
+    local _label="$1" _snippet="$2"
+    local _trial="${_inbounds}${_sep}
+      ${_snippet}"
+    local _tc="/tmp/sb-trycfg-$$.json"
+    printf '{\n  "log": { "level": "warn" },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct" }]\n}\n' "$_trial" > "$_tc"
+    if "$SB_BIN" check -c "$_tc" >/dev/null 2>&1; then
+      _inbounds="$_trial"
+      _sep=","
+      rm -f "$_tc"
+      return 0
+    else
+      warn "${_label} 配置校验未通过，已跳过该协议"
+      rm -f "$_tc"
+      return 1
+    fi
+  }
 
   if [ "${DISABLE_ARGO:-}" != "true" ]; then
-    VMESS_JSON="{\"v\":\"2\",\"ps\":\"$(json_escape "$NAME")\",\"add\":\"cdns.doon.eu.org\",\"port\":\"443\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${ARGO_HOST}\",\"path\":\"$(json_escape "$WS_PATH")\",\"tls\":\"tls\",\"sni\":\"${ARGO_HOST}\"}"
-    ALL_LINKS="vmess://$(b64 "$VMESS_JSON")"
+    _vmess_json="{
+        \"type\": \"vmess\",
+        \"tag\": \"vmess-in\",
+        \"listen\": \"127.0.0.1\",
+        \"listen_port\": ${ARGO_PORT},
+        \"users\": [{ \"uuid\": \"${UUID}\", \"alterId\": 0 }],
+        \"transport\": { \"type\": \"ws\", \"path\": \"$(json_escape "$WS_PATH")\" }
+      }"
+    try_add_inbound "VMess/Argo" "$_vmess_json" || DISABLE_ARGO="true"
   fi
 
-  if [ "$HY2_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-    if [ "$HY2_TLS_INSECURE" = "0" ]; then
-      _hy2_sni="$HY2_TLS_SNI"; _hy2_insecure="0"; _hy2_addr="$HY2_TLS_SNI"
-    else
-      _hy2_sni="www.bing.com"; _hy2_insecure="1"; _hy2_addr="$(format_addr "$PUBLIC_IP")"
-    fi
-    _hy2_hopq=""
-    [ "$HY2_HOP_ACTIVE" = "1" ] && _hy2_hopq="&mport=${HY2_HOP_RANGE}"
+  HY2_ACTIVE_PORTS=""
+  if [ "$HY2_ACTIVE" = "1" ]; then
+    _hy2_ports="$HY2_PORT"
+    [ -n "$HY2_EXTRA_PORTS" ] && _hy2_ports="$_hy2_ports $(parse_extra_ports "$HY2_EXTRA_PORTS")"
     _idx=0
-    for _p in $HY2_ACTIVE_PORTS; do
+    for _p in $_hy2_ports; do
       _idx=$((_idx + 1))
-      _hy2_name="$NAME_ENCODED"
-      _hy2_q=""
-      if [ "$_idx" -gt 1 ]; then
-        _hy2_name="${NAME_ENCODED}-P${_idx}"
-      else
-        _hy2_q="$_hy2_hopq"
+      _tag="hy2-in"
+      [ "$_idx" -gt 1 ] && _tag="hy2-in-${_idx}"
+      _hy2_json="{
+        \"type\": \"hysteria2\",
+        \"tag\": \"${_tag}\",
+        \"listen\": \"::\",
+        \"listen_port\": ${_p},
+        \"users\": [{ \"password\": \"${UUID}\" }],
+        \"masquerade\": \"https://bing.com\",
+        \"tls\": {
+          \"enabled\": true,
+          \"alpn\": [\"h3\"],
+          \"certificate_path\": \"${HY2_TLS_CERT}\",
+          \"key_path\": \"${HY2_TLS_KEY}\"
+        }
+      }"
+      if try_add_inbound "Hysteria2(${_p})" "$_hy2_json"; then
+        HY2_ACTIVE_PORTS="${HY2_ACTIVE_PORTS}${HY2_ACTIVE_PORTS:+ }${_p}"
       fi
-      _link="hysteria2://${UUID}@${_hy2_addr}:${_p}?sni=${_hy2_sni}&insecure=${_hy2_insecure}&alpn=h3&obfs=none${_hy2_q}#${_hy2_name}"
+    done
+    [ -z "$HY2_ACTIVE_PORTS" ] && HY2_ACTIVE=0
+  fi
+
+  TUIC_ACTIVE_PORTS=""
+  if [ "$TUIC_ACTIVE" = "1" ]; then
+    _tuic_ports="$TUIC_PORT"
+    [ -n "$TUIC_EXTRA_PORTS" ] && _tuic_ports="$_tuic_ports $(parse_extra_ports "$TUIC_EXTRA_PORTS")"
+    _idx=0
+    for _p in $_tuic_ports; do
+      _idx=$((_idx + 1))
+      _tag="tuic-in"
+      [ "$_idx" -gt 1 ] && _tag="tuic-in-${_idx}"
+      _tuic_json="{
+        \"type\": \"tuic\",
+        \"tag\": \"${_tag}\",
+        \"listen\": \"::\",
+        \"listen_port\": ${_p},
+        \"users\": [{ \"uuid\": \"${UUID}\", \"password\": \"${UUID}\" }],
+        \"congestion_control\": \"bbr\",
+        \"tls\": {
+          \"enabled\": true,
+          \"alpn\": [\"h3\"],
+          \"certificate_path\": \"${TUIC_TLS_CERT}\",
+          \"key_path\": \"${TUIC_TLS_KEY}\"
+        }
+      }"
+      if try_add_inbound "TUIC(${_p})" "$_tuic_json"; then
+        TUIC_ACTIVE_PORTS="${TUIC_ACTIVE_PORTS}${TUIC_ACTIVE_PORTS:+ }${_p}"
+      fi
+    done
+    [ -z "$TUIC_ACTIVE_PORTS" ] && TUIC_ACTIVE=0
+  fi
+
+  if [ "$REALITY_ACTIVE" = "1" ]; then
+    _reality_json="{
+        \"type\": \"vless\",
+        \"tag\": \"reality-in\",
+        \"listen\": \"::\",
+        \"listen_port\": ${REALITY_PORT},
+        \"users\": [{ \"uuid\": \"${UUID}\", \"flow\": \"xtls-rprx-vision\" }],
+        \"tls\": {
+          \"enabled\": true,
+          \"server_name\": \"${REALITY_DOMAIN}\",
+          \"reality\": {
+            \"enabled\": true,
+            \"handshake\": { \"server\": \"${REALITY_DOMAIN}\", \"server_port\": 443 },
+            \"private_key\": \"${REALITY_PRIV}\",
+            \"short_id\": [\"\"]
+          }
+        }
+      }"
+    try_add_inbound "VLESS Reality" "$_reality_json" || REALITY_ACTIVE=0
+  fi
+
+  if [ "$SS_ACTIVE" = "1" ]; then
+    _ss_json="{
+        \"type\": \"shadowsocks\",
+        \"tag\": \"ss-in\",
+        \"listen\": \"::\",
+        \"listen_port\": ${SS_PORT},
+        \"network\": \"tcp\",
+        \"method\": \"2022-blake3-aes-128-gcm\",
+        \"password\": \"${SS_PASS}\"
+      }"
+    try_add_inbound "Shadowsocks" "$_ss_json" || SS_ACTIVE=0
+  fi
+
+  if [ "$SOCKS5_ACTIVE" = "1" ]; then
+    _socks5_json="{
+        \"type\": \"socks\",
+        \"tag\": \"socks5-in\",
+        \"listen\": \"::\",
+        \"listen_port\": ${SOCKS5_PORT},
+        \"users\": [{ \"username\": \"${SOCKS5_USER}\", \"password\": \"${SOCKS5_PASS}\" }]
+      }"
+    try_add_inbound "SOCKS5" "$_socks5_json" || SOCKS5_ACTIVE=0
+  fi
+
+  if [ "$TROJAN_ACTIVE" = "1" ]; then
+    _trojan_json="{
+        \"type\": \"trojan\",
+        \"tag\": \"trojan-in\",
+        \"listen\": \"::\",
+        \"listen_port\": ${TROJAN_PORT},
+        \"users\": [{ \"password\": \"${UUID}\" }],
+        \"tls\": {
+          \"enabled\": true,
+          \"certificate_path\": \"${TROJAN_TLS_CERT}\",
+          \"key_path\": \"${TROJAN_TLS_KEY}\"
+        }
+      }"
+    try_add_inbound "Trojan" "$_trojan_json" || TROJAN_ACTIVE=0
+  fi
+
+  if [ "$ANYTLS_ACTIVE" = "1" ]; then
+    _anytls_json="{
+        \"type\": \"anytls\",
+        \"tag\": \"anytls-in\",
+        \"listen\": \"::\",
+        \"listen_port\": ${ANYTLS_PORT},
+        \"users\": [{ \"password\": \"${UUID}\" }],
+        \"tls\": {
+          \"enabled\": true,
+          \"certificate_path\": \"${ANYTLS_TLS_CERT}\",
+          \"key_path\": \"${ANYTLS_TLS_KEY}\"
+        }
+      }"
+    try_add_inbound "AnyTLS" "$_anytls_json" || ANYTLS_ACTIVE=0
+  fi
+
+  [ -z "$_inbounds" ] && die "所有协议均校验失败，无法启动"
+
+  local ROUTE_JSON=""
+  [ -n "$EXTRA_OUTBOUND_JSON" ] && ROUTE_JSON=',
+  "route": { "final": "custom-out" }'
+
+  printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct" }%s]%s\n}\n' \
+    "$_inbounds" "$EXTRA_OUTBOUND_JSON" "$ROUTE_JSON" > "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+
+  start_singbox() {
+    "$SB_BIN" run -c "$CONFIG_FILE" &
+    SB_PID=$!
+    if [ "${DISABLE_ARGO:-}" != "true" ]; then
+      wait_port 127.0.0.1 "$ARGO_PORT" 10
+    fi
+    if ! kill -0 $SB_PID 2>/dev/null; then return 1; fi
+    log "sing-box 已启动 (PID: $SB_PID)"
+    return 0
+  }
+
+  start_singbox || die "sing-box 启动失败"
+
+  ARGO_HOST=""
+  CF_PID=""
+  start_cloudflared() {
+    if [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_AUTH" ]; then
+      "$CF_BIN" tunnel --edge-ip-version auto --protocol "$ARGO_PROTOCOL" --no-autoupdate \
+        run --token "$ARGO_AUTH" >/dev/null 2>&1 &
+      CF_PID=$!
+      sleep 3
+      ARGO_HOST="$ARGO_DOMAIN"
+    else
+      rm -f "$CF_LOG"
+      "$CF_BIN" tunnel --edge-ip-version auto --protocol "$ARGO_PROTOCOL" --no-autoupdate \
+        --url "http://127.0.0.1:${ARGO_PORT}" \
+        --logfile "$CF_LOG" >/dev/null 2>&1 &
+      CF_PID=$!
+      local i=0 _new_host=""
+      while [ $i -lt 30 ]; do
+        _new_host="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$CF_LOG" 2>/dev/null | head -1 | sed 's|https://||')"
+        [ -n "$_new_host" ] && break
+        sleep 1
+        i=$((i+1))
+      done
+      ARGO_HOST="${_new_host:-your-domain.com}"
+    fi
+    log "Argo 隧道域名: $ARGO_HOST"
+    generate_sub
+  }
+
+  generate_sub() {
+    local ALL_LINKS=""
+    if [ "${DISABLE_ARGO:-}" != "true" ]; then
+      local VMESS_JSON="{\"v\":\"2\",\"ps\":\"$(json_escape "$NAME")\",\"add\":\"cdns.doon.eu.org\",\"port\":\"443\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${ARGO_HOST}\",\"path\":\"$(json_escape "$WS_PATH")\",\"tls\":\"tls\",\"sni\":\"${ARGO_HOST}\"}"
+      ALL_LINKS="vmess://$(b64 "$VMESS_JSON")"
+    fi
+
+    if [ "$HY2_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+      local _h_addr _h_sni _h_insec
+      [ "$HY2_TLS_INSECURE" = "0" ] && { _h_addr="$HY2_TLS_SNI"; _h_sni="$HY2_TLS_SNI"; _h_insec="0"; } || { _h_addr="$(format_addr "$PUBLIC_IP")"; _h_sni="www.bing.com"; _h_insec="1"; }
+      for _p in $HY2_ACTIVE_PORTS; do
+        local _link="hysteria2://${UUID}@${_h_addr}:${_p}?sni=${_h_sni}&insecure=${_h_insec}&alpn=h3&obfs=none#${NAME_ENCODED}"
+        ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
+}${_link}"
+      done
+    fi
+
+    if [ "$TUIC_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+      local _t_addr _t_sni _t_insec
+      [ "$TUIC_TLS_INSECURE" = "0" ] && { _t_addr="$TUIC_TLS_SNI"; _t_sni="$TUIC_TLS_SNI"; _t_insec="0"; } || { _t_addr="$(format_addr "$PUBLIC_IP")"; _t_sni="www.bing.com"; _t_insec="1"; }
+      for _p in $TUIC_ACTIVE_PORTS; do
+        local _link="tuic://${UUID}:${UUID}@${_t_addr}:${_p}?sni=${_t_sni}&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=${_t_insec}#${NAME_ENCODED}"
+        ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
+}${_link}"
+      done
+    fi
+
+    if [ "$REALITY_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ] && [ -n "$REALITY_PUB" ]; then
+      local _link="vless://${UUID}@$(format_addr "$PUBLIC_IP"):${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=firefox&pbk=${REALITY_PUB}&type=tcp&headerType=none#${NAME_ENCODED}"
       ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
-    done
-  fi
-
-  if [ "$TUIC_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-    if [ "$TUIC_TLS_INSECURE" = "0" ]; then
-      _tuic_sni="$TUIC_TLS_SNI"; _tuic_insecure="0"; _tuic_addr="$TUIC_TLS_SNI"
-    else
-      _tuic_sni="www.bing.com"; _tuic_insecure="1"; _tuic_addr="$(format_addr "$PUBLIC_IP")"
     fi
-    _tuic_hopq=""
-    [ "$TUIC_HOP_ACTIVE" = "1" ] && _tuic_hopq="&mport=${TUIC_HOP_RANGE}"
-    _idx=0
-    for _p in $TUIC_ACTIVE_PORTS; do
-      _idx=$((_idx + 1))
-      _tuic_name="$NAME_ENCODED"
-      _tuic_q=""
-      if [ "$_idx" -gt 1 ]; then
-        _tuic_name="${NAME_ENCODED}-P${_idx}"
-      else
-        _tuic_q="$_tuic_hopq"
-      fi
-      _link="tuic://${UUID}:${UUID}@${_tuic_addr}:${_p}?sni=${_tuic_sni}&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=${_tuic_insecure}${_tuic_q}#${_tuic_name}"
+
+    if [ "$SS_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+      local SS_USERINFO
+      SS_USERINFO="$(b64 "2022-blake3-aes-128-gcm:${SS_PASS}")"
+      local _link="ss://${SS_USERINFO}@$(format_addr "$PUBLIC_IP"):${SS_PORT}#${NAME_ENCODED}"
       ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
-    done
-  fi
-
-  if [ "$REALITY_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ] && [ -n "$REALITY_PUB" ]; then
-    _link="vless://${UUID}@$(format_addr "$PUBLIC_IP"):${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=firefox&pbk=${REALITY_PUB}&type=tcp&headerType=none#${NAME_ENCODED}"
-    ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
-}${_link}"
-  fi
-
-  if [ "$SS_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-    SS_USERINFO="$(b64 "2022-blake3-aes-128-gcm:${SS_PASS}")"
-    _link="ss://${SS_USERINFO}@$(format_addr "$PUBLIC_IP"):${SS_PORT}#${NAME_ENCODED}"
-    ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
-}${_link}"
-  fi
-
-  if [ "$SOCKS5_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-    # 注意 scheme 是 socks:// 不是 socks5://，且 user:pass 要 base64 编码
-    # （跟 SS 链接同一套写法）——大多数客户端只认这种格式，之前的 socks5:// 明文
-    # 格式很多客户端识别不出来，会被当成无效链接导入失败。
-    SOCKS5_USERINFO="$(b64 "${SOCKS5_USER}:${SOCKS5_PASS}")"
-    _link="socks://${SOCKS5_USERINFO}@$(format_addr "$PUBLIC_IP"):${SOCKS5_PORT}#${NAME_ENCODED}"
-    ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
-}${_link}"
-  fi
-
-  if [ "$TROJAN_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-    if [ "$TROJAN_TLS_INSECURE" = "0" ]; then
-      _trojan_sni="$TROJAN_TLS_SNI"; _trojan_insecure="0"; _trojan_addr="$TROJAN_TLS_SNI"
-    else
-      _trojan_sni="bing.com"; _trojan_insecure="1"; _trojan_addr="$(format_addr "$PUBLIC_IP")"
     fi
-    _link="trojan://${UUID}@${_trojan_addr}:${TROJAN_PORT}?security=tls&sni=${_trojan_sni}&allowInsecure=${_trojan_insecure}&fp=firefox#${NAME_ENCODED}"
-    ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
+
+    if [ "$SOCKS5_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+      local S5_USERINFO
+      S5_USERINFO="$(b64 "${SOCKS5_USER}:${SOCKS5_PASS}")"
+      local _link="socks://${S5_USERINFO}@$(format_addr "$PUBLIC_IP"):${SOCKS5_PORT}#${NAME_ENCODED}"
+      ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
-  fi
-
-  if [ "$ANYTLS_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
-    if [ "$ANYTLS_TLS_INSECURE" = "0" ]; then
-      _anytls_sni="$ANYTLS_TLS_SNI"; _anytls_insecure="0"; _anytls_addr="$ANYTLS_TLS_SNI"
-    else
-      _anytls_sni="bing.com"; _anytls_insecure="1"; _anytls_addr="$(format_addr "$PUBLIC_IP")"
     fi
-    _link="anytls://${UUID}@${_anytls_addr}:${ANYTLS_PORT}?sni=${_anytls_sni}&insecure=${_anytls_insecure}#${NAME_ENCODED}"
-    ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
+
+    if [ "$TROJAN_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+      local _tr_addr _tr_sni _tr_insec
+      [ "$TROJAN_TLS_INSECURE" = "0" ] && { _tr_addr="$TROJAN_TLS_SNI"; _tr_sni="$TROJAN_TLS_SNI"; _tr_insec="0"; } || { _tr_addr="$(format_addr "$PUBLIC_IP")"; _tr_sni="bing.com"; _tr_insec="1"; }
+      local _link="trojan://${UUID}@${_tr_addr}:${TROJAN_PORT}?security=tls&sni=${_tr_sni}&allowInsecure=${_tr_insec}&fp=firefox#${NAME_ENCODED}"
+      ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
-  fi
-
-  SUB_BASE64="$(b64 "$ALL_LINKS")"
-  echo "$SUB_BASE64" > "$SUB_FILE"
-  chmod 600 "$SUB_FILE" 2>/dev/null || true
-
-  log "================= 订阅内容 (已刷新) ================="
-  echo "$SUB_BASE64"
-  log "======================================================"
-  log "节点文件: $SUB_FILE"
-}
-
-if [ "${DISABLE_ARGO:-}" != "true" ]; then
-  start_cloudflared
-else
-  # Argo 被禁用时也要生成一次订阅（只含直连协议的节点）
-  generate_sub
-fi
-
-# ── 启动 Komari 监控探针 ──────────────────────────────────────────────────────
-KM_ACTIVE=0
-if [ -n "$KOMARI_DOMAIN" ] && [ -n "$KOMARI_TOKEN" ]; then
-  KM_ENDPOINT="$KOMARI_DOMAIN"
-  case "$KM_ENDPOINT" in
-    http://*|https://*) : ;;
-    *) KM_ENDPOINT="https://$KM_ENDPOINT" ;;
-  esac
-  if [ -x "$KM_BIN" ]; then
-    nohup "$KM_BIN" -e "$KM_ENDPOINT" -t "$KOMARI_TOKEN" >> "$KM_LOG" 2>&1 &
-    KM_PID=$!
-    KM_ACTIVE=1
-    log "Komari 探针已启动，PID: $KM_PID"
-  fi
-fi
-
-log "============== 已启用协议 =============="
-[ "${DISABLE_ARGO:-}" != "true" ] && log "✓ VMess + WS + Argo TLS  (域名: $ARGO_HOST)"
-[ "${DISABLE_ARGO:-}" = "true"  ] && log "✗ Argo 隧道已禁用"
-if [ "$HY2_ACTIVE" = "1" ]; then
-  _hy2_extra_disp="$(echo "$HY2_ACTIVE_PORTS" | sed "s/^${HY2_PORT} *//")"
-  _hy2_line="✓ Hysteria2     端口 $HY2_PORT (UDP)  证书: ${HY2_CERT_DOMAIN:-自签}"
-  [ -n "$_hy2_extra_disp" ] && _hy2_line="${_hy2_line}  额外端口: ${_hy2_extra_disp}"
-  [ "$HY2_HOP_ACTIVE" = "1" ] && _hy2_line="${_hy2_line}  跳跃: ${HY2_HOP_RANGE}"
-  log "$_hy2_line"
-fi
-if [ "$TUIC_ACTIVE" = "1" ]; then
-  _tuic_extra_disp="$(echo "$TUIC_ACTIVE_PORTS" | sed "s/^${TUIC_PORT} *//")"
-  _tuic_line="✓ TUIC v5       端口 $TUIC_PORT (UDP)  证书: ${TUIC_CERT_DOMAIN:-自签}"
-  [ -n "$_tuic_extra_disp" ] && _tuic_line="${_tuic_line}  额外端口: ${_tuic_extra_disp}"
-  [ "$TUIC_HOP_ACTIVE" = "1" ] && _tuic_line="${_tuic_line}  跳跃: ${TUIC_HOP_RANGE}"
-  log "$_tuic_line"
-fi
-[ "$REALITY_ACTIVE" = "1" ] && log "✓ VLESS Reality 端口 $REALITY_PORT  PubKey: $REALITY_PUB"
-[ "$SS_ACTIVE"      = "1" ] && log "✓ Shadowsocks   端口 $SS_PORT (TCP)"
-[ "$SOCKS5_ACTIVE"  = "1" ] && log "✓ SOCKS5        端口 $SOCKS5_PORT (TCP/UDP)  用户: $SOCKS5_USER"
-[ "$TROJAN_ACTIVE"  = "1" ] && log "✓ Trojan        端口 $TROJAN_PORT (TCP)  证书: ${TROJAN_CERT_DOMAIN:-自签}"
-[ "$ANYTLS_ACTIVE"  = "1" ] && log "✓ AnyTLS        端口 $ANYTLS_PORT (TCP)  证书: ${ANYTLS_CERT_DOMAIN:-自签}"
-[ "$KM_ACTIVE"      = "1" ] && log "✓ Komari 探针     域名: $KOMARI_DOMAIN"
-[ -n "$EXTRA_OUTBOUND_JSON" ] && log "✓ 自定义出口    ${CUSTOM_OUT_TYPE}://${CUSTOM_OUT_ADDR}:${CUSTOM_OUT_PORT}"
-log "========================================"
-
-# ── 守护循环 ──────────────────────────────────────────────────────────────────
-# sing-box 和 cloudflared 分别独立检测、独立重启，互不依赖：
-# 以前 cloudflared 崩溃只有在 sing-box 也一起崩溃时才会被顺带重拉，
-# 现在两者各自都有存活检查。cloudflared 每次重启都会重新调用
-# start_cloudflared，临时隧道的新域名会被重新解析并写回 sub.txt。
-# 加入退避重试：如果是持续性故障（比如端口被别的进程永久占用），
-# 不会每 10-15 秒就重启一次刷屏，重试间隔会随连续失败次数递增，最长封顶 60 秒。
-log "进入守护模式..."
-SB_FAIL_COUNT=0
-CF_FAIL_COUNT=0
-while true; do
-  if ! kill -0 $SB_PID 2>/dev/null; then
-    SB_FAIL_COUNT=$((SB_FAIL_COUNT + 1))
-    _backoff=$((SB_FAIL_COUNT * 5))
-    [ "$_backoff" -gt 60 ] && _backoff=60
-    warn "sing-box 意外退出（连续第 ${SB_FAIL_COUNT} 次），${_backoff} 秒后重启..."
-    sleep "$_backoff"
-    if start_singbox; then
-      SB_FAIL_COUNT=0
-    else
-      warn "重启失败，继续等待..."
-      sleep 10
-      continue
     fi
-  fi
+
+    if [ "$ANYTLS_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+      local _at_addr _at_sni _at_insec
+      [ "$ANYTLS_TLS_INSECURE" = "0" ] && { _at_addr="$ANYTLS_TLS_SNI"; _at_sni="$ANYTLS_TLS_SNI"; _at_insec="0"; } || { _at_addr="$(format_addr "$PUBLIC_IP")"; _at_sni="bing.com"; _at_insec="1"; }
+      local _link="anytls://${UUID}@${_at_addr}:${ANYTLS_PORT}?sni=${_at_sni}&insecure=${_at_insec}#${NAME_ENCODED}"
+      ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
+}${_link}"
+    fi
+
+    local SUB_BASE64
+    SUB_BASE64="$(b64 "$ALL_LINKS")"
+    echo "$SUB_BASE64" > "$SUB_FILE"
+    chmod 600 "$SUB_FILE" 2>/dev/null || true
+
+    log "================= 节点订阅刷新 ================="
+    echo "$SUB_BASE64"
+    log "================================================"
+  }
 
   if [ "${DISABLE_ARGO:-}" != "true" ]; then
-    if [ -z "$CF_PID" ] || ! kill -0 "$CF_PID" 2>/dev/null; then
-      CF_FAIL_COUNT=$((CF_FAIL_COUNT + 1))
-      _cf_backoff=$((CF_FAIL_COUNT * 5))
-      [ "$_cf_backoff" -gt 60 ] && _cf_backoff=60
-      warn "cloudflared 意外退出（或未运行，连续第 ${CF_FAIL_COUNT} 次），${_cf_backoff} 秒后重启..."
-      pkill -f "$CF_BIN" 2>/dev/null || true
-      sleep "$_cf_backoff"
-      start_cloudflared
-    else
-      CF_FAIL_COUNT=0
-    fi
+    start_cloudflared
+  else
+    generate_sub
   fi
 
-  if [ "${KM_ACTIVE:-0}" = "1" ]; then
-    if [ -z "$KM_PID" ] || ! kill -0 "$KM_PID" 2>/dev/null; then
-      warn "Komari 探针意外退出，正在重启..."
-      pkill -f "$KM_BIN" 2>/dev/null || true
+  KM_ACTIVE=0
+  if [ -n "$KOMARI_DOMAIN" ] && [ -n "$KOMARI_TOKEN" ]; then
+    local KM_ENDPOINT="$KOMARI_DOMAIN"
+    case "$KM_ENDPOINT" in
+      http://*|https://*) : ;;
+      *) KM_ENDPOINT="https://$KM_ENDPOINT" ;;
+    esac
+    if [ -x "$KM_BIN" ]; then
       nohup "$KM_BIN" -e "$KM_ENDPOINT" -t "$KOMARI_TOKEN" >> "$KM_LOG" 2>&1 &
       KM_PID=$!
+      KM_ACTIVE=1
+      log "Komari 监控探针已启动 (PID: $KM_PID)"
     fi
   fi
 
-  sleep 10
-done
+  log "进入后台守护看门狗状态..."
+  local SB_FAIL=0 CF_FAIL=0
+  while true; do
+    if ! kill -0 $SB_PID 2>/dev/null; then
+      SB_FAIL=$((SB_FAIL + 1))
+      warn "sing-box 异常退出 (第 $SB_FAIL 次)，正在重启..."
+      sleep 3
+      if start_singbox; then SB_FAIL=0; fi
+    fi
+
+    if [ "${DISABLE_ARGO:-}" != "true" ]; then
+      if [ -z "$CF_PID" ] || ! kill -0 "$CF_PID" 2>/dev/null; then
+        CF_FAIL=$((CF_FAIL + 1))
+        warn "cloudflared 异常退出，正在重启并重获域名..."
+        sleep 3
+        start_cloudflared
+      fi
+    fi
+
+    if [ "${KM_ACTIVE}" = "1" ]; then
+      if [ -z "$KM_PID" ] || ! kill -0 "$KM_PID" 2>/dev/null; then
+        warn "Komari 探针异常退出，正在重启..."
+        nohup "$KM_BIN" -e "$KM_ENDPOINT" -t "$KOMARI_TOKEN" >> "$KM_LOG" 2>&1 &
+        KM_PID=$!
+      fi
+    fi
+
+    sleep 10
+  done
+}
+
+# ==============================================================================
+# 命令路由分发入口
+# ==============================================================================
+CMD="${1:-}"
+
+case "$CMD" in
+  install)
+    shift; do_install "$@"
+    ;;
+  menu)
+    shift; do_menu "$@"
+    ;;
+  sub)
+    shift; do_sub "$@"
+    ;;
+  log)
+    shift; do_log "$@"
+    ;;
+  edit)
+    shift; do_edit "$@"
+    ;;
+  uninstall)
+    shift; do_uninstall "$@"
+    ;;
+  restart)
+    do_restart
+    ;;
+  status)
+    check_status
+    ;;
+  stop)
+    do_stop
+    ;;
+  run|daemon|start)
+    shift; do_run "$@"
+    ;;
+  *)
+    if [ ! -f "$ENV_FILE" ] && [ ! -f "$LEGACY_WRAPPER" ]; then
+      do_install "$@"
+    else
+      if [ -t 0 ]; then
+        do_menu "$@"
+      else
+        do_run "$@"
+      fi
+    fi
+    ;;
+esac

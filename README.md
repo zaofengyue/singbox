@@ -5,6 +5,7 @@
 ## 部署方式
 
 ### 方式一：Docker 部署
+支持 `linux/amd64` 与 `linux/arm64` 双架构，镜像内置二进制并集成 openssl，秒级冷启动：
 
 ```bash
 docker pull ghcr.io/zaofengyue/sbx:latest
@@ -34,13 +35,18 @@ index.html（可选）
 
 curl：
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/zaofengyue/singbox/main/install.sh)
+bash <(curl -sL https://raw.githubusercontent.com/zaofengyue/singbox/main/singbox.sh)
 ```
 
 wget：
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/zaofengyue/singbox/main/install.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/zaofengyue/singbox/main/singbox.sh)
 ```
+
+> **提示**：支持指定分支安装与测试，例如使用 `beta` 分支：
+> ```bash
+> BRANCH=beta bash <(curl -sL https://raw.githubusercontent.com/zaofengyue/singbox/beta/singbox.sh)
+> ```
 
 安装完成后可使用以下命令管理：
 
@@ -96,5 +102,5 @@ bash <(wget -qO- https://raw.githubusercontent.com/zaofengyue/singbox/main/insta
 - 仅供学习研究使用，请遵守当地法律法规
 - 临时隧道重启后域名会变，需要重新导入节点
 - 固定隧道需要 Cloudflare 账号和托管域名
-- sing-box、cloudflared 和 komari-agent 首次启动时自动下载，需要网络连接
+- Docker 镜像已预置对应架构二进制与 openssl，容器秒级离线冷启动；Shell 脚本部署首次运行会自动拉取并持久化
 - Hysteria2 / TUIC 使用自签证书，客户端需开启跳过证书验证

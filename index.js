@@ -211,6 +211,9 @@ async function downloadSingBox() {
     if (os.platform() !== 'win32') execSync(`chmod +x "${SB_BIN_PATH}"`);
     return SB_BIN_PATH;
   }
+  if (fs.existsSync('/usr/local/bin/sing-box')) {
+    return '/usr/local/bin/sing-box';
+  }
 
   const arch = detectArch();
   const platform = detectOS();
@@ -262,6 +265,9 @@ async function downloadCloudflared() {
     if (os.platform() !== 'win32') execSync(`chmod +x "${CLOUDFLARED_BIN}"`);
     return CLOUDFLARED_BIN;
   }
+  if (fs.existsSync('/usr/local/bin/cloudflared')) {
+    return '/usr/local/bin/cloudflared';
+  }
 
   const platform = os.platform();
   const arch = os.arch();
@@ -289,6 +295,9 @@ async function downloadKomariAgent() {
   if (fs.existsSync(KOMARI_BIN_PATH)) {
     if (os.platform() !== 'win32') execSync(`chmod +x "${KOMARI_BIN_PATH}"`);
     return KOMARI_BIN_PATH;
+  }
+  if (fs.existsSync('/usr/local/bin/komari-agent')) {
+    return '/usr/local/bin/komari-agent';
   }
 
   const platform = detectOS();
