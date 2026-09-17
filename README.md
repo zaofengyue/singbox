@@ -80,12 +80,21 @@ bash <(wget -qO- https://raw.githubusercontent.com/zaofengyue/singbox/main/insta
 | `REALITY_PORT` | VLESS Reality 端口 | TCP |
 | `REALITY_DOMAIN` | Reality 伪装域名 | 默认 `www.iij.ad.jp` |
 | `SS_PORT` | Shadowsocks 2022 端口 | TCP |
+| `SOCKS5_PORT` | SOCKS5 端口 | TCP/UDP |
+| `TROJAN_PORT` | Trojan 端口 | TCP |
+| `ANYTLS_PORT` | AnyTLS 端口 | TCP |
 
+### Komari 探针监控（可选，填写则上报监控，留空不启动）
+
+| 变量名 | 说明 | 默认值 |
+|--------|------|--------|
+| `KOMARI_ENDPOINT` | Komari 服务端地址（如 `https://komari.example.com`） | 留空不启用 |
+| `KOMARI_TOKEN` | Komari 探针通信密钥 Token | 留空不启用 |
 
 ## 注意事项
 
 - 仅供学习研究使用，请遵守当地法律法规
 - 临时隧道重启后域名会变，需要重新导入节点
 - 固定隧道需要 Cloudflare 账号和托管域名
-- sing-box 和 cloudflared 首次启动时自动下载，需要网络连接
+- sing-box、cloudflared 和 komari-agent 首次启动时自动下载，需要网络连接
 - Hysteria2 / TUIC 使用自签证书，客户端需开启跳过证书验证

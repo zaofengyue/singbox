@@ -31,6 +31,9 @@ SS_PORT="${SS_PORT:-}"
 SOCKS5_PORT="${SOCKS5_PORT:-}"
 TROJAN_PORT="${TROJAN_PORT:-}"
 ANYTLS_PORT="${ANYTLS_PORT:-}"
+# Komari 监控探针（可选，填写服务端和 Token 则上报监控，留空不启动）
+KOMARI_ENDPOINT="${KOMARI_ENDPOINT:-}"
+KOMARI_TOKEN="${KOMARI_TOKEN:-}"
 # 域名证书绑定（留空则该协议使用共享自签证书）：值是已经用 acme.sh 申请好的域名，
 # 证书文件预期位于 $STATE_DIR/domain-certs/<域名>/{cert.pem,key.pem}
 HY2_CERT_DOMAIN="${HY2_CERT_DOMAIN:-}"
@@ -66,6 +69,7 @@ CERT_DIR="$STATE_DIR/certs"
 DOMAIN_CERT_DIR="$STATE_DIR/domain-certs"
 SUB_FILE="$APP_DIR/sub.txt"
 CF_LOG="$APP_DIR/cf.log"
+KM_LOG="$APP_DIR/komari.log"
 
 # 兼容旧版本：把之前散落在 $HOME 根目录下的文件自动迁移到新位置，避免升级后 UUID/密钥丢失
 for _pair in "uuid.txt:$UUID_FILE" "sb-config.json:$CONFIG_FILE" \
@@ -85,6 +89,7 @@ BIN_DIR="/tmp/sb-bin"
 SB_DIR="$BIN_DIR/singbox"
 SB_BIN="$SB_DIR/sing-box"
 CF_BIN="$BIN_DIR/cloudflared"
+KM_BIN="$BIN_DIR/komari-agent"
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
 
@@ -356,13 +361,13 @@ fi
 
 # ── 架构检测 ──────────────────────────────────────────────────────────────────
 case "$(uname -m)" in
-  x86_64|amd64)  SB_ARCH="amd64";  CF_ARCH="linux-amd64" ;;
-  aarch64|arm64) SB_ARCH="arm64";  CF_ARCH="linux-arm64" ;;
-  armv7*|armv6*) SB_ARCH="armv7";  CF_ARCH="linux-arm"   ;;
-  i386|i686)     SB_ARCH="386";    CF_ARCH="linux-386"   ;;
+  x86_64|amd64)  SB_ARCH="amd64";  CF_ARCH="linux-amd64"; KM_ARCH="linux-amd64" ;;
+  aarch64|arm64) SB_ARCH="arm64";  CF_ARCH="linux-arm64"; KM_ARCH="linux-arm64" ;;
+  armv7*|armv6*) SB_ARCH="armv7";  CF_ARCH="linux-arm";   KM_ARCH="linux-arm"   ;;
+  i386|i686)     SB_ARCH="386";    CF_ARCH="linux-386";   KM_ARCH="linux-386"   ;;
   *)
     warn "未知架构 $(uname -m)，fallback 到 amd64"
-    SB_ARCH="amd64"; CF_ARCH="linux-amd64"
+    SB_ARCH="amd64"; CF_ARCH="linux-amd64"; KM_ARCH="linux-amd64"
     ;;
 esac
 
@@ -373,6 +378,7 @@ mkdir -p "$BIN_DIR" 2>/dev/null || {
   SB_DIR="$BIN_DIR/singbox"
   SB_BIN="$SB_DIR/sing-box"
   CF_BIN="$BIN_DIR/cloudflared"
+  KM_BIN="$BIN_DIR/komari-agent"
   mkdir -p "$BIN_DIR"
 }
 
@@ -391,6 +397,7 @@ if ! "$_test_bin" 2>/dev/null; then
       SB_DIR="$BIN_DIR/singbox"
       SB_BIN="$SB_DIR/sing-box"
       CF_BIN="$BIN_DIR/cloudflared"
+      KM_BIN="$BIN_DIR/komari-agent"
       mkdir -p "$BIN_DIR"
       rm -f "$_test_bin2"
       log "使用可执行目录: $BIN_DIR"
@@ -482,9 +489,21 @@ download_cloudflared() {
   log "cloudflared 下载完成"
 }
 
+# ── 下载 komari-agent ─────────────────────────────────────────────────────────
+download_komari() {
+  log "正在下载 Komari 探针 (${KM_ARCH})..."
+  if ! dl "https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-${KM_ARCH}" "$KM_BIN"; then
+    warn "Komari 探针下载失败，本次将跳过监控"
+    return 1
+  fi
+  chmod +x "$KM_BIN"
+  log "Komari 探针下载完成"
+}
+
 # 清理旧进程
 pkill -f "$SB_BIN"    2>/dev/null || true
 pkill -f "$CF_BIN"    2>/dev/null || true
+pkill -f "$KM_BIN"    2>/dev/null || true
 sleep 1
 
 [ -x "$SB_BIN" ] && ! "$SB_BIN" version >/dev/null 2>&1 && { warn "已存在的 sing-box 二进制无法运行，重新下载"; rm -f "$SB_BIN"; }
@@ -493,6 +512,10 @@ sleep 1
 if [ "${DISABLE_ARGO:-}" != "true" ]; then
   [ -x "$CF_BIN" ] && ! "$CF_BIN" --version >/dev/null 2>&1 && { warn "已存在的 cloudflared 二进制无法运行，重新下载"; rm -f "$CF_BIN"; }
   [ -x "$CF_BIN" ] || download_cloudflared || true
+fi
+
+if [ -n "$KOMARI_ENDPOINT" ] && [ -n "$KOMARI_TOKEN" ]; then
+  [ -x "$KM_BIN" ] || download_komari || true
 fi
 
 # ── 端口分配 ──────────────────────────────────────────────────────────────────
@@ -1260,6 +1283,17 @@ else
   generate_sub
 fi
 
+# ── 启动 Komari 监控探针 ──────────────────────────────────────────────────────
+KM_ACTIVE=0
+if [ -n "$KOMARI_ENDPOINT" ] && [ -n "$KOMARI_TOKEN" ]; then
+  if [ -x "$KM_BIN" ]; then
+    nohup "$KM_BIN" -e "$KOMARI_ENDPOINT" -t "$KOMARI_TOKEN" >> "$KM_LOG" 2>&1 &
+    KM_PID=$!
+    KM_ACTIVE=1
+    log "Komari 探针已启动，PID: $KM_PID"
+  fi
+fi
+
 log "============== 已启用协议 =============="
 [ "${DISABLE_ARGO:-}" != "true" ] && log "✓ VMess + WS + Argo TLS  (域名: $ARGO_HOST)"
 [ "${DISABLE_ARGO:-}" = "true"  ] && log "✗ Argo 隧道已禁用"
@@ -1282,6 +1316,7 @@ fi
 [ "$SOCKS5_ACTIVE"  = "1" ] && log "✓ SOCKS5        端口 $SOCKS5_PORT (TCP/UDP)  用户: $SOCKS5_USER"
 [ "$TROJAN_ACTIVE"  = "1" ] && log "✓ Trojan        端口 $TROJAN_PORT (TCP)  证书: ${TROJAN_CERT_DOMAIN:-自签}"
 [ "$ANYTLS_ACTIVE"  = "1" ] && log "✓ AnyTLS        端口 $ANYTLS_PORT (TCP)  证书: ${ANYTLS_CERT_DOMAIN:-自签}"
+[ "$KM_ACTIVE"      = "1" ] && log "✓ Komari 探针     服务端: $KOMARI_ENDPOINT"
 [ -n "$EXTRA_OUTBOUND_JSON" ] && log "✓ 自定义出口    ${CUSTOM_OUT_TYPE}://${CUSTOM_OUT_ADDR}:${CUSTOM_OUT_PORT}"
 log "========================================"
 
@@ -1322,6 +1357,15 @@ while true; do
       start_cloudflared
     else
       CF_FAIL_COUNT=0
+    fi
+  fi
+
+  if [ "${KM_ACTIVE:-0}" = "1" ]; then
+    if [ -z "$KM_PID" ] || ! kill -0 "$KM_PID" 2>/dev/null; then
+      warn "Komari 探针意外退出，正在重启..."
+      pkill -f "$KM_BIN" 2>/dev/null || true
+      nohup "$KM_BIN" -e "$KOMARI_ENDPOINT" -t "$KOMARI_TOKEN" >> "$KM_LOG" 2>&1 &
+      KM_PID=$!
     fi
   fi
 

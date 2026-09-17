@@ -297,6 +297,23 @@
         </div>
       </div>
 
+      <div class="section">
+        <div class="section-label"><span class="tag">可选</span> · 探针监控</div>
+        <h2>Komari 探针</h2>
+        <div class="field-row">
+          <div class="field">
+            <label for="field-komari-endpoint">Komari 服务端地址</label>
+            <input type="text" id="field-komari-endpoint" placeholder="例如 https://komari.example.com">
+            <span class="desc">KOMARI_ENDPOINT</span>
+          </div>
+          <div class="field">
+            <label for="field-komari-token">探针密钥 Token</label>
+            <input type="text" id="field-komari-token" placeholder="留空不启用监控">
+            <span class="desc">KOMARI_TOKEN</span>
+          </div>
+        </div>
+      </div>
+
     </div>
 
     <div class="preview-col">
@@ -336,6 +353,7 @@
     uuid:'', port:'', name:'', sub:'',
     argoPort:'', argoDomain:'', argoAuth:'', disableArgo:false,
     hy2:'', tuic:'', ss:'', trojan:'', anytls:'', s5:'', reality:'', realityDomain:'',
+    komariEndpoint:'', komariToken:'',
     cmdType:'curl'
   };
 
@@ -363,6 +381,8 @@
     if(state.s5)            p.push(['SOCKS5_PORT',    state.s5,           false]);
     if(state.reality)       p.push(['REALITY_PORT',   state.reality,      false]);
     if(state.realityDomain) p.push(['REALITY_DOMAIN', state.realityDomain,false]);
+    if(state.komariEndpoint)p.push(['KOMARI_ENDPOINT',state.komariEndpoint,false]);
+    if(state.komariToken)   p.push(['KOMARI_TOKEN',   state.komariToken,  false]);
     return p;
   }
 
@@ -454,6 +474,7 @@
     ['field-uuid','uuid'],['field-port','port'],['field-name','name'],['field-sub','sub'],
     ['field-argo-port','argoPort'],['field-argo-domain','argoDomain'],['field-argo-auth','argoAuth'],
     ['field-reality-domain','realityDomain'],
+    ['field-komari-endpoint','komariEndpoint'],['field-komari-token','komariToken'],
   ].forEach(([id,key]) => {
     document.getElementById(id).addEventListener('input', e => { state[key] = e.target.value.trim(); render(); });
   });

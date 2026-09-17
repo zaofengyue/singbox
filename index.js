@@ -16,6 +16,9 @@ const PRESET_REALITY_DOMAIN = '';
 const PRESET_SS_PORT        = '';
 const PRESET_S5_PORT        = '';
 const PRESET_ANYTLS_PORT    = '';
+// ── Komari 监控探针（可选，填写则上报监控，留空不启动）──
+const PRESET_KOMARI_ENDPOINT = '';
+const PRESET_KOMARI_TOKEN    = '';
 // =============================================
 
 const { execSync, spawn } = require('child_process');
@@ -33,6 +36,10 @@ const SB_DIR          = `${HOME}/sing-box`;
 const SB_BIN_NAME     = os.platform() === 'win32' ? 'sing-box.exe' : 'sing-box';
 const SB_BIN_PATH     = `${SB_DIR}/${SB_BIN_NAME}`;
 const CLOUDFLARED_BIN = `${HOME}/cloudflared${os.platform() === 'win32' ? '.exe' : ''}`;
+const KOMARI_DIR      = `${HOME}/komari-agent`;
+const KOMARI_BIN_NAME = os.platform() === 'win32' ? 'komari-agent.exe' : 'komari-agent';
+const KOMARI_BIN_PATH = `${KOMARI_DIR}/${KOMARI_BIN_NAME}`;
+const KOMARI_LOG_FILE = `${KOMARI_DIR}/agent.log`;
 
 // Argo 三协议 WS 路径
 const WS_PATH_VMESS  = '/fengyue-vm';
@@ -275,6 +282,36 @@ async function downloadCloudflared() {
 }
 
 // ──────────────────────────────────────────────
+// 下载 Komari 探针（跨平台架构识别）
+// ──────────────────────────────────────────────
+
+async function downloadKomariAgent() {
+  if (fs.existsSync(KOMARI_BIN_PATH)) {
+    if (os.platform() !== 'win32') execSync(`chmod +x "${KOMARI_BIN_PATH}"`);
+    return KOMARI_BIN_PATH;
+  }
+
+  const platform = detectOS();
+  const arch = detectArch();
+  const kmArch = arch === 'armv7' ? 'arm' : arch;
+  const ext = platform === 'windows' ? '.exe' : '';
+  const fileName = `komari-agent-${platform}-${kmArch}${ext}`;
+  const url = `https://github.com/komari-monitor/komari-agent/releases/latest/download/${fileName}`;
+
+  fs.mkdirSync(KOMARI_DIR, { recursive: true });
+  console.log(`正在下载 Komari 探针 (${fileName})...`);
+  try {
+    await download(url, KOMARI_BIN_PATH);
+    if (platform !== 'windows') execSync(`chmod +x "${KOMARI_BIN_PATH}"`);
+    console.log('Komari 探针下载完成');
+    return KOMARI_BIN_PATH;
+  } catch (err) {
+    console.warn(`Komari 探针下载失败: ${err.message}`);
+    return null;
+  }
+}
+
+// ──────────────────────────────────────────────
 // Argo 隧道
 // ──────────────────────────────────────────────
 
@@ -380,6 +417,9 @@ async function main() {
   const ANYTLS_PORT   = ANYTLS_PORT_RAW ? parseInt(ANYTLS_PORT_RAW)  : 0;
 
   const REALITY_DOMAIN = PRESET_REALITY_DOMAIN || process.env.REALITY_DOMAIN || 'www.iij.ad.jp';
+
+  const KOMARI_ENDPOINT = PRESET_KOMARI_ENDPOINT || process.env.KOMARI_ENDPOINT || '';
+  const KOMARI_TOKEN    = PRESET_KOMARI_TOKEN    || process.env.KOMARI_TOKEN    || '';
 
   // 节点名称
   const COUNTRY = await httpGet('https://ipinfo.io/country') ||
@@ -787,6 +827,30 @@ async function main() {
     console.log('Argo 隧道已禁用，跳过 cloudflared');
   }
 
+  // ── 启动 Komari 监控探针（可选）──────────────
+  let komariActive = false;
+  if (KOMARI_ENDPOINT && KOMARI_TOKEN) {
+    try {
+      const kmBin = await downloadKomariAgent();
+      if (kmBin && fs.existsSync(kmBin)) {
+        const kmLogFd = fs.openSync(KOMARI_LOG_FILE, 'a');
+        const km = spawn(kmBin, ['-e', KOMARI_ENDPOINT, '-t', KOMARI_TOKEN], {
+          stdio: ['ignore', kmLogFd, kmLogFd],
+          detached: os.platform() !== 'win32'
+        });
+        km.unref();
+        komariActive = true;
+        console.log(`Komari 探针已在后台启动，PID: ${km.pid}`);
+        console.log(`Komari 日志: ${KOMARI_LOG_FILE}`);
+        km.on('error', (err) => {
+          console.error(`Komari 探针进程启动失败: ${err.message}`);
+        });
+      }
+    } catch (err) {
+      console.warn(`启动 Komari 探针失败: ${err.message}`);
+    }
+  }
+
   // ── 生成订阅链接 ───────────────────────────
   const links = [];
 
@@ -888,6 +952,7 @@ async function main() {
   if (ssActive)      console.log(`✓ Shadowsocks   端口 ${SS_PORT} (TCP)  密码: ${SS_PASS}`);
   if (s5Active)      console.log(`✓ Socks5        端口 ${S5_PORT} (TCP)  账号: ${UUID.substring(0, 8)}`);
   if (anytlsFinal)   console.log(`✓ AnyTLS        端口 ${ANYTLS_PORT} (TCP)`);
+  if (komariActive)  console.log(`✓ Komari 探针     服务端: ${KOMARI_ENDPOINT}`);
   if (DISABLE_ARGO)  console.log(`✗ Argo 隧道已禁用`);
   console.log(`运行环境: ${detectOS()}-${detectArch()}`);
   console.log('========================================');
