@@ -4,9 +4,13 @@
 # 功能支持: 安装部署 / 守护进程 / 交互面板 / 订阅查看 / 证书申请 / 出口分流 / 探针监控
 # ==============================================================================
 
-# Alpine ash 兼容性处理：若当前不是 bash 则尝试唤起 bash
+# Alpine ash 兼容性处理：若当前不是 bash 则尝试唤起或自动安装 bash
 if [ -z "${BASH_VERSION:-}" ]; then
   if command -v bash >/dev/null 2>&1; then
+    exec bash "$0" "$@"
+  elif [ "$(id -u)" = "0" ] && command -v apk >/dev/null 2>&1; then
+    echo "检测到 Alpine 系统，自动安装 bash 与基础工具..."
+    apk add --no-cache bash >/dev/null 2>&1 || true
     exec bash "$0" "$@"
   else
     echo "本脚本需要 bash 才能运行，当前系统未检测到 bash。"
@@ -16,11 +20,9 @@ if [ -z "${BASH_VERSION:-}" ]; then
   fi
 fi
 
-set -e
-
 export TERM="${TERM:-xterm}"
 export LANG="${LANG:-C.UTF-8}"
-export LC_ALL="${LC_ALL:-C.UTF-8}"
+export LC_ALL="${LANG:-C.UTF-8}"
 
 # ── 颜色与输出定义 ────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
@@ -38,7 +40,6 @@ die()  { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 # ── 路径与常量定义 ────────────────────────────────────────────────────────────
 BRANCH="${BRANCH:-main}"
-REPO_BASE="https://raw.githubusercontent.com/zaofengyue/singbox/${BRANCH}"
 
 HOME_DIR="${HOME:-/root}"
 APP_DIR="$HOME_DIR/singbox"
@@ -146,10 +147,11 @@ ensure_basic_deps() {
   command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || _missing="$_missing curl"
   command -v tar     >/dev/null 2>&1 || _missing="$_missing tar"
   command -v openssl >/dev/null 2>&1 || _missing="$_missing openssl"
+  command -v socat   >/dev/null 2>&1 || _missing="$_missing socat"
   [ -z "$_missing" ] && return 0
 
   warn "检测到缺少基础工具:${_missing}，尝试自动安装..."
-  try_install_pkg "$_missing"
+  try_install_pkg "$_missing ca-certificates"
   if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
     die "缺少 curl/wget 且自动安装失败。Alpine: apk add --no-cache curl；Debian/Ubuntu: apt-get install -y curl"
   fi
@@ -160,26 +162,37 @@ ensure_basic_deps() {
 
 # ── 通用工具函数 ──────────────────────────────────────────────────────────────
 http_get() {
+  local _ipopt="${1:--4}"
+  local _url="$2"
+  if [ -z "$_url" ]; then _url="$1"; _ipopt=""; fi
+
   if command -v curl >/dev/null 2>&1; then
-    curl -sL --max-time 5 "$1" 2>/dev/null || true
+    curl $_ipopt -sL --max-time 6 "$_url" 2>/dev/null || true
   else
-    wget -qO- --timeout=5 "$1" 2>/dev/null || true
+    wget $_ipopt -qO- --timeout=6 "$_url" 2>/dev/null || true
   fi
 }
 
 dl() {
-  local _url="$1" _out="$2" _tries=0
-  while [ "$_tries" -lt 3 ]; do
-    if command -v curl >/dev/null 2>&1; then
-      curl -sL --fail --max-time 60 "$_url" -o "$_out" 2>/dev/null
-    else
-      wget -q --timeout=60 "$_url" -O "$_out" 2>/dev/null
-    fi
-    if [ -s "$_out" ]; then return 0; fi
-    _tries=$((_tries + 1))
-    warn "下载失败(第 ${_tries} 次): $_url"
+  local _url="$1" _out="$2"
+  # 支持直链与多组主流 GitHub 加速镜像回退，保证 99.99% 下载成功率
+  local _mirrors=("" "https://ghproxy.net/" "https://github.moeyy.xyz/" "https://mirror.ghproxy.com/")
+  for _prefix in "${_mirrors[@]}"; do
+    local _target="${_prefix}${_url}"
     rm -f "$_out"
-    sleep 2
+    if command -v curl >/dev/null 2>&1; then
+      curl -sL --fail --max-time 90 "$_target" -o "$_out" 2>/dev/null || true
+    else
+      wget -q --timeout=90 "$_target" -O "$_out" 2>/dev/null || true
+    fi
+    if [ -s "$_out" ]; then
+      # 简单检查是否被拦截下载为 HTML 错误页面
+      if head -c 200 "$_out" 2>/dev/null | grep -qiE "<!DOCTYPE html|<html"; then
+        rm -f "$_out"
+        continue
+      fi
+      return 0
+    fi
   done
   return 1
 }
@@ -579,15 +592,16 @@ SVCEOF
     systemctl --user enable singbox
     systemctl --user restart singbox
     loginctl enable-linger "$USER" 2>/dev/null || true
-    (crontab -l 2>/dev/null | grep -v "singbox autostart") | crontab - 2>/dev/null || true
+    (crontab -l 2>/dev/null | grep -v "singbox" ; echo "0 3 * * * bash $APP_DIR/singbox.sh renew-cron >> $LOG_FILE 2>&1") | crontab - 2>/dev/null || true
     echo ""
-    log "服务已通过用户级 systemd 启动并设置开机自启"
+    log "服务已通过用户级 systemd 启动并设置开机自启（证书自动续期已配置）"
   else
     do_restart
-    (crontab -l 2>/dev/null | grep -v "singbox autostart"; \
-     echo "@reboot sleep 20 && bash $APP_DIR/singbox.sh run >> $LOG_FILE 2>&1") | crontab - 2>/dev/null || true
+    (crontab -l 2>/dev/null | grep -v "singbox" ; \
+     echo "@reboot sleep 20 && bash $APP_DIR/singbox.sh run >> $LOG_FILE 2>&1" ; \
+     echo "0 3 * * * bash $APP_DIR/singbox.sh renew-cron >> $LOG_FILE 2>&1") | crontab - 2>/dev/null || true
     echo ""
-    log "服务已通过 nohup 后台启动，开机自启已写入 cron"
+    log "服务已通过 nohup 后台启动，开机自启与证书自动续期已写入 cron"
   fi
 
   echo ""
@@ -701,6 +715,7 @@ menu_config() {
     echo -e "${WHITE}5. 添加多端口${RESET}"
     echo -e "${WHITE}6. 端口跳跃${RESET}"
     echo -e "${WHITE}7. Komari探针监控${RESET}"
+    echo -e "${WHITE}8. IP栈偏好与连接域名${RESET}"
     echo -e "${WHITE}0. 返回${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -ne "${GRAY}请输入选项: ${RESET}"
@@ -713,10 +728,52 @@ menu_config() {
       5) config_extraports ;;
       6) config_hop ;;
       7) config_komari ;;
+      8) config_ip_domain ;;
       0) return ;;
       *) ;;
     esac
   done
+}
+
+config_ip_domain() {
+  clear
+  echo -e "${GREEN}======= IP栈偏好与连接域名 =======${RESET}"
+  local cur_v cur_dom cur_pip
+  cur_v=$(get_val IP_VERSION)
+  cur_dom=$(get_val SERVER_DOMAIN)
+  cur_pip=$(get_val PUBLIC_IP)
+  echo -e "${GRAY}当前 IP 栈偏好: ${CYAN}${cur_v:-4 (IPv4优先)}${RESET}"
+  echo -e "${GRAY}当前连接域名:   ${CYAN}${cur_dom:-未设置 (使用IP)}${RESET}"
+  echo -e "${GRAY}自定义公网 IP:  ${CYAN}${cur_pip:-自动探测}${RESET}"
+  echo -e "${GRAY}--------------------------------${RESET}"
+  echo -e "${WHITE}1. 设置 IP 栈偏好 (4: IPv4优先 | 6: IPv6优先 | auto: 自动)${RESET}"
+  echo -e "${WHITE}2. 修改全局连接域名 (输入 0 或留空恢复使用 IP)${RESET}"
+  echo -e "${WHITE}3. 手动指定公网 IP (输入 0 或留空恢复自动探测)${RESET}"
+  echo -e "${WHITE}0. 返回${RESET}"
+  read -p "选项: " opt
+  case "$opt" in
+    1)
+      read -p "请输入 IP 栈偏好 [4/6/auto]: " v
+      case "$v" in
+        6) set_val IP_VERSION "6" ;;
+        auto) set_val IP_VERSION "auto" ;;
+        *) set_val IP_VERSION "4" ;;
+      esac
+      do_restart; press_any_key ;;
+    2)
+      read -p "全局连接域名（如 node.example.com，输入 0 清除）: " d
+      d="$(echo "$d" | tr -d '[:space:]')"
+      [ "$d" = "0" ] && d=""
+      set_val SERVER_DOMAIN "$d"
+      do_restart; press_any_key ;;
+    3)
+      read -p "手动指定公网 IP（如 1.2.3.4，输入 0 清除）: " ip
+      ip="$(echo "$ip" | tr -d '[:space:]')"
+      [ "$ip" = "0" ] && ip=""
+      set_val PUBLIC_IP "$ip"
+      do_restart; press_any_key ;;
+    *) return ;;
+  esac
 }
 
 config_uuid() {
@@ -895,31 +952,57 @@ config_cert_bind() {
       press_any_key; return
     fi
     echo -e "${GRAY}可用域名证书: ${CYAN}$(echo "$avail" | tr '\n' ' ')${RESET}"
+    echo -e "${GRAY}当前连接域名: ${CYAN}$(get_val SERVER_DOMAIN || echo '使用公网IP')${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -e "${WHITE}1. Hysteria2  [${CYAN}$(get_val HY2_CERT_DOMAIN || echo '自签')${WHITE}]${RESET}"
     echo -e "${WHITE}2. TUIC       [${CYAN}$(get_val TUIC_CERT_DOMAIN || echo '自签')${WHITE}]${RESET}"
     echo -e "${WHITE}3. Trojan     [${CYAN}$(get_val TROJAN_CERT_DOMAIN || echo '自签')${WHITE}]${RESET}"
     echo -e "${WHITE}4. AnyTLS     [${CYAN}$(get_val ANYTLS_CERT_DOMAIN || echo '自签')${WHITE}]${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}5. 一键应用域名到全部协议并设为连接域名${RESET}"
+    echo -e "${WHITE}6. 一键恢复全部自签证书与公网 IP${RESET}"
     echo -e "${WHITE}0. 返回${RESET}"
     read -p "选择: " popt
-    local key=""
     case "$popt" in
-      1) key="HY2_CERT_DOMAIN" ;;
-      2) key="TUIC_CERT_DOMAIN" ;;
-      3) key="TROJAN_CERT_DOMAIN" ;;
-      4) key="ANYTLS_CERT_DOMAIN" ;;
+      1)
+        echo -ne "${WHITE}输入 Hysteria2 绑定的域名 (输入 0 恢复自签): ${RESET}"
+        read -r dopt
+        [ "$dopt" = "0" ] && set_val HY2_CERT_DOMAIN "" || { [ -n "$dopt" ] && set_val HY2_CERT_DOMAIN "$dopt"; }
+        do_restart; press_any_key ;;
+      2)
+        echo -ne "${WHITE}输入 TUIC 绑定的域名 (输入 0 恢复自签): ${RESET}"
+        read -r dopt
+        [ "$dopt" = "0" ] && set_val TUIC_CERT_DOMAIN "" || { [ -n "$dopt" ] && set_val TUIC_CERT_DOMAIN "$dopt"; }
+        do_restart; press_any_key ;;
+      3)
+        echo -ne "${WHITE}输入 Trojan 绑定的域名 (输入 0 恢复自签): ${RESET}"
+        read -r dopt
+        [ "$dopt" = "0" ] && set_val TROJAN_CERT_DOMAIN "" || { [ -n "$dopt" ] && set_val TROJAN_CERT_DOMAIN "$dopt"; }
+        do_restart; press_any_key ;;
+      4)
+        echo -ne "${WHITE}输入 AnyTLS 绑定的域名 (输入 0 恢复自签): ${RESET}"
+        read -r dopt
+        [ "$dopt" = "0" ] && set_val ANYTLS_CERT_DOMAIN "" || { [ -n "$dopt" ] && set_val ANYTLS_CERT_DOMAIN "$dopt"; }
+        do_restart; press_any_key ;;
+      5)
+        echo -ne "${WHITE}输入要一键应用的域名: ${RESET}"
+        read -r dopt
+        dopt="$(echo "$dopt" | tr -d '[:space:]')"
+        if [ -n "$dopt" ]; then
+          apply_domain_to_all_protos "$dopt"
+        fi
+        press_any_key ;;
+      6)
+        set_val SERVER_DOMAIN ""
+        set_val HY2_CERT_DOMAIN ""
+        set_val TUIC_CERT_DOMAIN ""
+        set_val TROJAN_CERT_DOMAIN ""
+        set_val ANYTLS_CERT_DOMAIN ""
+        echo -e "${GREEN}已恢复全部自签证书与公网 IP 连接模式！${RESET}"
+        do_restart; press_any_key ;;
       0) return ;;
       *) continue ;;
     esac
-    echo -e "${WHITE}输入要绑定的域名 (输入 0 恢复自签): ${RESET}"
-    read -r dopt
-    if [ "$dopt" = "0" ]; then
-      set_val "$key" ""
-    elif [ -n "$dopt" ]; then
-      set_val "$key" "$dopt"
-    fi
-    do_restart
-    press_any_key
   done
 }
 
@@ -1036,6 +1119,18 @@ EOF
   press_any_key
 }
 
+apply_domain_to_all_protos() {
+  local dom="$1"
+  [ -z "$dom" ] && return
+  set_val SERVER_DOMAIN "$dom"
+  set_val HY2_CERT_DOMAIN "$dom"
+  set_val TUIC_CERT_DOMAIN "$dom"
+  set_val TROJAN_CERT_DOMAIN "$dom"
+  set_val ANYTLS_CERT_DOMAIN "$dom"
+  echo -e "${GREEN}已将 ${CYAN}${dom}${GREEN} 设为全局连接域名，并绑定至全部直连协议！${RESET}"
+  do_restart
+}
+
 ensure_acme() {
   [ -x "$ACME_HOME/acme.sh" ] && return 0
   echo -e "${YELLOW}正在安装 acme.sh...${RESET}"
@@ -1060,6 +1155,7 @@ menu_domain_cert() {
     local certs
     certs="$(_list_domain_certs)"
     echo -e "${GRAY}已签发/导入证书:${RESET} ${CYAN}${certs:-无}${RESET}"
+    echo -e "${GRAY}当前连接域名:${RESET}   ${CYAN}$(get_val SERVER_DOMAIN || echo '使用公网IP')${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -e "${WHITE}1. 申请新域名证书 (HTTP-01)${RESET}"
     echo -e "${WHITE}2. 手动导入已有证书${RESET}"
@@ -1071,13 +1167,21 @@ menu_domain_cert() {
       1)
         ensure_acme || { warn "acme.sh 初始化失败"; press_any_key; continue; }
         read -p "域名（需已解析到本机 IP，80 端口可用）: " domain
+        domain="$(echo "$domain" | tr -d '[:space:]')"
         if [ -n "$domain" ]; then
           mkdir -p "$DOMAIN_CERT_DIR/$domain"
+          "$ACME_HOME/acme.sh" --home "$ACME_HOME" --register-account -m "admin@${domain}" --server letsencrypt >/dev/null 2>&1 || true
           if "$ACME_HOME/acme.sh" --home "$ACME_HOME" --issue -d "$domain" --standalone --httpport 80 --server letsencrypt --force; then
             "$ACME_HOME/acme.sh" --home "$ACME_HOME" --install-cert -d "$domain" \
               --key-file "$DOMAIN_CERT_DIR/$domain/key.pem" \
               --fullchain-file "$DOMAIN_CERT_DIR/$domain/cert.pem" >/dev/null 2>&1
-            echo -e "${GREEN}证书申请成功！可前往「修改配置 -> 协议证书绑定」使用${RESET}"
+            echo -e "${GREEN}证书申请成功！${RESET}"
+            echo -ne "${YELLOW}是否将此域名一键应用到全部直连协议（连接地址替换为域名并绑定证书）？[Y/n]: ${RESET}"
+            read -r _apply_all
+            case "$_apply_all" in
+              n|N) ;;
+              *) apply_domain_to_all_protos "$domain" ;;
+            esac
           else
             echo -e "${RED}申请失败，请确认域名解析及 80 端口未被占用${RESET}"
             rm -rf "$DOMAIN_CERT_DIR/$domain"
@@ -1087,29 +1191,51 @@ menu_domain_cert() {
         ;;
       2)
         read -p "域名标识: " domain
+        domain="$(echo "$domain" | tr -d '[:space:]')"
         read -p "cert.pem 绝对路径: " cpath
         read -p "key.pem 绝对路径: " kpath
-        if [ -f "$cpath" ] && [ -f "$kpath" ]; then
+        if [ -f "$cpath" ] && [ -f "$kpath" ] && [ -n "$domain" ]; then
           mkdir -p "$DOMAIN_CERT_DIR/$domain"
           cp "$cpath" "$DOMAIN_CERT_DIR/$domain/cert.pem"
           cp "$kpath" "$DOMAIN_CERT_DIR/$domain/key.pem"
           chmod 600 "$DOMAIN_CERT_DIR/$domain/key.pem"
           echo -e "${GREEN}证书导入成功！${RESET}"
+          echo -ne "${YELLOW}是否将此域名一键应用到全部直连协议（连接地址替换为域名并绑定证书）？[Y/n]: ${RESET}"
+          read -r _apply_all
+          case "$_apply_all" in
+            n|N) ;;
+            *) apply_domain_to_all_protos "$domain" ;;
+          esac
         fi
         press_any_key
         ;;
       3)
         read -p "要续期的域名: " domain
+        domain="$(echo "$domain" | tr -d '[:space:]')"
         if [ -d "$DOMAIN_CERT_DIR/$domain" ] && [ -x "$ACME_HOME/acme.sh" ]; then
-          "$ACME_HOME/acme.sh" --home "$ACME_HOME" --renew -d "$domain" --force --standalone --httpport 80
-          do_restart
+          echo -e "${YELLOW}正在续期证书...${RESET}"
+          if "$ACME_HOME/acme.sh" --home "$ACME_HOME" --renew -d "$domain" --force --standalone --httpport 80; then
+            "$ACME_HOME/acme.sh" --home "$ACME_HOME" --install-cert -d "$domain" \
+              --key-file "$DOMAIN_CERT_DIR/$domain/key.pem" \
+              --fullchain-file "$DOMAIN_CERT_DIR/$domain/cert.pem" >/dev/null 2>&1
+            echo -e "${GREEN}证书续期并同步更新成功！${RESET}"
+            do_restart
+          else
+            echo -e "${RED}续期失败，请确认 80 端口未被其他服务占用${RESET}"
+          fi
         fi
         press_any_key
         ;;
       4)
         read -p "要删除的域名: " domain
+        domain="$(echo "$domain" | tr -d '[:space:]')"
         rm -rf "$DOMAIN_CERT_DIR/$domain"
         [ -x "$ACME_HOME/acme.sh" ] && "$ACME_HOME/acme.sh" --home "$ACME_HOME" --remove -d "$domain" >/dev/null 2>&1 || true
+        [ "$(get_val SERVER_DOMAIN)" = "$domain" ] && set_val SERVER_DOMAIN ""
+        for k in HY2_CERT_DOMAIN TUIC_CERT_DOMAIN TROJAN_CERT_DOMAIN ANYTLS_CERT_DOMAIN; do
+          [ "$(get_val "$k")" = "$domain" ] && set_val "$k" ""
+        done
+        do_restart
         echo -e "${GREEN}已删除${RESET}"
         press_any_key
         ;;
@@ -1200,6 +1326,25 @@ do_uninstall() {
   exit 0
 }
 
+do_cron_renew() {
+  load_env_file
+  [ -d "$DOMAIN_CERT_DIR" ] || exit 0
+  [ -x "$ACME_HOME/acme.sh" ] || exit 0
+  local renewed=0
+  for d in "$DOMAIN_CERT_DIR"/*/; do
+    [ -d "$d" ] || continue
+    local dom
+    dom="$(basename "$d")"
+    if "$ACME_HOME/acme.sh" --home "$ACME_HOME" --renew -d "$dom" --standalone --httpport 80 >/dev/null 2>&1; then
+      "$ACME_HOME/acme.sh" --home "$ACME_HOME" --install-cert -d "$dom" \
+        --key-file "$DOMAIN_CERT_DIR/$dom/key.pem" \
+        --fullchain-file "$DOMAIN_CERT_DIR/$dom/cert.pem" >/dev/null 2>&1
+      renewed=1
+    fi
+  done
+  [ "$renewed" = "1" ] && do_restart
+}
+
 # ==============================================================================
 # 模块 4: 守护进程运行器 (do_run / 原 singbox.sh 核心主体)
 # ==============================================================================
@@ -1232,8 +1377,35 @@ do_run() {
   HY2_HOP_RANGE="${HY2_HOP_RANGE:-}"
   TUIC_EXTRA_PORTS="${TUIC_EXTRA_PORTS:-}"
   TUIC_HOP_RANGE="${TUIC_HOP_RANGE:-}"
+  IP_VERSION="${IP_VERSION:-4}"
+  SERVER_DOMAIN="${SERVER_DOMAIN:-}"
+  PUBLIC_IP="${PUBLIC_IP:-${IP:-}}"
   CF_PREFER_HOST="${CF_PREFER_HOST:-cdns.doon.eu.org}"
   WS_PATH="${WS_PATH:-/fengyue}"
+
+  setup_port_hop() {
+    [ "$(id -u)" = "0" ] || return 0
+    command -v nft >/dev/null 2>&1 && nft delete table inet singbox_hop 2>/dev/null || true
+    if command -v iptables >/dev/null 2>&1; then
+      iptables -t nat -F SINGBOX_HOP 2>/dev/null || true
+      iptables -t nat -D PREROUTING -j SINGBOX_HOP 2>/dev/null || true
+      iptables -t nat -X SINGBOX_HOP 2>/dev/null || true
+    fi
+
+    local _has_rule=0
+    if command -v iptables >/dev/null 2>&1; then
+      iptables -t nat -N SINGBOX_HOP 2>/dev/null || true
+      if [ -n "$HY2_PORT" ] && [ -n "$HY2_HOP_RANGE" ]; then
+        local s="${HY2_HOP_RANGE%%-*}" e="${HY2_HOP_RANGE##*-}"
+        iptables -t nat -A SINGBOX_HOP -p udp --dport "${s}:${e}" -j REDIRECT --to-ports "$HY2_PORT" 2>/dev/null && _has_rule=1
+      fi
+      if [ -n "$TUIC_PORT" ] && [ -n "$TUIC_HOP_RANGE" ]; then
+        local s="${TUIC_HOP_RANGE%%-*}" e="${TUIC_HOP_RANGE##*-}"
+        iptables -t nat -A SINGBOX_HOP -p udp --dport "${s}:${e}" -j REDIRECT --to-ports "$TUIC_PORT" 2>/dev/null && _has_rule=1
+      fi
+      [ "$_has_rule" = "1" ] && iptables -t nat -I PREROUTING -j SINGBOX_HOP 2>/dev/null || true
+    fi
+  }
 
   mkdir -p "$STATE_DIR" "$APP_DIR"
   chmod 700 "$STATE_DIR" 2>/dev/null || true
@@ -1275,6 +1447,7 @@ do_run() {
     _hexesc="$(printf '%s' "$_hex" | sed 's/\(..\)/\\x\1/g')"
     SS_PASS="$(printf "$_hexesc" | openssl base64 -A 2>/dev/null)" || SS_PASS=""
   fi
+  [ -z "$SS_PASS" ] && SS_PASS="$(head -c 16 /dev/urandom 2>/dev/null | b64)"
 
   case "$(uname -m)" in
     x86_64|amd64)  SB_ARCH="amd64";  CF_ARCH="linux-amd64"; KM_ARCH="linux-amd64" ;;
@@ -1364,9 +1537,14 @@ do_run() {
   fi
   NAME_ENCODED="$(url_encode "$NAME")"
 
-  PUBLIC_IP=""
-  if [ -n "$HY2_PORT" ] || [ -n "$TUIC_PORT" ] || [ -n "$REALITY_PORT" ] || [ -n "$SS_PORT" ] || [ -n "$SOCKS5_PORT" ] || [ -n "$TROJAN_PORT" ] || [ -n "$ANYTLS_PORT" ]; then
-    for _ipsrc in 'https://ipinfo.io/ip' 'https://ifconfig.co/ip' 'https://api64.ipify.org'; do
+  if [ -z "$PUBLIC_IP" ] && { [ -n "$HY2_PORT" ] || [ -n "$TUIC_PORT" ] || [ -n "$REALITY_PORT" ] || [ -n "$SS_PORT" ] || [ -n "$SOCKS5_PORT" ] || [ -n "$TROJAN_PORT" ] || [ -n "$ANYTLS_PORT" ]; }; then
+    local _sources=()
+    if [ "$IP_VERSION" = "6" ]; then
+      _sources=('https://api6.ipify.org' 'https://api64.ipify.org' 'https://ifconfig.co/ip')
+    else
+      _sources=('https://api.ipify.org' 'https://ipinfo.io/ip' 'https://ifconfig.co/ip' 'https://icanhazip.com' 'https://api64.ipify.org')
+    fi
+    for _ipsrc in "${_sources[@]}"; do
       _cand="$(http_get "$_ipsrc" | tr -d '[:space:]')"
       if valid_ip "$_cand"; then PUBLIC_IP="$_cand"; break; fi
     done
@@ -1662,6 +1840,7 @@ do_run() {
   }
 
   start_singbox || die "sing-box 启动失败"
+  setup_port_hop
 
   ARGO_HOST=""
   CF_PID=""
@@ -1698,9 +1877,13 @@ do_run() {
       ALL_LINKS="vmess://$(b64 "$VMESS_JSON")"
     fi
 
-    if [ "$HY2_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+    # 全局直连连接主机名：优先使用自定义连接域名，留空则使用公网 IP
+    local NODE_HOST="${SERVER_DOMAIN:-}"
+    [ -z "$NODE_HOST" ] && [ -n "$PUBLIC_IP" ] && NODE_HOST="$(format_addr "$PUBLIC_IP")"
+
+    if [ "$HY2_ACTIVE" = "1" ] && [ -n "$NODE_HOST" ]; then
       local _h_addr _h_sni _h_insec
-      [ "$HY2_TLS_INSECURE" = "0" ] && { _h_addr="$HY2_TLS_SNI"; _h_sni="$HY2_TLS_SNI"; _h_insec="0"; } || { _h_addr="$(format_addr "$PUBLIC_IP")"; _h_sni="www.bing.com"; _h_insec="1"; }
+      [ "$HY2_TLS_INSECURE" = "0" ] && { _h_addr="${HY2_TLS_SNI:-$NODE_HOST}"; _h_sni="$HY2_TLS_SNI"; _h_insec="0"; } || { _h_addr="$NODE_HOST"; _h_sni="www.bing.com"; _h_insec="1"; }
       for _p in $HY2_ACTIVE_PORTS; do
         local _link="hysteria2://${UUID}@${_h_addr}:${_p}?sni=${_h_sni}&insecure=${_h_insec}&alpn=h3&obfs=none#${NAME_ENCODED}"
         ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
@@ -1708,9 +1891,9 @@ do_run() {
       done
     fi
 
-    if [ "$TUIC_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+    if [ "$TUIC_ACTIVE" = "1" ] && [ -n "$NODE_HOST" ]; then
       local _t_addr _t_sni _t_insec
-      [ "$TUIC_TLS_INSECURE" = "0" ] && { _t_addr="$TUIC_TLS_SNI"; _t_sni="$TUIC_TLS_SNI"; _t_insec="0"; } || { _t_addr="$(format_addr "$PUBLIC_IP")"; _t_sni="www.bing.com"; _t_insec="1"; }
+      [ "$TUIC_TLS_INSECURE" = "0" ] && { _t_addr="${TUIC_TLS_SNI:-$NODE_HOST}"; _t_sni="$TUIC_TLS_SNI"; _t_insec="0"; } || { _t_addr="$NODE_HOST"; _t_sni="www.bing.com"; _t_insec="1"; }
       for _p in $TUIC_ACTIVE_PORTS; do
         local _link="tuic://${UUID}:${UUID}@${_t_addr}:${_p}?sni=${_t_sni}&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=${_t_insec}#${NAME_ENCODED}"
         ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
@@ -1718,39 +1901,39 @@ do_run() {
       done
     fi
 
-    if [ "$REALITY_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ] && [ -n "$REALITY_PUB" ]; then
-      local _link="vless://${UUID}@$(format_addr "$PUBLIC_IP"):${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=firefox&pbk=${REALITY_PUB}&type=tcp&headerType=none#${NAME_ENCODED}"
+    if [ "$REALITY_ACTIVE" = "1" ] && [ -n "$NODE_HOST" ] && [ -n "$REALITY_PUB" ]; then
+      local _link="vless://${UUID}@${NODE_HOST}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=firefox&pbk=${REALITY_PUB}&type=tcp&headerType=none#${NAME_ENCODED}"
       ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
     fi
 
-    if [ "$SS_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+    if [ "$SS_ACTIVE" = "1" ] && [ -n "$NODE_HOST" ]; then
       local SS_USERINFO
       SS_USERINFO="$(b64 "2022-blake3-aes-128-gcm:${SS_PASS}")"
-      local _link="ss://${SS_USERINFO}@$(format_addr "$PUBLIC_IP"):${SS_PORT}#${NAME_ENCODED}"
+      local _link="ss://${SS_USERINFO}@${NODE_HOST}:${SS_PORT}#${NAME_ENCODED}"
       ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
     fi
 
-    if [ "$SOCKS5_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+    if [ "$SOCKS5_ACTIVE" = "1" ] && [ -n "$NODE_HOST" ]; then
       local S5_USERINFO
       S5_USERINFO="$(b64 "${SOCKS5_USER}:${SOCKS5_PASS}")"
-      local _link="socks://${S5_USERINFO}@$(format_addr "$PUBLIC_IP"):${SOCKS5_PORT}#${NAME_ENCODED}"
+      local _link="socks://${S5_USERINFO}@${NODE_HOST}:${SOCKS5_PORT}#${NAME_ENCODED}"
       ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
     fi
 
-    if [ "$TROJAN_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+    if [ "$TROJAN_ACTIVE" = "1" ] && [ -n "$NODE_HOST" ]; then
       local _tr_addr _tr_sni _tr_insec
-      [ "$TROJAN_TLS_INSECURE" = "0" ] && { _tr_addr="$TROJAN_TLS_SNI"; _tr_sni="$TROJAN_TLS_SNI"; _tr_insec="0"; } || { _tr_addr="$(format_addr "$PUBLIC_IP")"; _tr_sni="bing.com"; _tr_insec="1"; }
+      [ "$TROJAN_TLS_INSECURE" = "0" ] && { _tr_addr="${TROJAN_TLS_SNI:-$NODE_HOST}"; _tr_sni="$TROJAN_TLS_SNI"; _tr_insec="0"; } || { _tr_addr="$NODE_HOST"; _tr_sni="bing.com"; _tr_insec="1"; }
       local _link="trojan://${UUID}@${_tr_addr}:${TROJAN_PORT}?security=tls&sni=${_tr_sni}&allowInsecure=${_tr_insec}&fp=firefox#${NAME_ENCODED}"
       ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
     fi
 
-    if [ "$ANYTLS_ACTIVE" = "1" ] && [ -n "$PUBLIC_IP" ]; then
+    if [ "$ANYTLS_ACTIVE" = "1" ] && [ -n "$NODE_HOST" ]; then
       local _at_addr _at_sni _at_insec
-      [ "$ANYTLS_TLS_INSECURE" = "0" ] && { _at_addr="$ANYTLS_TLS_SNI"; _at_sni="$ANYTLS_TLS_SNI"; _at_insec="0"; } || { _at_addr="$(format_addr "$PUBLIC_IP")"; _at_sni="bing.com"; _at_insec="1"; }
+      [ "$ANYTLS_TLS_INSECURE" = "0" ] && { _at_addr="${ANYTLS_TLS_SNI:-$NODE_HOST}"; _at_sni="$ANYTLS_TLS_SNI"; _at_insec="0"; } || { _at_addr="$NODE_HOST"; _at_sni="bing.com"; _at_insec="1"; }
       local _link="anytls://${UUID}@${_at_addr}:${ANYTLS_PORT}?sni=${_at_sni}&insecure=${_at_insec}#${NAME_ENCODED}"
       ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
@@ -1850,6 +2033,9 @@ case "$CMD" in
     ;;
   stop)
     do_stop
+    ;;
+  renew-cron|cron-renew)
+    do_cron_renew
     ;;
   run|daemon|start)
     shift; do_run "$@"
