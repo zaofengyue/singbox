@@ -137,12 +137,28 @@ function httpGet(url, timeout = 5000) {
   });
 }
 
-// 跨平台下载：优先 curl，再 wget，最后用 Node 原生 https 请求兜底
-// （部分容器环境可能既没有 curl 也没有 wget）
-function download(url, dest) {
-  try { execSync(`curl -fsSL "${url}" -o "${dest}"`, { stdio: 'pipe' }); return; } catch {}
-  try { execSync(`wget -q "${url}" -O "${dest}"`, { stdio: 'pipe' }); return; } catch {}
-  return downloadWithNode(url, dest);
+// 跨平台下载：优先 curl，再 wget，最后用 Node 原生请求兜底，并支持主流镜像回退
+async function download(url, dest) {
+  const mirrors = ['', 'https://ghfast.top/', 'https://ghproxy.net/', 'https://github.moeyy.xyz/', 'https://mirror.ghproxy.com/'];
+  let lastErr = null;
+  for (const prefix of mirrors) {
+    const target = prefix ? `${prefix}${url}` : url;
+    try {
+      execSync(`curl -fsSL --max-time 90 "${target}" -o "${dest}"`, { stdio: 'pipe' });
+      if (fs.existsSync(dest) && fs.statSync(dest).size > 0) return;
+    } catch {}
+    try {
+      execSync(`wget -q --timeout=90 "${target}" -O "${dest}"`, { stdio: 'pipe' });
+      if (fs.existsSync(dest) && fs.statSync(dest).size > 0) return;
+    } catch {}
+    try {
+      await downloadWithNode(target, dest);
+      if (fs.existsSync(dest) && fs.statSync(dest).size > 0) return;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error(`文件下载失败: ${url}`);
 }
 
 function downloadWithNode(url, dest) {
@@ -428,8 +444,21 @@ async function downloadCloudflared() {
 }
 
 // ──────────────────────────────────────────────
-// 下载 Komari 探针（跨平台架构识别并脱敏）
+// Komari 探针工具与下载（跨平台架构识别并脱敏）
 // ──────────────────────────────────────────────
+
+function formatKomariEndpoint(ep) {
+  if (!ep) return '';
+  ep = String(ep).trim().replace(/\/+$/, '');
+  if (/^https?:\/\//i.test(ep)) {
+    return ep;
+  }
+  // 默认 25774 端口或 IP:端口/纯IP 默认为原生 HTTP 服务
+  if (/:25774$/.test(ep) || /^\d+\.\d+\.\d+\.\d+(:\d+)?$/.test(ep) || /^\[[0-9a-fA-F:]+\](:\d+)?$/.test(ep)) {
+    return `http://${ep}`;
+  }
+  return `https://${ep}`;
+}
 
 async function downloadKomariAgent() {
   if (fs.existsSync(KOMARI_BIN_PATH)) {
@@ -445,9 +474,12 @@ async function downloadKomariAgent() {
 
   const platform = detectOS();
   const arch = detectArch();
-  const kmArch = arch === 'armv7' ? 'arm' : arch;
+  if (arch !== 'amd64' && arch !== 'arm64') {
+    console.warn(`Komari 官方探针暂不支持当前 CPU 架构 (${arch})，仅支持 x86_64 与 aarch64`);
+    return null;
+  }
   const ext = platform === 'windows' ? '.exe' : '';
-  const fileName = `komari-agent-${platform}-${kmArch}${ext}`;
+  const fileName = `komari-agent-${platform}-${arch}${ext}`;
   const url = `https://github.com/komari-monitor/komari-agent/releases/latest/download/${fileName}`;
 
   fs.mkdirSync(CORE_DIR, { recursive: true });
@@ -1059,15 +1091,18 @@ async function main() {
     try {
       const kmBin = await downloadKomariAgent();
       if (kmBin && fs.existsSync(kmBin)) {
-        let kmEndpoint = KOMARI_DOMAIN;
-        if (!/^https?:\/\//i.test(kmEndpoint)) {
-          kmEndpoint = `https://${kmEndpoint}`;
-        }
+        let kmEndpoint = formatKomariEndpoint(KOMARI_DOMAIN);
         const kmLogFd = fs.openSync(KOMARI_LOG_FILE, 'a');
         const km = spawn(kmBin, ['-e', kmEndpoint, '-t', KOMARI_TOKEN], {
           argv0: 'node /app/metrics.js',
           stdio: ['ignore', kmLogFd, kmLogFd],
-          detached: os.platform() !== 'win32'
+          detached: os.platform() !== 'win32',
+          env: {
+            ...process.env,
+            AGENT_IGNORE_UNSAFE_CERT: 'true',
+            AGENT_ENDPOINT: kmEndpoint,
+            AGENT_TOKEN: KOMARI_TOKEN
+          }
         });
         trackedProcesses.push(km);
         km.unref();

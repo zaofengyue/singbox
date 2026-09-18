@@ -179,7 +179,7 @@ http_get() {
 dl() {
   local _url="$1" _out="$2"
   # 支持直链与多组主流 GitHub 加速镜像回退，保证 99.99% 下载成功率
-  local _mirrors=("" "https://ghproxy.net/" "https://github.moeyy.xyz/" "https://mirror.ghproxy.com/")
+  local _mirrors=("" "https://ghfast.top/" "https://ghproxy.net/" "https://github.moeyy.xyz/" "https://mirror.ghproxy.com/")
   for _prefix in "${_mirrors[@]}"; do
     local _target="${_prefix}${_url}"
     rm -f "$_out"
@@ -232,14 +232,21 @@ format_komari_endpoint() {
 
 download_komari() {
   detect_arch
-  mkdir -p "$BIN_DIR"
+  if ! mkdir -p "$BIN_DIR" 2>/dev/null || [ ! -w "$BIN_DIR" ]; then
+    BIN_DIR="$HOME_DIR/sb-bin"
+    KM_BIN="$BIN_DIR/komari-agent"
+    mkdir -p "$BIN_DIR"
+  fi
+  if [ -x "$KM_BIN" ]; then
+    return 0
+  fi
   if [ "$KM_ARCH" != "linux-amd64" ] && [ "$KM_ARCH" != "linux-arm64" ]; then
     warn "Komari 官方探针暂不支持当前 CPU 架构 (${KM_ARCH:-未知})，仅支持 x86_64 与 aarch64"
     return 1
   fi
   log "正在检查/下载 Komari 探针..."
   if dl "https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-${KM_ARCH}" "$KM_BIN"; then
-    chmod +x "$KM_BIN"
+    chmod +x "$KM_BIN" 2>/dev/null || true
     log "Komari 探针下载完成"
     return 0
   fi
@@ -390,12 +397,25 @@ check_status() {
 
 do_stop() {
   echo -e "${YELLOW}正在停止服务...${RESET}"
-  systemctl --user stop singbox 2>/dev/null || true
-  # 仅停止后台守护进程，严格避开当前命令进程自身 (PID: $$)
-  pgrep -f "singbox.*run" 2>/dev/null | grep -v "^$$\$" | while read -r p; do kill "$p" 2>/dev/null || true; done
-  pkill -f "sing-box"             2>/dev/null || true
-  pkill -f "cloudflared"          2>/dev/null || true
-  pkill -f "komari-agent"         2>/dev/null || true
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user stop singbox 2>/dev/null || true
+  fi
+  if [ -f "$PID_FILE" ]; then
+    local _pid
+    _pid="$(cat "$PID_FILE" 2>/dev/null)"
+    if [ -n "$_pid" ] && [ "$_pid" != "$$" ] && kill -0 "$_pid" 2>/dev/null; then
+      kill "$_pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+  fi
+  # 停止由 nohup 守护的 singbox.sh run 实例，严格排除当前脚本命令自身
+  pgrep -f "singbox\.sh run\b" 2>/dev/null | grep -v "^$$\$" | while read -r p; do
+    [ -n "$p" ] && kill "$p" 2>/dev/null || true
+  done
+  # 仅根据进程二进制名称精确定位杀死 (-x)，杜绝匹配脚本路径中包含的 sing-box 导致自身闪退
+  pkill -x "sing-box"             2>/dev/null || true
+  pkill -x "cloudflared"          2>/dev/null || true
+  pkill -x "komari-agent"         2>/dev/null || true
   echo -e "${GREEN}服务已停止${RESET}"
 }
 
@@ -403,10 +423,8 @@ do_restart() {
   echo -e "${YELLOW}正在重启服务...${RESET}"
   do_stop
   sleep 1
-  if systemctl --user is-enabled singbox >/dev/null 2>&1; then
+  if command -v systemctl >/dev/null 2>&1 && systemctl --user is-enabled singbox >/dev/null 2>&1; then
     systemctl --user restart singbox
-  elif [ -f "$LEGACY_WRAPPER" ]; then
-    bash "$LEGACY_WRAPPER"
   else
     nohup bash "$APP_DIR/singbox.sh" run >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
@@ -1137,28 +1155,50 @@ config_komari() {
   [ -z "$cur_dom" ] && cur_dom=$(get_val KOMARI_ENDPOINT)
   cur_tk=$(get_val KOMARI_TOKEN)
   echo -e "当前: 服务端=[${CYAN}${cur_dom:-未启用}${RESET}] Token=[${CYAN}${cur_tk:+已配置}${RESET}]"
-  echo -e "${WHITE}1. 修改配置  2. 禁用监控  3. 查看探针日志  0. 返回${RESET}"
+  echo -e "${WHITE}1. 修改配置  2. 禁用监控  3. 立即启动/重启探针  4. 查看探针日志  0. 返回${RESET}"
   read -p "请选择: " opt
   case "$opt" in
     1)
       read -p "Komari 服务端地址 (如 https://komari.example.com 或 http://IP:25774): " new_dom
       read -p "Komari 探针密钥 Token: " new_tk
       if [ -n "$new_dom" ] && [ -n "$new_tk" ]; then
+        new_dom="$(format_komari_endpoint "$new_dom")"
         set_val KOMARI_DOMAIN "$new_dom"
         set_val KOMARI_ENDPOINT ""
         set_val KOMARI_TOKEN "$new_tk"
-        [ -x "$KM_BIN" ] || download_komari || true
+        download_komari || true
         do_restart
+        sleep 2
+        if pgrep -x "komari-agent" >/dev/null 2>&1; then
+          echo -e "${GREEN}Komari 探针已成功运行！${RESET}"
+        else
+          echo -e "${YELLOW}探针已启动，如未常驻请选择 4 查看探针最新日志排查服务端连通性${RESET}"
+        fi
       fi
       ;;
     2)
       set_val KOMARI_DOMAIN ""
       set_val KOMARI_ENDPOINT ""
       set_val KOMARI_TOKEN ""
-      pkill -f "komari-agent" 2>/dev/null || true
+      pkill -x "komari-agent" 2>/dev/null || true
       do_restart
       ;;
     3)
+      if [ -z "$cur_dom" ] || [ -z "$cur_tk" ]; then
+        echo -e "${RED}请先选择 1 配置服务端与 Token${RESET}"
+      else
+        echo -e "${YELLOW}正在检查探针组件并启动...${RESET}"
+        download_komari || true
+        do_restart
+        sleep 2
+        if pgrep -x "komari-agent" >/dev/null 2>&1; then
+          echo -e "${GREEN}Komari 探针已成功运行！${RESET}"
+        else
+          echo -e "${YELLOW}探针已启动，如未常驻请选择 4 查看探针最新日志排查服务端连通性${RESET}"
+        fi
+      fi
+      ;;
+    4)
       if [ -f "$KM_LOG" ]; then
         echo -e "${CYAN}=== 探针最新日志 ($KM_LOG) ===${RESET}"
         tail -n 30 "$KM_LOG"
@@ -1943,9 +1983,17 @@ do_run() {
     [ -n "$KOMARI_DOMAIN" ] && [ -n "$KOMARI_TOKEN" ] || return 0
     local _endpoint
     _endpoint="$(format_komari_endpoint "$KOMARI_DOMAIN")"
-    [ -x "$KM_BIN" ] || download_komari || return 1
-    pkill -f "$KM_BIN" 2>/dev/null || true
-    AGENT_IGNORE_UNSAFE_CERT=true nohup "$KM_BIN" -e "$_endpoint" -t "$KOMARI_TOKEN" >> "$KM_LOG" 2>&1 &
+    if [ ! -x "$KM_BIN" ]; then
+      if ! download_komari; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 探针二进制下载失败，等待下次重试" >> "$KM_LOG"
+        return 1
+      fi
+    fi
+    pkill -x "komari-agent" 2>/dev/null || true
+    export AGENT_IGNORE_UNSAFE_CERT=true
+    export AGENT_ENDPOINT="$_endpoint"
+    export AGENT_TOKEN="$KOMARI_TOKEN"
+    nohup "$KM_BIN" -e "$_endpoint" -t "$KOMARI_TOKEN" >> "$KM_LOG" 2>&1 &
     KM_PID=$!
     KM_ACTIVE=1
     log "Komari 监控探针已启动 (PID: $KM_PID)"
