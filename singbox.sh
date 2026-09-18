@@ -148,6 +148,9 @@ ensure_basic_deps() {
   command -v tar     >/dev/null 2>&1 || _missing="$_missing tar"
   command -v openssl >/dev/null 2>&1 || _missing="$_missing openssl"
   command -v socat   >/dev/null 2>&1 || _missing="$_missing socat"
+  if command -v apk >/dev/null 2>&1; then
+    _missing="$_missing libc6-compat gcompat ca-certificates"
+  fi
   [ -z "$_missing" ] && return 0
 
   warn "检测到缺少基础工具:${_missing}，尝试自动安装..."
@@ -194,6 +197,53 @@ dl() {
       return 0
     fi
   done
+  return 1
+}
+
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)  SB_ARCH="amd64";  CF_ARCH="linux-amd64"; KM_ARCH="linux-amd64" ;;
+    aarch64|arm64) SB_ARCH="arm64";  CF_ARCH="linux-arm64"; KM_ARCH="linux-arm64" ;;
+    armv7*|armv6*) SB_ARCH="armv7";  CF_ARCH="linux-arm";   KM_ARCH="linux-arm"   ;;
+    i386|i686)     SB_ARCH="386";    CF_ARCH="linux-386";   KM_ARCH="linux-386"   ;;
+    *)             SB_ARCH="amd64";  CF_ARCH="linux-amd64"; KM_ARCH="linux-amd64" ;;
+  esac
+}
+detect_arch
+
+format_komari_endpoint() {
+  local ep="$1"
+  # 剔除首尾空白与末尾斜杠
+  ep="$(printf '%s' "$ep" | tr -d ' \r\n' | sed 's|/*$||')"
+  case "$ep" in
+    http://*|https://*)
+      ;;
+    *:25774|[0-9]*.[0-9]*.[0-9]*.[0-9]*:*|[0-9]*.[0-9]*.[0-9]*.[0-9]*)
+      # 默认 25774 端口或纯 IP 通常为 HTTP 无证书服务
+      ep="http://$ep"
+      ;;
+    *)
+      # 域名默认走 HTTPS
+      ep="https://$ep"
+      ;;
+  esac
+  printf '%s' "$ep"
+}
+
+download_komari() {
+  detect_arch
+  mkdir -p "$BIN_DIR"
+  if [ "$KM_ARCH" != "linux-amd64" ] && [ "$KM_ARCH" != "linux-arm64" ]; then
+    warn "Komari 官方探针暂不支持当前 CPU 架构 (${KM_ARCH:-未知})，仅支持 x86_64 与 aarch64"
+    return 1
+  fi
+  log "正在检查/下载 Komari 探针..."
+  if dl "https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-${KM_ARCH}" "$KM_BIN"; then
+    chmod +x "$KM_BIN"
+    log "Komari 探针下载完成"
+    return 0
+  fi
+  warn "Komari 探针下载失败"
   return 1
 }
 
@@ -543,7 +593,7 @@ do_install() {
 
     echo ""
     echo -e "${YELLOW}--- Komari 监控探针（可选）---${NC}"
-    read -p "Komari 服务端域名（如 komari.example.com，留空跳过）: " IN_KOMARI_DOMAIN
+    read -p "Komari 服务端地址（如 https://komari.example.com 或 http://IP:25774，留空跳过）: " IN_KOMARI_DOMAIN
     if [ -n "$IN_KOMARI_DOMAIN" ]; then
       read -p "Komari 探针密钥 Token: " IN_KOMARI_TOKEN
     fi
@@ -705,16 +755,48 @@ do_sub() {
 
 do_log() {
   clear
-  echo -e "${GREEN}======= 运行日志（Ctrl+C 退出）=======${RESET}"
-  echo ""
-  if systemctl --user is-active singbox >/dev/null 2>&1; then
-    journalctl --user -u singbox -n 50 -f
-  elif [ -f "$LOG_FILE" ]; then
-    tail -n 50 -f "$LOG_FILE"
-  else
-    echo -e "${RED}未找到日志文件${RESET}"
-    press_any_key
-  fi
+  echo -e "${GREEN}======= 查看日志（Ctrl+C 退出）=======${RESET}"
+  echo -e "${WHITE}1. sing-box 核心运行日志${RESET}"
+  echo -e "${WHITE}2. cloudflared Argo 隧道日志${RESET}"
+  echo -e "${WHITE}3. Komari 探针日志${RESET}"
+  echo -e "${WHITE}0. 返回${RESET}"
+  echo -e "${GRAY}--------------------------------${RESET}"
+  read -p "请选择: " log_opt
+  case "$log_opt" in
+    1)
+      clear
+      echo -e "${GREEN}=== sing-box 核心日志 ===${RESET}"
+      if systemctl --user is-active singbox >/dev/null 2>&1; then
+        journalctl --user -u singbox -n 50 -f
+      elif [ -f "$LOG_FILE" ]; then
+        tail -n 50 -f "$LOG_FILE"
+      else
+        echo -e "${RED}未找到核心日志文件 ($LOG_FILE)${RESET}"
+        press_any_key
+      fi
+      ;;
+    2)
+      clear
+      echo -e "${GREEN}=== cloudflared Argo 隧道日志 ===${RESET}"
+      if [ -f "$CF_LOG" ]; then
+        tail -n 50 -f "$CF_LOG"
+      else
+        echo -e "${RED}未找到 Argo 日志文件 ($CF_LOG)${RESET}"
+        press_any_key
+      fi
+      ;;
+    3)
+      clear
+      echo -e "${GREEN}=== Komari 探针监控日志 ===${RESET}"
+      if [ -f "$KM_LOG" ]; then
+        tail -n 50 -f "$KM_LOG"
+      else
+        echo -e "${RED}未找到探针日志文件 ($KM_LOG)${RESET}"
+        press_any_key
+      fi
+      ;;
+    *) return ;;
+  esac
 }
 
 menu_config() {
@@ -1054,17 +1136,18 @@ config_komari() {
   cur_dom=$(get_val KOMARI_DOMAIN)
   [ -z "$cur_dom" ] && cur_dom=$(get_val KOMARI_ENDPOINT)
   cur_tk=$(get_val KOMARI_TOKEN)
-  echo -e "当前: 域名=[${CYAN}${cur_dom:-未启用}${RESET}] Token=[${CYAN}${cur_tk:+已配置}${RESET}]"
-  echo -e "${WHITE}1. 修改配置  2. 禁用监控  0. 返回${RESET}"
+  echo -e "当前: 服务端=[${CYAN}${cur_dom:-未启用}${RESET}] Token=[${CYAN}${cur_tk:+已配置}${RESET}]"
+  echo -e "${WHITE}1. 修改配置  2. 禁用监控  3. 查看探针日志  0. 返回${RESET}"
   read -p "请选择: " opt
   case "$opt" in
     1)
-      read -p "Komari 服务端域名 (如 komari.example.com): " new_dom
+      read -p "Komari 服务端地址 (如 https://komari.example.com 或 http://IP:25774): " new_dom
       read -p "Komari 探针密钥 Token: " new_tk
       if [ -n "$new_dom" ] && [ -n "$new_tk" ]; then
         set_val KOMARI_DOMAIN "$new_dom"
         set_val KOMARI_ENDPOINT ""
         set_val KOMARI_TOKEN "$new_tk"
+        [ -x "$KM_BIN" ] || download_komari || true
         do_restart
       fi
       ;;
@@ -1074,6 +1157,14 @@ config_komari() {
       set_val KOMARI_TOKEN ""
       pkill -f "komari-agent" 2>/dev/null || true
       do_restart
+      ;;
+    3)
+      if [ -f "$KM_LOG" ]; then
+        echo -e "${CYAN}=== 探针最新日志 ($KM_LOG) ===${RESET}"
+        tail -n 30 "$KM_LOG"
+      else
+        echo -e "${RED}暂无探针日志文件 ($KM_LOG)${RESET}"
+      fi
       ;;
   esac
   press_any_key
@@ -1505,16 +1596,6 @@ do_run() {
     return 1
   }
 
-  download_komari() {
-    log "正在下载 Komari 探针..."
-    if dl "https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-${KM_ARCH}" "$KM_BIN"; then
-      chmod +x "$KM_BIN"
-      return 0
-    fi
-    warn "Komari 探针下载失败"
-    return 1
-  }
-
   pkill -f "$SB_BIN" 2>/dev/null || true
   pkill -f "$CF_BIN" 2>/dev/null || true
   pkill -f "$KM_BIN" 2>/dev/null || true
@@ -1856,6 +1937,22 @@ do_run() {
   start_singbox || die "sing-box 启动失败"
   setup_port_hop
 
+  KM_PID=""
+  KM_ACTIVE=0
+  start_komari() {
+    [ -n "$KOMARI_DOMAIN" ] && [ -n "$KOMARI_TOKEN" ] || return 0
+    local _endpoint
+    _endpoint="$(format_komari_endpoint "$KOMARI_DOMAIN")"
+    [ -x "$KM_BIN" ] || download_komari || return 1
+    pkill -f "$KM_BIN" 2>/dev/null || true
+    AGENT_IGNORE_UNSAFE_CERT=true nohup "$KM_BIN" -e "$_endpoint" -t "$KOMARI_TOKEN" >> "$KM_LOG" 2>&1 &
+    KM_PID=$!
+    KM_ACTIVE=1
+    log "Komari 监控探针已启动 (PID: $KM_PID)"
+    return 0
+  }
+  start_komari || true
+
   ARGO_HOST=""
   CF_PID=""
   start_cloudflared() {
@@ -1969,21 +2066,6 @@ do_run() {
     generate_sub
   fi
 
-  KM_ACTIVE=0
-  if [ -n "$KOMARI_DOMAIN" ] && [ -n "$KOMARI_TOKEN" ]; then
-    local KM_ENDPOINT="$KOMARI_DOMAIN"
-    case "$KM_ENDPOINT" in
-      http://*|https://*) : ;;
-      *) KM_ENDPOINT="https://$KM_ENDPOINT" ;;
-    esac
-    if [ -x "$KM_BIN" ]; then
-      nohup "$KM_BIN" -e "$KM_ENDPOINT" -t "$KOMARI_TOKEN" >> "$KM_LOG" 2>&1 &
-      KM_PID=$!
-      KM_ACTIVE=1
-      log "Komari 监控探针已启动 (PID: $KM_PID)"
-    fi
-  fi
-
   log "进入后台守护看门狗状态..."
   local SB_FAIL=0 CF_FAIL=0
   while true; do
@@ -2006,8 +2088,8 @@ do_run() {
     if [ "${KM_ACTIVE}" = "1" ]; then
       if [ -z "$KM_PID" ] || ! kill -0 "$KM_PID" 2>/dev/null; then
         warn "Komari 探针异常退出，正在重启..."
-        nohup "$KM_BIN" -e "$KM_ENDPOINT" -t "$KOMARI_TOKEN" >> "$KM_LOG" 2>&1 &
-        KM_PID=$!
+        sleep 2
+        start_komari || true
       fi
     fi
 
