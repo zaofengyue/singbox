@@ -22,7 +22,7 @@ fi
 
 export TERM="${TERM:-xterm}"
 export LANG="${LANG:-C.UTF-8}"
-export LC_ALL="${LANG:-C.UTF-8}"
+export LC_ALL="${LC_ALL:-C.UTF-8}"
 
 # ── 颜色与输出定义 ────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
@@ -147,14 +147,12 @@ ensure_basic_deps() {
   command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || _missing="$_missing curl"
   command -v tar     >/dev/null 2>&1 || _missing="$_missing tar"
   command -v openssl >/dev/null 2>&1 || _missing="$_missing openssl"
-  command -v socat   >/dev/null 2>&1 || _missing="$_missing socat"
-  if command -v apk >/dev/null 2>&1; then
-    _missing="$_missing libc6-compat gcompat ca-certificates"
-  fi
+  # ca-certificates 没有对应的可执行命令，用证书目录探测大致是否已装
+  [ -d /etc/ssl/certs ] || _missing="$_missing ca-certificates"
   [ -z "$_missing" ] && return 0
 
   warn "检测到缺少基础工具:${_missing}，尝试自动安装..."
-  try_install_pkg "$_missing ca-certificates"
+  try_install_pkg "$_missing"
   if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
     die "缺少 curl/wget 且自动安装失败。Alpine: apk add --no-cache curl；Debian/Ubuntu: apt-get install -y curl"
   fi
@@ -673,15 +671,22 @@ SVCEOF
     systemctl --user daemon-reload
     systemctl --user enable singbox
     systemctl --user restart singbox
-    loginctl enable-linger "$USER" 2>/dev/null || true
-    (crontab -l 2>/dev/null | grep -v "singbox" ; echo "0 3 * * * bash $APP_DIR/singbox.sh renew-cron >> $LOG_FILE 2>&1") | crontab - 2>/dev/null || true
+    if command -v crontab >/dev/null 2>&1; then
+      (crontab -l 2>/dev/null | grep -v "singbox" ; echo "0 3 * * * bash $APP_DIR/singbox.sh renew-cron >> $LOG_FILE 2>&1") | crontab - 2>/dev/null || true
+    else
+      warn "未检测到 crontab，系统级续期任务未注册，已启用常驻进程内的每日检查作为兜底"
+    fi
     echo ""
     log "服务已通过用户级 systemd 启动并设置开机自启（证书自动续期已配置）"
   else
     do_restart
-    (crontab -l 2>/dev/null | grep -v "singbox" ; \
-     echo "@reboot sleep 20 && bash $APP_DIR/singbox.sh run >> $LOG_FILE 2>&1" ; \
-     echo "0 3 * * * bash $APP_DIR/singbox.sh renew-cron >> $LOG_FILE 2>&1") | crontab - 2>/dev/null || true
+    if command -v crontab >/dev/null 2>&1; then
+      (crontab -l 2>/dev/null | grep -v "singbox" ; \
+       echo "@reboot sleep 20 && bash $APP_DIR/singbox.sh run >> $LOG_FILE 2>&1" ; \
+       echo "0 3 * * * bash $APP_DIR/singbox.sh renew-cron >> $LOG_FILE 2>&1") | crontab - 2>/dev/null || true
+    else
+      warn "未检测到 crontab，开机自启依托 ~/.bashrc 唤醒守卫，证书续期已启用常驻进程每日检查兜底"
+    fi
     # 针对容器/非 systemd 环境（如 SAP BAS / Docker），注入 ~/.bashrc 与 ~/.profile 实现进入终端/环境唤醒时自动保活拉起
     for RC in "$HOME_DIR/.bashrc" "$HOME_DIR/.profile"; do
       if [ -f "$RC" ]; then
@@ -1072,13 +1077,19 @@ config_cert_bind() {
       echo -e "${YELLOW}还没有已签发的域名证书，请先到主菜单「8. 域名证书」申请${RESET}"
       press_any_key; return
     fi
+    local _s_dom _h_dom _t_dom _tr_dom _a_dom
+    _s_dom="$(get_val SERVER_DOMAIN)"
+    _h_dom="$(get_val HY2_CERT_DOMAIN)"
+    _t_dom="$(get_val TUIC_CERT_DOMAIN)"
+    _tr_dom="$(get_val TROJAN_CERT_DOMAIN)"
+    _a_dom="$(get_val ANYTLS_CERT_DOMAIN)"
     echo -e "${GRAY}可用域名证书: ${CYAN}$(echo "$avail" | tr '\n' ' ')${RESET}"
-    echo -e "${GRAY}当前连接域名: ${CYAN}$(get_val SERVER_DOMAIN || echo '使用公网IP')${RESET}"
+    echo -e "${GRAY}当前连接域名: ${CYAN}${_s_dom:-使用公网IP}${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
-    echo -e "${WHITE}1. Hysteria2  [${CYAN}$(get_val HY2_CERT_DOMAIN || echo '自签')${WHITE}]${RESET}"
-    echo -e "${WHITE}2. TUIC       [${CYAN}$(get_val TUIC_CERT_DOMAIN || echo '自签')${WHITE}]${RESET}"
-    echo -e "${WHITE}3. Trojan     [${CYAN}$(get_val TROJAN_CERT_DOMAIN || echo '自签')${WHITE}]${RESET}"
-    echo -e "${WHITE}4. AnyTLS     [${CYAN}$(get_val ANYTLS_CERT_DOMAIN || echo '自签')${WHITE}]${RESET}"
+    echo -e "${WHITE}1. Hysteria2  [${CYAN}${_h_dom:-自签}${WHITE}]${RESET}"
+    echo -e "${WHITE}2. TUIC       [${CYAN}${_t_dom:-自签}${WHITE}]${RESET}"
+    echo -e "${WHITE}3. Trojan     [${CYAN}${_tr_dom:-自签}${WHITE}]${RESET}"
+    echo -e "${WHITE}4. AnyTLS     [${CYAN}${_a_dom:-自签}${WHITE}]${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -e "${WHITE}5. 一键应用域名到全部协议并设为连接域名${RESET}"
     echo -e "${WHITE}6. 一键恢复全部自签证书与公网 IP${RESET}"
@@ -1130,12 +1141,20 @@ config_cert_bind() {
 config_extraports() {
   clear
   echo -e "${GREEN}======= 添加多端口 =======${RESET}"
-  echo -ne "Hysteria2 额外端口(逗号分隔，留空清除)[当前: $(get_val HY2_EXTRA_PORTS)]: "
-  read -r val
-  set_val HY2_EXTRA_PORTS "$val"
-  echo -ne "TUIC 额外端口(逗号分隔，留空清除)[当前: $(get_val TUIC_EXTRA_PORTS)]: "
-  read -r val2
-  set_val TUIC_EXTRA_PORTS "$val2"
+  local hy2 tuic
+  hy2=$(get_val HY2_PORT); tuic=$(get_val TUIC_PORT)
+  if [ -z "$hy2" ] && [ -z "$tuic" ]; then
+    echo -e "${YELLOW}当前没有已启用的 HY2/TUIC，请先在「修改协议端口」里开启${RESET}"
+    press_any_key; return
+  fi
+  if [ -n "$hy2" ]; then
+    echo -ne "Hysteria2 额外端口(逗号分隔，留空清除)[当前: $(get_val HY2_EXTRA_PORTS)]: "
+    read -r val; set_val HY2_EXTRA_PORTS "$val"
+  fi
+  if [ -n "$tuic" ]; then
+    echo -ne "TUIC 额外端口(逗号分隔，留空清除)[当前: $(get_val TUIC_EXTRA_PORTS)]: "
+    read -r val2; set_val TUIC_EXTRA_PORTS "$val2"
+  fi
   do_restart
   press_any_key
 }
@@ -1144,12 +1163,20 @@ config_hop() {
   clear
   echo -e "${GREEN}======= 端口跳跃 =======${RESET}"
   echo -e "${YELLOW}提示：需 root + nftables/iptables${RESET}"
-  echo -ne "Hysteria2 范围(如 20000-30000)[当前: $(get_val HY2_HOP_RANGE)]: "
-  read -r val
-  set_val HY2_HOP_RANGE "$val"
-  echo -ne "TUIC 范围(如 20000-30000)[当前: $(get_val TUIC_HOP_RANGE)]: "
-  read -r val2
-  set_val TUIC_HOP_RANGE "$val2"
+  local hy2 tuic
+  hy2=$(get_val HY2_PORT); tuic=$(get_val TUIC_PORT)
+  if [ -z "$hy2" ] && [ -z "$tuic" ]; then
+    echo -e "${YELLOW}当前没有已启用的 HY2/TUIC，请先在「修改协议端口」里开启${RESET}"
+    press_any_key; return
+  fi
+  if [ -n "$hy2" ]; then
+    echo -ne "Hysteria2 范围(如 20000-30000)[当前: $(get_val HY2_HOP_RANGE)]: "
+    read -r val; set_val HY2_HOP_RANGE "$val"
+  fi
+  if [ -n "$tuic" ]; then
+    echo -ne "TUIC 范围(如 20000-30000)[当前: $(get_val TUIC_HOP_RANGE)]: "
+    read -r val2; set_val TUIC_HOP_RANGE "$val2"
+  fi
   do_restart
   press_any_key
 }
@@ -1295,19 +1322,31 @@ ensure_acme() {
     wget -q https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh -O "$tmp_acme/acme.sh"
   fi
   chmod +x "$tmp_acme/acme.sh"
-  (cd "$tmp_acme" && ./acme.sh --install --home "$ACME_HOME" --force >/dev/null 2>&1) || true
+  local _has_cron=1
+  command -v crontab >/dev/null 2>&1 || _has_cron=0
+  if [ "$_has_cron" = "1" ]; then
+    (cd "$tmp_acme" && ./acme.sh --install --home "$ACME_HOME" >/dev/null 2>&1)
+  else
+    echo -e "${YELLOW}未检测到 crontab，跳过系统级续期定时任务${RESET}"
+    (cd "$tmp_acme" && ./acme.sh --install --home "$ACME_HOME" --force >/dev/null 2>&1)
+  fi
   rm -rf "$tmp_acme"
-  [ -x "$ACME_HOME/acme.sh" ]
+  if [ -x "$ACME_HOME/acme.sh" ]; then
+    [ "$_has_cron" = "0" ] && echo -e "${YELLOW}⚠ 没有系统级自动续期，已启用看门狗常驻进程内每日检查作为兜底${RESET}"
+    return 0
+  fi
+  return 1
 }
 
 menu_domain_cert() {
   while true; do
     clear
     echo -e "${GREEN}======= 域名证书 (acme.sh) =======${RESET}"
-    local certs
+    local certs _s_dom
     certs="$(_list_domain_certs)"
+    _s_dom="$(get_val SERVER_DOMAIN)"
     echo -e "${GRAY}已签发/导入证书:${RESET} ${CYAN}${certs:-无}${RESET}"
-    echo -e "${GRAY}当前连接域名:${RESET}   ${CYAN}$(get_val SERVER_DOMAIN || echo '使用公网IP')${RESET}"
+    echo -e "${GRAY}当前连接域名:${RESET}   ${CYAN}${_s_dom:-使用公网IP}${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -e "${WHITE}1. 申请新域名证书 (HTTP-01)${RESET}"
     echo -e "${WHITE}2. 手动导入已有证书${RESET}"
@@ -1326,7 +1365,9 @@ menu_domain_cert() {
           if "$ACME_HOME/acme.sh" --home "$ACME_HOME" --issue -d "$domain" --standalone --httpport 80 --server letsencrypt --force; then
             "$ACME_HOME/acme.sh" --home "$ACME_HOME" --install-cert -d "$domain" \
               --key-file "$DOMAIN_CERT_DIR/$domain/key.pem" \
-              --fullchain-file "$DOMAIN_CERT_DIR/$domain/cert.pem" >/dev/null 2>&1
+              --fullchain-file "$DOMAIN_CERT_DIR/$domain/cert.pem" \
+              --reloadcmd "pkill -f 'sing-box run' 2>/dev/null || true" >/dev/null 2>&1
+            chmod 600 "$DOMAIN_CERT_DIR/$domain/key.pem" 2>/dev/null || true
             echo -e "${GREEN}证书申请成功！${RESET}"
             echo -ne "${YELLOW}是否将此域名一键应用到全部直连协议（连接地址替换为域名并绑定证书）？[Y/n]: ${RESET}"
             read -r _apply_all
@@ -1369,7 +1410,9 @@ menu_domain_cert() {
           if "$ACME_HOME/acme.sh" --home "$ACME_HOME" --renew -d "$domain" --force --standalone --httpport 80; then
             "$ACME_HOME/acme.sh" --home "$ACME_HOME" --install-cert -d "$domain" \
               --key-file "$DOMAIN_CERT_DIR/$domain/key.pem" \
-              --fullchain-file "$DOMAIN_CERT_DIR/$domain/cert.pem" >/dev/null 2>&1
+              --fullchain-file "$DOMAIN_CERT_DIR/$domain/cert.pem" \
+              --reloadcmd "pkill -f 'sing-box run' 2>/dev/null || true" >/dev/null 2>&1
+            chmod 600 "$DOMAIN_CERT_DIR/$domain/key.pem" 2>/dev/null || true
             echo -e "${GREEN}证书续期并同步更新成功！${RESET}"
             do_restart
           else
@@ -1533,30 +1576,69 @@ do_run() {
   SERVER_DOMAIN="${SERVER_DOMAIN:-}"
   PUBLIC_IP="${PUBLIC_IP:-${IP:-}}"
   CF_PREFER_HOST="${CF_PREFER_HOST:-cdns.doon.eu.org}"
-  WS_PATH="${WS_PATH:-/fengyue}"
+  WS_PATH="${WS_PATH:-/fengyue-vm}"
 
   setup_port_hop() {
-    [ "$(id -u)" = "0" ] || return 0
-    command -v nft >/dev/null 2>&1 && nft delete table inet singbox_hop 2>/dev/null || true
-    if command -v iptables >/dev/null 2>&1; then
-      iptables -t nat -F SINGBOX_HOP 2>/dev/null || true
-      iptables -t nat -D PREROUTING -j SINGBOX_HOP 2>/dev/null || true
-      iptables -t nat -X SINGBOX_HOP 2>/dev/null || true
+    [ -n "$HY2_HOP_RANGE" ] || [ -n "$TUIC_HOP_RANGE" ] || return 0
+
+    if [ "$(id -u)" != "0" ]; then
+      warn "端口跳跃需要 root 权限，本次跳过（协议本身仍会用主端口正常工作）"
+      return 1
     fi
 
-    local _has_rule=0
-    if command -v iptables >/dev/null 2>&1; then
-      iptables -t nat -N SINGBOX_HOP 2>/dev/null || true
-      if [ -n "$HY2_PORT" ] && [ -n "$HY2_HOP_RANGE" ]; then
-        local s="${HY2_HOP_RANGE%%-*}" e="${HY2_HOP_RANGE##*-}"
-        iptables -t nat -A SINGBOX_HOP -p udp --dport "${s}:${e}" -j REDIRECT --to-ports "$HY2_PORT" 2>/dev/null && _has_rule=1
+    local _backend=""
+    if command -v nft >/dev/null 2>&1; then
+      _backend="nft"
+    elif command -v iptables >/dev/null 2>&1; then
+      _backend="iptables"
+    else
+      warn "缺少 nft/iptables，尝试自动安装..."
+      try_install_pkg nftables
+      command -v nft >/dev/null 2>&1 && _backend="nft"
+      if [ -z "$_backend" ]; then
+        try_install_pkg iptables
+        command -v iptables >/dev/null 2>&1 && _backend="iptables"
       fi
-      if [ -n "$TUIC_PORT" ] && [ -n "$TUIC_HOP_RANGE" ]; then
-        local s="${TUIC_HOP_RANGE%%-*}" e="${TUIC_HOP_RANGE##*-}"
-        iptables -t nat -A SINGBOX_HOP -p udp --dport "${s}:${e}" -j REDIRECT --to-ports "$TUIC_PORT" 2>/dev/null && _has_rule=1
-      fi
-      [ "$_has_rule" = "1" ] && iptables -t nat -I PREROUTING -j SINGBOX_HOP 2>/dev/null || true
     fi
+    [ -z "$_backend" ] && { warn "缺少 nft/iptables 且自动安装失败，端口跳跃本次未生效"; return 1; }
+
+    local _table="singbox_hop"
+    if [ "$_backend" = "nft" ]; then
+      nft add table inet "$_table" 2>/dev/null
+      nft "add chain inet $_table prerouting { type nat hook prerouting priority -100 ; }" 2>/dev/null
+      nft flush chain inet "$_table" prerouting 2>/dev/null
+    else
+      iptables -t nat -N SINGBOX_HOP 2>/dev/null
+      iptables -t nat -C PREROUTING -j SINGBOX_HOP 2>/dev/null || iptables -t nat -A PREROUTING -j SINGBOX_HOP 2>/dev/null
+      iptables -t nat -F SINGBOX_HOP 2>/dev/null
+      command -v ip6tables >/dev/null 2>&1 && {
+        ip6tables -t nat -N SINGBOX_HOP 2>/dev/null
+        ip6tables -t nat -C PREROUTING -j SINGBOX_HOP 2>/dev/null || ip6tables -t nat -A PREROUTING -j SINGBOX_HOP 2>/dev/null
+        ip6tables -t nat -F SINGBOX_HOP 2>/dev/null
+      }
+    fi
+
+    _hop_add_rule() {
+      local _label="$1" _range="$2" _port="$3"
+      valid_port_range "$_range" || { warn "${_label}_HOP_RANGE 格式不合法(${_range})，应为如 20000-30000"; return 1; }
+      if [ "$_backend" = "nft" ]; then
+        nft add rule inet "$_table" prerouting udp dport "$_range" redirect to ":${_port}" 2>/dev/null \
+          && { log "端口跳跃已生效(nftables): ${_label} UDP ${_range} -> ${_port}"; return 0; }
+      else
+        local _dports="${_range%-*}:${_range#*-}"
+        iptables -t nat -A SINGBOX_HOP -p udp --dport "$_dports" -j REDIRECT --to-ports "$_port" 2>/dev/null || return 1
+        command -v ip6tables >/dev/null 2>&1 && ip6tables -t nat -A SINGBOX_HOP -p udp --dport "$_dports" -j REDIRECT --to-ports "$_port" 2>/dev/null
+        log "端口跳跃已生效(iptables): ${_label} UDP ${_range} -> ${_port}"
+        return 0
+      fi
+      warn "${_label} 端口跳跃规则下发失败"
+      return 1
+    }
+
+    HY2_HOP_ACTIVE=0
+    TUIC_HOP_ACTIVE=0
+    [ -n "$HY2_HOP_RANGE" ] && [ "$HY2_ACTIVE" = "1" ] && _hop_add_rule "Hysteria2" "$HY2_HOP_RANGE" "$HY2_PORT" && HY2_HOP_ACTIVE=1
+    [ -n "$TUIC_HOP_RANGE" ] && [ "$TUIC_ACTIVE" = "1" ] && _hop_add_rule "TUIC" "$TUIC_HOP_RANGE" "$TUIC_PORT" && TUIC_HOP_ACTIVE=1
   }
 
   mkdir -p "$STATE_DIR" "$APP_DIR"
@@ -1599,7 +1681,9 @@ do_run() {
     _hexesc="$(printf '%s' "$_hex" | sed 's/\(..\)/\\x\1/g')"
     SS_PASS="$(printf "$_hexesc" | openssl base64 -A 2>/dev/null)" || SS_PASS=""
   fi
-  [ -z "$SS_PASS" ] && SS_PASS="$(head -c 16 /dev/urandom 2>/dev/null | b64)"
+  if [ -z "$SS_PASS" ] && [ -n "$SS_PORT" ]; then
+    warn "SS2022 密码生成失败（需要 python3 或 openssl），Shadowsocks 本次将被跳过"
+  fi
 
   case "$(uname -m)" in
     x86_64|amd64)  SB_ARCH="amd64";  CF_ARCH="linux-amd64"; KM_ARCH="linux-amd64" ;;
@@ -1612,23 +1696,40 @@ do_run() {
   download_singbox() {
     mkdir -p "$SB_DIR"
     log "正在检查/获取 sing-box..."
-    local SB_VER
+    local SB_VER SB_FALLBACK_VER="v1.12.0"
     SB_VER="$(http_get 'https://api.github.com/repos/SagerNet/sing-box/releases/latest' \
       | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
-    [ -z "$SB_VER" ] && SB_VER="v1.12.0"
+    [ -z "$SB_VER" ] && { warn "获取最新版本号失败，直接使用保底版本 ${SB_FALLBACK_VER}"; SB_VER="$SB_FALLBACK_VER"; }
 
-    local _vnum="${SB_VER#v}"
-    for _suffix in "-musl" ""; do
-      local _asset="sing-box-${_vnum}-linux-${SB_ARCH}${_suffix}.tar.gz"
-      if dl "https://github.com/SagerNet/sing-box/releases/download/${SB_VER}/${_asset}" /tmp/sing-box.tar.gz; then
-        if tar -tzf /tmp/sing-box.tar.gz >/dev/null 2>&1; then
-          tar -xzf /tmp/sing-box.tar.gz -C "$SB_DIR" --strip-components=1
-          chmod +x "$SB_BIN"
-          rm -f /tmp/sing-box.tar.gz
-          if "$SB_BIN" version >/dev/null 2>&1; then return 0; fi
+    _try_fetch_singbox() {
+      local _v="$1" _vnum="${1#v}"
+      for _suffix in "-musl" ""; do
+        local _asset="sing-box-${_vnum}-linux-${SB_ARCH}${_suffix}.tar.gz"
+        log "下载 sing-box ${_v} (${SB_ARCH}${_suffix:+ 静态musl})..."
+        if dl "https://github.com/SagerNet/sing-box/releases/download/${_v}/${_asset}" /tmp/sing-box.tar.gz; then
+          if tar -tzf /tmp/sing-box.tar.gz >/dev/null 2>&1; then
+            rm -rf "$SB_DIR"; mkdir -p "$SB_DIR"
+            tar -xzf /tmp/sing-box.tar.gz -C "$SB_DIR" --strip-components=1
+            chmod +x "$SB_BIN"
+            rm -f /tmp/sing-box.tar.gz
+            if "$SB_BIN" version >/dev/null 2>&1; then return 0; fi
+            warn "sing-box ${_v}${_suffix} 下载完整但无法执行"
+          else
+            warn "sing-box ${_v}${_suffix} 压缩包已损坏"
+          fi
         fi
-      fi
-    done
+      done
+      return 1
+    }
+
+    if _try_fetch_singbox "$SB_VER"; then
+      log "sing-box 下载完成: $("$SB_BIN" version 2>/dev/null | head -1)"
+      return 0
+    fi
+    if [ "$SB_VER" != "$SB_FALLBACK_VER" ]; then
+      warn "${SB_VER} 不可用，回退到 ${SB_FALLBACK_VER}..."
+      _try_fetch_singbox "$SB_FALLBACK_VER" && { log "sing-box 下载完成（回退版本）"; return 0; }
+    fi
     return 1
   }
 
@@ -1647,8 +1748,10 @@ do_run() {
   pkill -f "$CF_BIN" 2>/dev/null || true
   pkill -f "$KM_BIN" 2>/dev/null || true
 
+  [ -x "$SB_BIN" ] && ! "$SB_BIN" version >/dev/null 2>&1 && { warn "已存在的 sing-box 无法运行，重新下载"; rm -f "$SB_BIN"; }
   [ -x "$SB_BIN" ] || download_singbox || die "sing-box 下载失败"
   if [ "${DISABLE_ARGO:-}" != "true" ]; then
+    [ -x "$CF_BIN" ] && ! "$CF_BIN" --version >/dev/null 2>&1 && { warn "已存在的 cloudflared 无法运行，重新下载"; rm -f "$CF_BIN"; }
     [ -x "$CF_BIN" ] || download_cloudflared || true
   fi
   if [ -n "$KOMARI_DOMAIN" ] && [ -n "$KOMARI_TOKEN" ]; then
@@ -1703,6 +1806,30 @@ do_run() {
         openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days 3650 -nodes \
           -keyout "$KEY_PATH" -out "$CERT_PATH" \
           -subj "/CN=bing.com/O=Microsoft/C=US" 2>/dev/null
+      else
+        warn "系统缺少 openssl，将使用内置共享自签证书（仅供测试）"
+        cat > "$KEY_PATH" << 'KEYEOF'
+-----BEGIN EC PARAMETERS-----
+BggqhkjOPQMBBw==
+-----END EC PARAMETERS-----
+-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIM4792SEtPqIt1ywqTd/0bYidBqpYV/++siNnfBYsdUYoAoGCCqGSM49
+AwEHoUQDQgAE1kHafPj07rJG+HboH2ekAI4r+e6TL38GWASANnngZreoQDF16ARa
+/TsyLyFoPkhLxSbehH/NBEjHtSZGaDhMqQ==
+-----END EC PRIVATE KEY-----
+KEYEOF
+        cat > "$CERT_PATH" << 'CERTEOF'
+-----BEGIN CERTIFICATE-----
+MIIBejCCASGgAwIBAgIUfWeQL3556PNJLp/veCFxGNj9crkwCgYIKoZIzj0EAwIw
+EzERMA8GA1UEAwwIYmluZy5jb20wHhcNMjUwOTE4MTgyMDIyWhcNMzUwOTE2MTgy
+MDIyWjATMREwDwYDVQQDDAhiaW5nLmNvbTBZMBMGByqGSM49AgEGCCqGSM49AwEH
+A0IABNZB2nz49O6yRvh26B9npACOK/nuky9/BlgEgDZ54Ga3qEAxdegEWv07Mi8h
+aD5IS8Um3oR/zQRIx7UmRmg4TKmjUzBRMB0GA1UdDgQWBBTV1cFID7UISE7PLTBR
+BfGbgkrMNzAfBgNVHSMEGDAWgBTV1cFID7UISE7PLTBRBfGbgkrMNzAPBgNVHRMB
+Af8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIAIDAJvg0vd/ytrQVvEcSm6XTlB+
+eQ6OFb9LbLYL9f+sAiAffoMbi4y/0YUSlTtz7as9S8/lciBF5VCUoVIKS+vX2g==
+-----END CERTIFICATE-----
+CERTEOF
       fi
     fi
     chmod 600 "$KEY_PATH" 2>/dev/null || true
@@ -2050,8 +2177,14 @@ do_run() {
     if [ "$HY2_ACTIVE" = "1" ] && [ -n "$NODE_HOST" ]; then
       local _h_addr _h_sni _h_insec
       [ "$HY2_TLS_INSECURE" = "0" ] && { _h_addr="${HY2_TLS_SNI:-$NODE_HOST}"; _h_sni="$HY2_TLS_SNI"; _h_insec="0"; } || { _h_addr="$NODE_HOST"; _h_sni="www.bing.com"; _h_insec="1"; }
+      local _h_hopq=""
+      [ "${HY2_HOP_ACTIVE:-0}" = "1" ] && _h_hopq="&mport=${HY2_HOP_RANGE}"
+      local _idx=0
       for _p in $HY2_ACTIVE_PORTS; do
-        local _link="hysteria2://${UUID}@${_h_addr}:${_p}?sni=${_h_sni}&insecure=${_h_insec}&alpn=h3&obfs=none#${NAME_ENCODED}"
+        _idx=$((_idx + 1))
+        local _h_name="$NAME_ENCODED" _h_q=""
+        if [ "$_idx" -gt 1 ]; then _h_name="${NAME_ENCODED}-P${_idx}"; else _h_q="$_h_hopq"; fi
+        local _link="hysteria2://${UUID}@${_h_addr}:${_p}?sni=${_h_sni}&insecure=${_h_insec}&alpn=h3&obfs=none${_h_q}#${_h_name}"
         ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
       done
@@ -2060,8 +2193,14 @@ do_run() {
     if [ "$TUIC_ACTIVE" = "1" ] && [ -n "$NODE_HOST" ]; then
       local _t_addr _t_sni _t_insec
       [ "$TUIC_TLS_INSECURE" = "0" ] && { _t_addr="${TUIC_TLS_SNI:-$NODE_HOST}"; _t_sni="$TUIC_TLS_SNI"; _t_insec="0"; } || { _t_addr="$NODE_HOST"; _t_sni="www.bing.com"; _t_insec="1"; }
+      local _t_hopq=""
+      [ "${TUIC_HOP_ACTIVE:-0}" = "1" ] && _t_hopq="&mport=${TUIC_HOP_RANGE}"
+      local _idx=0
       for _p in $TUIC_ACTIVE_PORTS; do
-        local _link="tuic://${UUID}:${UUID}@${_t_addr}:${_p}?sni=${_t_sni}&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=${_t_insec}#${NAME_ENCODED}"
+        _idx=$((_idx + 1))
+        local _t_name="$NAME_ENCODED" _t_q=""
+        if [ "$_idx" -gt 1 ]; then _t_name="${NAME_ENCODED}-P${_idx}"; else _t_q="$_t_hopq"; fi
+        local _link="tuic://${UUID}:${UUID}@${_t_addr}:${_p}?sni=${_t_sni}&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=${_t_insec}${_t_q}#${_t_name}"
         ALL_LINKS="${ALL_LINKS:+${ALL_LINKS}
 }${_link}"
       done
@@ -2121,22 +2260,42 @@ do_run() {
     generate_sub
   fi
 
+  ACME_CRON_MARK="$STATE_DIR/.last-acme-cron"
+  ACME_CRON_INTERVAL=86400
+
+  acme_cron_check() {
+    [ -x "$ACME_HOME/acme.sh" ] || return 0
+    local _now _last=0
+    _now="$(date +%s 2>/dev/null || echo 0)"
+    [ -f "$ACME_CRON_MARK" ] && _last="$(cat "$ACME_CRON_MARK" 2>/dev/null || echo 0)"
+    if [ $((_now - _last)) -ge "$ACME_CRON_INTERVAL" ]; then
+      log "检查域名证书是否需要续期..."
+      "$ACME_HOME/acme.sh" --cron --home "$ACME_HOME" >/dev/null 2>&1
+      echo "$_now" > "$ACME_CRON_MARK" 2>/dev/null || true
+    fi
+  }
+
   log "进入后台守护看门狗状态..."
   local SB_FAIL=0 CF_FAIL=0
   while true; do
     if ! kill -0 $SB_PID 2>/dev/null; then
       SB_FAIL=$((SB_FAIL + 1))
-      warn "sing-box 异常退出 (第 $SB_FAIL 次)，正在重启..."
-      sleep 3
-      if start_singbox; then SB_FAIL=0; fi
+      local _backoff=$((SB_FAIL * 5)); [ "$_backoff" -gt 60 ] && _backoff=60
+      warn "sing-box 异常退出 (连续第 $SB_FAIL 次)，${_backoff} 秒后重启..."
+      sleep "$_backoff"
+      if start_singbox; then SB_FAIL=0; else warn "重启失败，继续等待..."; sleep 10; continue; fi
     fi
 
     if [ "${DISABLE_ARGO:-}" != "true" ]; then
       if [ -z "$CF_PID" ] || ! kill -0 "$CF_PID" 2>/dev/null; then
         CF_FAIL=$((CF_FAIL + 1))
-        warn "cloudflared 异常退出，正在重启并重获域名..."
-        sleep 3
+        local _cf_backoff=$((CF_FAIL * 5)); [ "$_cf_backoff" -gt 60 ] && _cf_backoff=60
+        warn "cloudflared 异常退出 (连续第 $CF_FAIL 次)，${_cf_backoff} 秒后重启..."
+        pkill -f "$CF_BIN" 2>/dev/null || true
+        sleep "$_cf_backoff"
         start_cloudflared
+      else
+        CF_FAIL=0
       fi
     fi
 
@@ -2147,6 +2306,8 @@ do_run() {
         start_komari || true
       fi
     fi
+
+    acme_cron_check
 
     sleep 10
   done
