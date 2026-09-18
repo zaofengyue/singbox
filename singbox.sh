@@ -810,8 +810,8 @@ menu_config() {
     echo -e "${WHITE}4. 域名证书绑定${RESET}"
     echo -e "${WHITE}5. 添加多端口${RESET}"
     echo -e "${WHITE}6. 端口跳跃${RESET}"
-    echo -e "${WHITE}7. Komari探针监控${RESET}"
-    echo -e "${WHITE}8. IP栈偏好与连接域名${RESET}"
+    echo -e "${WHITE}7. Komari探针${RESET}"
+    echo -e "${WHITE}8. IP出栈设置${RESET}"
     echo -e "${WHITE}0. 返回${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -ne "${GRAY}请输入选项: ${RESET}"
@@ -833,7 +833,7 @@ menu_config() {
 
 config_ip_domain() {
   clear
-  echo -e "${GREEN}======= IP栈偏好与连接域名 =======${RESET}"
+  echo -e "${GREEN}======= IP出栈设置 =======${RESET}"
   local cur_v cur_dom cur_pip
   cur_v=$(get_val IP_VERSION)
   cur_dom=$(get_val SERVER_DOMAIN)
@@ -1131,7 +1131,7 @@ config_hop() {
 
 config_komari() {
   clear
-  echo -e "${GREEN}======= Komari 探针监控 =======${RESET}"
+  echo -e "${GREEN}======= Komari 探针 =======${RESET}"
   local cur_dom cur_tk
   cur_dom=$(get_val KOMARI_DOMAIN)
   [ -z "$cur_dom" ] && cur_dom=$(get_val KOMARI_ENDPOINT)
