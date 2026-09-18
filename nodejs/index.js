@@ -3,6 +3,7 @@
 const PRESET_UUID           = ''; // 节点 UUID（留空自动生成）
 const PRESET_PORT           = ''; // HTTP 服务端口（默认自动寻找可用端口）
 const PRESET_NAME           = ''; // 节点名称前缀（留空自动识别 IP 所在国家与组织）
+const PRESET_IP             = ''; // 自定义公网 IP（留空自动探测，支持环境变量 PUBLIC_IP 或 IP）
 const PRESET_SUB            = ''; // 订阅路径后缀（默认 'sub'，即 /sub）
 
 // ── 2. Argo 隧道配置 ──
@@ -120,6 +121,13 @@ function httpGet(url, timeout = 5000) {
   return new Promise((resolve) => {
     const mod = url.startsWith('https') ? https : http;
     const req = mod.get(url, { timeout }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return httpGet(res.headers.location, timeout).then(resolve);
+      }
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        res.resume();
+        return resolve('');
+      }
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => resolve(data.trim()));
@@ -509,9 +517,20 @@ function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = '
 // ──────────────────────────────────────────────
 
 async function getPublicIP() {
-  return await httpGet('https://ipinfo.io/ip') ||
-         await httpGet('https://ifconfig.co/ip') ||
-         '';
+  const envIP = PRESET_IP || process.env.PUBLIC_IP || process.env.IP || '';
+  if (envIP && envIP.trim()) return envIP.trim();
+
+  const apis = [
+    'https://api.ipify.org',
+    'https://ipinfo.io/ip',
+    'https://ifconfig.co/ip',
+    'https://icanhazip.com'
+  ];
+  for (const url of apis) {
+    const ip = await httpGet(url);
+    if (ip && net.isIP(ip)) return ip;
+  }
+  return '';
 }
 
 // ──────────────────────────────────────────────
