@@ -678,7 +678,7 @@ async function main() {
   let certReady = false;
   if (hy2Active || tuicActive || anytlsActive) {
     try {
-      const certDir = `${HOME}/certs`;
+      const certDir = fs.existsSync(`${HOME}/certs`) ? `${HOME}/certs` : `${CORE_DIR}/certs`;
       const cert = generateSelfSignedCert(certDir);
       certPath = cert.certPath;
       keyPath  = cert.keyPath;
