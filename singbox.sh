@@ -682,8 +682,15 @@ SVCEOF
     (crontab -l 2>/dev/null | grep -v "singbox" ; \
      echo "@reboot sleep 20 && bash $APP_DIR/singbox.sh run >> $LOG_FILE 2>&1" ; \
      echo "0 3 * * * bash $APP_DIR/singbox.sh renew-cron >> $LOG_FILE 2>&1") | crontab - 2>/dev/null || true
+    # 针对容器/非 systemd 环境（如 SAP BAS / Docker），注入 ~/.bashrc 与 ~/.profile 实现进入终端/环境唤醒时自动保活拉起
+    for RC in "$HOME_DIR/.bashrc" "$HOME_DIR/.profile"; do
+      if [ -f "$RC" ]; then
+        sed -i '/singbox.*run/d' "$RC" 2>/dev/null || true
+        echo "[ -f \"$APP_DIR/config.env\" ] && ! pgrep -x \"sing-box\" >/dev/null 2>&1 && nohup bash \"$APP_DIR/singbox.sh\" run >> \"$LOG_FILE\" 2>&1 &" >> "$RC"
+      fi
+    done
     echo ""
-    log "服务已通过 nohup 后台启动，开机自启与证书自动续期已写入 cron"
+    log "服务已通过 nohup 后台启动，开机自启与自愈守卫已配置"
   fi
 
   echo ""
