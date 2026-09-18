@@ -53,6 +53,7 @@ KM_LOG="$APP_DIR/komari.log"
 PID_FILE="$APP_DIR/singbox.pid"
 SVCFILE="$HOME_DIR/.config/systemd/user/singbox.service"
 LOCAL_BIN="$HOME_DIR/.local/bin"
+export PATH="$LOCAL_BIN:/usr/local/bin:$PATH"
 
 # 密钥与证书集中存放
 UUID_FILE="$STATE_DIR/uuid.txt"
@@ -471,6 +472,7 @@ WRAP
       printf '\n# singbox PATH\nexport PATH="%s:$PATH"\n' "$LOCAL_BIN" >> "$RC" 2>/dev/null || true
     fi
   done
+  export PATH="$LOCAL_BIN:/usr/local/bin:$PATH"
 }
 
 # ==============================================================================
@@ -1497,7 +1499,7 @@ do_uninstall() {
   systemctl --user daemon-reload 2>/dev/null || true
 
   do_stop
-  (crontab -l 2>/dev/null | grep -v "singbox autostart") | crontab - 2>/dev/null || true
+  (crontab -l 2>/dev/null | grep -v "singbox") | crontab - 2>/dev/null || true
 
   for RC in "$HOME_DIR/.bashrc" "$HOME_DIR/.profile" "$HOME_DIR/.bash_profile" "$HOME_DIR/.zshrc"; do
     sed -i '/singbox/d' "$RC" 2>/dev/null || true
@@ -1510,6 +1512,11 @@ do_uninstall() {
     iptables -t nat -F SINGBOX_HOP 2>/dev/null || true
     iptables -t nat -D PREROUTING -j SINGBOX_HOP 2>/dev/null || true
     iptables -t nat -X SINGBOX_HOP 2>/dev/null || true
+  fi
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -t nat -F SINGBOX_HOP 2>/dev/null || true
+    ip6tables -t nat -D PREROUTING -j SINGBOX_HOP 2>/dev/null || true
+    ip6tables -t nat -X SINGBOX_HOP 2>/dev/null || true
   fi
 
   rm -rf "$APP_DIR"
@@ -1534,6 +1541,7 @@ do_cron_renew() {
       "$ACME_HOME/acme.sh" --home "$ACME_HOME" --install-cert -d "$dom" \
         --key-file "$DOMAIN_CERT_DIR/$dom/key.pem" \
         --fullchain-file "$DOMAIN_CERT_DIR/$dom/cert.pem" >/dev/null 2>&1
+      chmod 600 "$DOMAIN_CERT_DIR/$dom/key.pem" 2>/dev/null || true
       renewed=1
     fi
   done
