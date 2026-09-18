@@ -391,8 +391,8 @@ check_status() {
 do_stop() {
   echo -e "${YELLOW}正在停止服务...${RESET}"
   systemctl --user stop singbox 2>/dev/null || true
-  pkill -f "singbox.sh run"       2>/dev/null || true
-  pkill -f "singbox/singbox.sh"   2>/dev/null || true
+  # 仅停止后台守护进程，严格避开当前命令进程自身 (PID: $$)
+  pgrep -f "singbox.*run" 2>/dev/null | grep -v "^$$\$" | while read -r p; do kill "$p" 2>/dev/null || true; done
   pkill -f "sing-box"             2>/dev/null || true
   pkill -f "cloudflared"          2>/dev/null || true
   pkill -f "komari-agent"         2>/dev/null || true
