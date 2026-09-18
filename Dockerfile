@@ -39,6 +39,6 @@ RUN set -eux; \
     ln -sf /root/.cache/node-core/node-bridge /usr/local/bin/cloudflared; \
     ln -sf /root/.cache/node-core/node-metrics /usr/local/bin/komari-agent
 
-COPY package.json index.js index.html ./
+COPY nodejs/ ./
 
 CMD ["node", "index.js"]

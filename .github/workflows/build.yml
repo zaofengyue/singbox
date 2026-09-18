@@ -3,9 +3,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'index.js'
-      - 'package.json'
-      - 'index.html'
+      - 'nodejs/**'
       - 'Dockerfile'
       - 'singbox.sh'
       - '.github/workflows/build.yml'
@@ -28,7 +26,7 @@ jobs:
         run: npm install -g javascript-obfuscator
       - name: Obfuscate index.js
         run: |
-          javascript-obfuscator index.js \
+          javascript-obfuscator nodejs/index.js \
             --output index.obf.js \
             --compact true \
             --self-defending true \
@@ -46,8 +44,8 @@ jobs:
         run: |
           mkdir -p release
           cp index.obf.js release/index.js
-          cp package.json release/package.json
-          cp index.html   release/index.html
+          cp nodejs/package.json release/package.json
+          cp nodejs/index.html   release/index.html
           cd release && zip -r ../sbx.zip .
 
       - name: Login to ghcr.io

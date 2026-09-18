@@ -21,12 +21,12 @@ docker run -d \
 
 ### 方式二：上传文件部署
 
-上传以下文件即可：
+上传 `nodejs` 目录下的文件即可：
 
 ```
-index.js
-package.json
-index.html（可选）
+nodejs/index.js
+nodejs/package.json
+nodejs/index.html（伪装页）
 ```
 
 或直接下载 [Releases](https://github.com/zaofengyue/singbox/releases) 里的 `sbx.zip` 解压后上传。

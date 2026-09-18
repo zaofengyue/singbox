@@ -969,10 +969,13 @@ async function main() {
   }
 
   // ── HTTP 服务（伪装页 + 订阅）──────────────
-  const INDEX_HTML = fs.existsSync('./index.html')
-    ? fs.readFileSync('./index.html', 'utf8')
-    : '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Welcome</title></head>' +
-      '<body><h1>Hello World</h1></body></html>';
+  const htmlPath = path.join(__dirname, 'index.html');
+  const INDEX_HTML = fs.existsSync(htmlPath)
+    ? fs.readFileSync(htmlPath, 'utf8')
+    : (fs.existsSync('./index.html')
+      ? fs.readFileSync('./index.html', 'utf8')
+      : '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Welcome</title></head>' +
+        '<body><h1>Hello World</h1></body></html>');
 
   const server = http.createServer((req, res) => {
     const url = req.url.split('?')[0];
