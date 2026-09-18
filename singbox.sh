@@ -377,8 +377,14 @@ create_symlinks() {
       sb-edit) subcmd="edit" ;;
     esac
     cat > "$LOCAL_BIN/$cmd" << WRAP
-#!/bin/bash
-exec "$APP_DIR/singbox.sh" $subcmd "\$@"
+#!/usr/bin/env bash
+if [ ! -s "$APP_DIR/singbox.sh" ]; then
+  echo "检测到脚本文件为空或缺失，正在自动修复同步..."
+  curl -fsSL "https://raw.githubusercontent.com/zaofengyue/singbox/${BRANCH:-main}/singbox.sh" -o "$APP_DIR/singbox.sh" 2>/dev/null || \
+  wget -qO "$APP_DIR/singbox.sh" "https://raw.githubusercontent.com/zaofengyue/singbox/${BRANCH:-main}/singbox.sh" 2>/dev/null || true
+  chmod +x "$APP_DIR/singbox.sh" 2>/dev/null || true
+fi
+exec bash "$APP_DIR/singbox.sh" $subcmd "\$@"
 WRAP
     chmod +x "$LOCAL_BIN/$cmd"
   done
@@ -411,15 +417,23 @@ do_install() {
   mkdir -p "$APP_DIR" "$STATE_DIR"
   chmod 700 "$STATE_DIR" 2>/dev/null || true
 
-  if [ ! -f "$APP_DIR/singbox.sh" ] || [ "$APP_DIR/singbox.sh" -ef "$0" ] 2>/dev/null; then
-    if [ "$0" != "$APP_DIR/singbox.sh" ]; then
-      cp -f "$0" "$APP_DIR/singbox.sh"
-      chmod +x "$APP_DIR/singbox.sh"
-    fi
+  local _src_is_file=false
+  case "$0" in
+    /dev/*|/proc/*|bash|sh|-*) _src_is_file=false ;;
+    *) [ -f "$0" ] && [ -s "$0" ] && _src_is_file=true ;;
+  esac
+
+  if $_src_is_file; then
+    [ "$0" != "$APP_DIR/singbox.sh" ] && cp -f "$0" "$APP_DIR/singbox.sh"
   else
-    cp -f "$0" "$APP_DIR/singbox.sh"
-    chmod +x "$APP_DIR/singbox.sh"
+    log "检测到网络一键安装，正在保存脚本至本地..."
+    local SCRIPT_RAW="https://raw.githubusercontent.com/zaofengyue/singbox/${BRANCH:-main}/singbox.sh"
+    dl "$SCRIPT_RAW" "$APP_DIR/singbox.sh" || {
+      curl -fsSL "$SCRIPT_RAW" -o "$APP_DIR/singbox.sh" 2>/dev/null || \
+      wget -qO "$APP_DIR/singbox.sh" "$SCRIPT_RAW" 2>/dev/null || true
+    }
   fi
+  chmod +x "$APP_DIR/singbox.sh"
 
   local IN_UUID="${UUID:-}"
   local IN_PORT="${PORT:-}"
