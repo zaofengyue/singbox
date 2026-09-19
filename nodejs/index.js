@@ -34,7 +34,7 @@ const PRESET_TG_CHAT_ID        = ''; // Telegram Chat ID
 const PRESET_SINGLE_PROCESS    = ''; // 填 'true' 开启极致单进程（禁用 Argo 时由核心独占常驻）
 // ==============================================================================
 
-const { execSync, spawn } = require('child_process');
+const { execSync, spawn, spawnSync, execFile } = require('child_process');
 const fs     = require('fs');
 const os     = require('os');
 const https  = require('https');
@@ -49,12 +49,22 @@ const path   = require('path');
 const trackedProcesses = [];
 let isShuttingDown = false;
 
+// 与各处 spawn 的 argv0 保持一致
+const PROC_TAGS = ['node /app/worker.js', 'node /app/bridge.js', 'node /app/metrics.js'];
+
+function killStaleByTag(tags = PROC_TAGS) {
+  if (os.platform() === 'win32') return;
+  for (const tag of tags) {
+    try { spawnSync('pkill', ['-f', tag], { stdio: 'ignore' }); } catch {}
+  }
+}
+
 process.on('uncaughtException', (err) => {
-  console.error(`[系统防崩溃] 拦截未捕获异常: ${err && err.message ? err.message : err}`);
+  console.error(`[系统防崩溃] 拦截未捕获异常: ${err && err.stack ? err.stack : (err && err.message ? err.message : err)}`);
 });
 
 process.on('unhandledRejection', (reason) => {
-  console.warn(`[系统防崩溃] 拦截未处理异步拒绝: ${reason && reason.message ? reason.message : reason}`);
+  console.warn(`[系统防崩溃] 拦截未处理异步拒绝: ${reason && reason.stack ? reason.stack : (reason && reason.message ? reason.message : reason)}`);
 });
 
 function gracefulExit(sig) {
@@ -66,16 +76,8 @@ function gracefulExit(sig) {
       if (proc && !proc.killed) proc.kill('SIGTERM');
     } catch {}
   }
-  try {
-    if (os.platform() !== 'win32') {
-      execSync(`pkill -f "${SB_BIN_PATH}" 2>/dev/null || true`);
-      execSync(`pkill -f "${CLOUDFLARED_BIN}" 2>/dev/null || true`);
-      execSync(`pkill -f "${KOMARI_BIN_PATH}" 2>/dev/null || true`);
-      execSync(`pkill -f "node-metrics" 2>/dev/null || true`);
-      execSync(`pkill -f "komari-agent" 2>/dev/null || true`);
-    }
-  } catch {}
-  setTimeout(() => process.exit(0), 300);
+  killStaleByTag();
+  setTimeout(() => process.exit(process.exitCode || 0), 300);
 }
 
 process.on('SIGTERM', () => gracefulExit('SIGTERM'));
@@ -119,116 +121,194 @@ function getFreePort() {
   });
 }
 
-function httpGet(url, timeout = 5000) {
+function httpGet(url, timeout = 5000, redirects = 3) {
   return new Promise((resolve) => {
-    const mod = url.startsWith('https') ? https : http;
-    const req = mod.get(url, { timeout, headers: { 'User-Agent': 'curl/8.5.0' } }, (res) => {
+    let mod;
+    try { mod = new URL(url).protocol === 'https:' ? https : http; } catch { return resolve(''); }
+    const req = mod.get(url, {
+      timeout,
+      headers: { 'User-Agent': 'curl/8.5.0', 'Accept': '*/*' }
+    }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        try {
-          const nextUrl = new URL(res.headers.location, url).href;
-          return httpGet(nextUrl, timeout).then(resolve);
-        } catch {
-          return resolve('');
-        }
+        res.resume();
+        if (redirects <= 0) return resolve('');
+        let next;
+        try { next = new URL(res.headers.location, url).href; } catch { return resolve(''); }
+        return httpGet(next, timeout, redirects - 1).then(resolve);
       }
       if (res.statusCode < 200 || res.statusCode >= 300) {
         res.resume();
         return resolve('');
       }
+      res.setEncoding('utf8');
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => resolve(data.trim()));
+      res.on('error', () => resolve(''));
     });
     req.on('error', () => resolve(''));
     req.on('timeout', () => { req.destroy(); resolve(''); });
   });
 }
 
-function isValidBinaryFile(filePath) {
-  try {
-    if (!fs.existsSync(filePath)) return false;
-    const stat = fs.statSync(filePath);
-    if (stat.size < 1000) return false;
-    const fd = fs.openSync(filePath, 'r');
-    const buf = Buffer.alloc(200);
-    fs.readSync(fd, buf, 0, 200, 0);
-    fs.closeSync(fd);
-    const head = buf.toString('utf8').toLowerCase();
-    if (head.includes('<!doctype html') || head.includes('<html')) return false;
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// 跨平台下载：优先 curl，再 wget，最后用 Node 原生请求兜底，先下到临时文件校验后再重命名
-async function download(url, dest) {
-  const mirrors = ['', 'https://ghfast.top/', 'https://ghproxy.net/', 'https://github.moeyy.xyz/', 'https://mirror.ghproxy.com/'];
-  const tmpDest = `${dest}.tmp.${Date.now()}`;
-  let lastErr = null;
-
-  for (const prefix of mirrors) {
-    const target = prefix ? `${prefix}${url}` : url;
-    try { if (fs.existsSync(tmpDest)) fs.unlinkSync(tmpDest); } catch {}
-
-    try {
-      execSync(`curl -fsSL -H "User-Agent: curl/8.5.0" --max-time 90 "${target}" -o "${tmpDest}"`, { stdio: 'pipe' });
-      if (isValidBinaryFile(tmpDest)) {
-        fs.renameSync(tmpDest, dest);
-        return;
-      }
-    } catch {}
-
-    try {
-      execSync(`wget -q --user-agent="curl/8.5.0" --timeout=90 "${target}" -O "${tmpDest}"`, { stdio: 'pipe' });
-      if (isValidBinaryFile(tmpDest)) {
-        fs.renameSync(tmpDest, dest);
-        return;
-      }
-    } catch {}
-
-    try {
-      await downloadWithNode(target, tmpDest);
-      if (isValidBinaryFile(tmpDest)) {
-        fs.renameSync(tmpDest, dest);
-        return;
-      }
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-
-  try { if (fs.existsSync(tmpDest)) fs.unlinkSync(tmpDest); } catch {}
-  throw lastErr || new Error(`文件下载校验失败: ${url}`);
-}
-
-function downloadWithNode(url, dest, redirectCount = 0) {
+function downloadWithNode(url, dest, redirects = 5) {
   return new Promise((resolve, reject) => {
-    if (redirectCount > 5) return reject(new Error('重定向次数过多'));
-    const mod = url.startsWith('https') ? https : http;
-    const file = fs.createWriteStream(dest);
-    const req = mod.get(url, { headers: { 'User-Agent': 'curl/8.5.0' }, timeout: 90000 }, (res) => {
+    let mod;
+    try { mod = new URL(url).protocol === 'https:' ? https : http; } catch (e) { return reject(e); }
+    const req = mod.get(url, { timeout: 30000, headers: { 'User-Agent': 'curl/8.5.0' } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        file.close();
-        try { fs.unlinkSync(dest); } catch {}
-        try {
-          const nextUrl = new URL(res.headers.location, url).href;
-          return downloadWithNode(nextUrl, dest, redirectCount + 1).then(resolve, reject);
-        } catch (err) {
-          return reject(err);
-        }
+        res.resume();
+        if (redirects <= 0) return reject(new Error('重定向次数过多'));
+        let next;
+        try { next = new URL(res.headers.location, url).href; } catch (e) { return reject(e); }
+        return downloadWithNode(next, dest, redirects - 1).then(resolve, reject);
       }
       if (res.statusCode !== 200) {
-        file.close();
-        try { fs.unlinkSync(dest); } catch {}
-        return reject(new Error(`下载失败，HTTP状态码: ${res.statusCode}`));
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode}`));
       }
+      const file = fs.createWriteStream(dest);
+      res.on('error', (e) => { file.destroy(); reject(e); });
+      res.on('aborted', () => { file.destroy(); reject(new Error('连接中断')); });
+      file.on('error', reject);
+      file.on('finish', () => file.close(() => resolve()));
       res.pipe(file);
-      file.on('finish', () => file.close(resolve));
     });
-    req.on('error', (err) => { try { fs.unlinkSync(dest); } catch {} reject(err); });
-    req.on('timeout', () => { req.destroy(); try { fs.unlinkSync(dest); } catch {} reject(new Error('下载超时')); });
+    req.on('timeout', () => req.destroy(new Error('下载超时')));
+    req.on('error', reject);
   });
+}
+
+const MIRRORS = ['https://ghfast.top/', 'https://ghproxy.net/', 'https://github.moeyy.xyz/', 'https://mirror.ghproxy.com/'];
+
+const runCmd = (cmd, args, timeout = 100000) =>
+  new Promise((resolve, reject) => execFile(cmd, args, { timeout }, (err) => (err ? reject(err) : resolve())));
+
+function sha256File(p) {
+  return crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+}
+
+function checkMagic(file, kind) {
+  if (!kind) return true;
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const b = Buffer.alloc(4);
+    fs.readSync(fd, b, 0, 4, 0);
+    const hex = b.toString('hex');
+    switch (kind) {
+      case 'gzip':  return hex.startsWith('1f8b');
+      case 'zip':   return hex.startsWith('504b');
+      case 'elf':   return hex === '7f454c46';
+      case 'pe':    return hex.startsWith('4d5a');
+      case 'macho': return ['cffaedfe', 'cefaedfe', 'cafebabe'].includes(hex);
+      default:      return true;
+    }
+  } catch { return false; }
+  finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
+}
+
+async function getAssetSha256(repo, tag, assetName) {
+  const api = tag === 'latest'
+    ? `https://api.github.com/repos/${repo}/releases/latest`
+    : `https://api.github.com/repos/${repo}/releases/tags/${tag}`;
+  try {
+    const rel = JSON.parse(await httpGet(api, 10000));
+    const asset = (rel.assets || []).find((a) => a.name === assetName);
+    const m = asset && typeof asset.digest === 'string' && asset.digest.match(/^sha256:([0-9a-f]{64})$/i);
+    return m ? m[1].toLowerCase() : '';
+  } catch { return ''; }
+}
+
+async function download(url, dest, { kind = null, minSize = 1 << 20, sha256 = '' } = {}) {
+  const tmp = `${dest}.part`;
+  // 镜像安全策略：拿到官方 SHA256 或显式配置 INSECURE_MIRROR=true 时才走第三方镜像
+  const prefixes = (sha256 || process.env.INSECURE_MIRROR === 'true') ? ['', ...MIRRORS] : [''];
+  let lastErr = null;
+  for (const prefix of prefixes) {
+    if (prefix) console.log(`尝试镜像: ${prefix}`);
+    const target = prefix + url;
+    const methods = [
+      () => runCmd('curl', ['-fsSL', '--max-time', '90', '-o', tmp, target]),
+      () => runCmd('wget', ['-q', '--timeout=90', '-O', tmp, target]),
+      () => downloadWithNode(target, tmp),
+    ];
+    for (const method of methods) {
+      try {
+        await method();
+        let ok = fs.existsSync(tmp) && fs.statSync(tmp).size >= minSize && checkMagic(tmp, kind);
+        if (ok && sha256) ok = sha256File(tmp) === sha256.toLowerCase();
+        if (ok) { fs.renameSync(tmp, dest); return; }
+        lastErr = new Error('下载内容校验未通过（大小 / 文件头魔数 / 哈希异常）');
+      } catch (e) { lastErr = e; }
+      try { fs.unlinkSync(tmp); } catch {}
+    }
+  }
+  throw lastErr || new Error(`文件下载失败: ${url}`);
+}
+
+function makeExecutable(p) {
+  if (os.platform() !== 'win32') {
+    try { fs.chmodSync(p, 0o755); } catch {}
+  }
+}
+
+function findFile(dir, names) {
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      const r = findFile(p, names);
+      if (r) return r;
+    } else if (names.includes(e.name)) {
+      return p;
+    }
+  }
+  return null;
+}
+
+function launchWithLog(bin, args, opts, logFile) {
+  const fd = fs.openSync(logFile, 'a');
+  try {
+    return spawn(bin, args, { ...opts, stdio: ['ignore', fd, fd] });
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function superviseProcess(name, spawnFn) {
+  let delay = 3000;
+  const launch = () => {
+    if (isShuttingDown) return null;
+    const startedAt = Date.now();
+    const child = spawnFn();
+    if (!child) return null;
+    trackedProcesses.push(child);
+    console.log(`[保活] ${name} 已启动，PID: ${child.pid}`);
+    child.on('error', (err) => console.error(`[保活] ${name} 启动失败: ${err.message}`));
+    child.on('exit', (code, sig) => {
+      const i = trackedProcesses.indexOf(child);
+      if (i >= 0) trackedProcesses.splice(i, 1);
+      if (isShuttingDown) return;
+      delay = (Date.now() - startedAt > 60000) ? 3000 : Math.min(delay * 2, 60000);
+      console.warn(`[保活] ${name} 退出 (code=${code}, sig=${sig})，${delay / 1000}s 后自动重启`);
+      setTimeout(launch, delay).unref();
+    });
+    return child;
+  };
+  return launch();
+}
+
+function normalizeCountry(s) {
+  s = String(s || '').trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(s) ? s : '';
+}
+
+function normalizeOrg(s) {
+  return String(s || '')
+    .replace(/^AS\d+\s+/, '')
+    .replace(/,?\s*\b(Inc|LLC|Ltd|Corp)\b\.?/gi, '')
+    .replace(/[^A-Za-z0-9 ._-]/g, '')
+    .trim().substring(0, 20);
 }
 
 // SS2022 密码：2022-blake3-aes-128-gcm 需要 16 字节 key，base64 后 24 字符
@@ -359,14 +439,13 @@ function secureFilePermissions(filePath) {
 // ──────────────────────────────────────────────
 
 function detectArch() {
-  const arch = os.arch();
   const archMap = {
     x64:   'amd64',
     arm64: 'arm64',
     arm:   'armv7',
     ia32:  '386',
   };
-  return archMap[arch] || 'amd64';
+  return archMap[os.arch()] || null;
 }
 
 function detectOS() {
@@ -378,77 +457,56 @@ function detectOS() {
 
 async function downloadSingBox() {
   if (fs.existsSync(SB_BIN_PATH)) {
-    if (os.platform() !== 'win32') execSync(`chmod +x "${SB_BIN_PATH}"`);
+    makeExecutable(SB_BIN_PATH);
     return SB_BIN_PATH;
   }
-  if (fs.existsSync('/usr/local/bin/node-worker')) {
-    return '/usr/local/bin/node-worker';
-  }
-  if (fs.existsSync('/usr/local/bin/sing-box')) {
-    return '/usr/local/bin/sing-box';
-  }
+  if (fs.existsSync('/usr/local/bin/node-worker')) return '/usr/local/bin/node-worker';
+  if (fs.existsSync('/usr/local/bin/sing-box')) return '/usr/local/bin/sing-box';
 
   const arch = detectArch();
+  if (!arch) throw new Error(`核心组件暂不支持当前 CPU 架构: ${os.arch()}`);
   const platform = detectOS();
 
   console.log(`正在获取核心组件最新版本 (${platform}-${arch})...`);
-
-  // 兜底版本必须 >= 1.12.0，否则 AnyTLS 协议类型无法被识别，
-  // 核心会在配置校验阶段整体拒绝启动（影响全部协议，不仅是AnyTLS）
   let version = 'v1.12.0';
   try {
-    const data = await httpGet('https://api.github.com/repos/SagerNet/sing-box/releases');
+    const data = await httpGet('https://api.github.com/repos/SagerNet/sing-box/releases', 10000);
     if (data) {
       const releases = JSON.parse(data);
       const stable = releases.find(r => !r.prerelease && !r.draft);
       if (stable && stable.tag_name) version = stable.tag_name;
     }
-  } catch {}
+  } catch (e) {
+    console.warn(`获取最新版本失败（${e.message}），使用兜底版本 ${version}`);
+  }
 
   console.log(`核心组件版本: ${version}`);
   const verNum = version.replace(/^v/, '');
   const ext = platform === 'windows' ? 'zip' : 'tar.gz';
   const tarName = `sing-box-${verNum}-${platform}-${arch}.${ext}`;
   const url = `https://github.com/SagerNet/sing-box/releases/download/${version}/${tarName}`;
+  const sha256 = await getAssetSha256('SagerNet/sing-box', version, tarName);
 
   fs.mkdirSync(CORE_DIR, { recursive: true });
   const tmpArchive = `${CORE_DIR}/.worker_${Date.now()}.${ext}`;
+  const workDir    = `${CORE_DIR}/.extract_${Date.now()}`;
   console.log('正在下载核心组件...');
-  await download(url, tmpArchive);
-
-  if (ext === 'zip') {
-    // Windows 环境解压并提取为 SB_BIN_PATH
-    const unzipDir = `${CORE_DIR}/.unzip_${Date.now()}`;
-    fs.mkdirSync(unzipDir, { recursive: true });
-    execSync(`powershell -Command "Expand-Archive -Path '${tmpArchive}' -DestinationPath '${unzipDir}' -Force"`);
-    const files = fs.readdirSync(unzipDir, { recursive: true });
-    for (const f of files) {
-      if (typeof f === 'string' && (f.endsWith('sing-box.exe') || f.endsWith('node-worker.exe'))) {
-        const fullPath = path.join(unzipDir, f);
-        if (fs.statSync(fullPath).isFile()) {
-          fs.copyFileSync(fullPath, SB_BIN_PATH);
-          break;
-        }
-      }
+  try {
+    await download(url, tmpArchive, { kind: ext === 'zip' ? 'zip' : 'gzip', minSize: 1 << 20, sha256 });
+    fs.mkdirSync(workDir, { recursive: true });
+    if (ext === 'zip') {
+      await runCmd('powershell', ['-Command', `Expand-Archive -Path '${tmpArchive}' -DestinationPath '${workDir}' -Force`]);
+    } else {
+      await runCmd('tar', ['-xzf', tmpArchive, '-C', workDir]);
     }
-    try { fs.rmSync(unzipDir, { recursive: true, force: true }); } catch {}
-  } else {
-    // Linux / Darwin: 解压并重命名为 node-worker，去除原始特征名
-    const tmpExtractDir = `${CORE_DIR}/.extract_${Date.now()}`;
-    fs.mkdirSync(tmpExtractDir, { recursive: true });
-    execSync(`tar -xzf "${tmpArchive}" -C "${tmpExtractDir}" --strip-components=1`);
-    const files = fs.readdirSync(tmpExtractDir);
-    for (const f of files) {
-      if (f === 'sing-box' || f === 'node-worker') {
-        fs.copyFileSync(path.join(tmpExtractDir, f), SB_BIN_PATH);
-        break;
-      }
-    }
-    try { fs.rmSync(tmpExtractDir, { recursive: true, force: true }); } catch {}
+    const bin = findFile(workDir, ['sing-box', 'sing-box.exe', 'node-worker', 'node-worker.exe']);
+    if (!bin) throw new Error('压缩包内未找到核心可执行文件');
+    fs.copyFileSync(bin, SB_BIN_PATH);
+    makeExecutable(SB_BIN_PATH);
+  } finally {
+    try { fs.rmSync(tmpArchive, { force: true }); } catch {}
+    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
   }
-
-  if (platform !== 'windows') execSync(`chmod +x "${SB_BIN_PATH}"`);
-  try { fs.unlinkSync(tmpArchive); } catch {}
   console.log('核心组件准备完成');
   return SB_BIN_PATH;
 }
@@ -459,34 +517,47 @@ async function downloadSingBox() {
 
 async function downloadCloudflared() {
   if (fs.existsSync(CLOUDFLARED_BIN)) {
-    if (os.platform() !== 'win32') execSync(`chmod +x "${CLOUDFLARED_BIN}"`);
+    makeExecutable(CLOUDFLARED_BIN);
     return CLOUDFLARED_BIN;
   }
-  if (fs.existsSync('/usr/local/bin/node-bridge')) {
-    return '/usr/local/bin/node-bridge';
-  }
-  if (fs.existsSync('/usr/local/bin/node-tunnel')) {
-    return '/usr/local/bin/node-tunnel';
-  }
-  if (fs.existsSync('/usr/local/bin/cloudflared')) {
-    return '/usr/local/bin/cloudflared';
-  }
+  if (fs.existsSync('/usr/local/bin/node-bridge')) return '/usr/local/bin/node-bridge';
+  if (fs.existsSync('/usr/local/bin/node-tunnel')) return '/usr/local/bin/node-tunnel';
+  if (fs.existsSync('/usr/local/bin/cloudflared')) return '/usr/local/bin/cloudflared';
 
   const platform = os.platform();
-  const arch = os.arch();
-
-  const archMap = {
-    linux:  { x64: 'linux-amd64',   arm64: 'linux-arm64',   arm: 'linux-arm' },
-    darwin: { x64: 'darwin-amd64',  arm64: 'darwin-arm64' },
+  const table = {
+    linux:  { x64: 'linux-amd64', arm64: 'linux-arm64', arm: 'linux-arm' },
+    darwin: { x64: 'darwin-amd64', arm64: 'darwin-arm64' },
     win32:  { x64: 'windows-amd64.exe', ia32: 'windows-386.exe' },
   };
+  const suffix = table[platform] && table[platform][os.arch()];
+  if (!suffix) throw new Error(`桥接组件暂不支持 ${platform}-${os.arch()}`);
 
-  const suffix = (archMap[platform] && archMap[platform][arch]) || 'linux-amd64';
-  console.log(`正在下载桥接组件 (${suffix})...`);
-  const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${suffix}`;
+  const isMac = platform === 'darwin';
+  const asset = `cloudflared-${suffix}${isMac ? '.tgz' : ''}`;
+  const url   = `https://github.com/cloudflare/cloudflared/releases/latest/download/${asset}`;
+  const sha256 = await getAssetSha256('cloudflare/cloudflared', 'latest', asset);
   fs.mkdirSync(CORE_DIR, { recursive: true });
-  await download(url, CLOUDFLARED_BIN);
-  if (platform !== 'win32') execSync(`chmod +x "${CLOUDFLARED_BIN}"`);
+
+  console.log(`正在下载桥接组件 (${suffix})...`);
+  if (isMac) {
+    const tgz = `${CORE_DIR}/.bridge_${Date.now()}.tgz`;
+    const dir = `${CORE_DIR}/.bridge_extract_${Date.now()}`;
+    try {
+      await download(url, tgz, { kind: 'gzip', minSize: 1 << 20, sha256 });
+      fs.mkdirSync(dir, { recursive: true });
+      await runCmd('tar', ['-xzf', tgz, '-C', dir]);
+      const bin = findFile(dir, ['cloudflared']);
+      if (!bin) throw new Error('压缩包内未找到 cloudflared');
+      fs.copyFileSync(bin, CLOUDFLARED_BIN);
+    } finally {
+      try { fs.rmSync(tgz, { force: true }); } catch {}
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    }
+  } else {
+    await download(url, CLOUDFLARED_BIN, { kind: platform === 'win32' ? 'pe' : 'elf', minSize: 1 << 20, sha256 });
+  }
+  makeExecutable(CLOUDFLARED_BIN);
   console.log('桥接组件准备完成');
   return CLOUDFLARED_BIN;
 }
@@ -517,9 +588,7 @@ async function downloadKomariAgent() {
   ];
   for (const p of candidatePaths) {
     if (fs.existsSync(p)) {
-      if (os.platform() !== 'win32') {
-        try { execSync(`chmod +x "${p}"`); } catch {}
-      }
+      makeExecutable(p);
       return p;
     }
   }
@@ -527,18 +596,20 @@ async function downloadKomariAgent() {
   const platform = detectOS();
   const arch = detectArch();
   if (arch !== 'amd64' && arch !== 'arm64') {
-    console.warn(`Komari 官方探针暂不支持当前 CPU 架构 (${arch})，仅支持 x86_64 与 aarch64`);
+    console.warn(`Komari 官方探针暂不支持当前 CPU 架构 (${os.arch()})，仅支持 x86_64 与 aarch64`);
     return null;
   }
   const ext = platform === 'windows' ? '.exe' : '';
   const fileName = `komari-agent-${platform}-${arch}${ext}`;
   const url = `https://github.com/komari-monitor/komari-agent/releases/latest/download/${fileName}`;
+  const sha256 = await getAssetSha256('komari-monitor/komari-agent', 'latest', fileName);
 
   fs.mkdirSync(CORE_DIR, { recursive: true });
   console.log(`正在下载监控探针 (${fileName})...`);
   try {
-    await download(url, KOMARI_BIN_PATH);
-    if (platform !== 'windows') execSync(`chmod +x "${KOMARI_BIN_PATH}"`);
+    const kind = platform === 'windows' ? 'pe' : (platform === 'darwin' ? 'macho' : 'elf');
+    await download(url, KOMARI_BIN_PATH, { kind, minSize: 1 << 20, sha256 });
+    makeExecutable(KOMARI_BIN_PATH);
     console.log('监控探针准备完成');
     return KOMARI_BIN_PATH;
   } catch (err) {
@@ -654,6 +725,71 @@ async function main() {
   const SUB_RAW  = PRESET_SUB || process.env.SUB || 'sub';
   const SUB_PATH = '/' + SUB_RAW.replace(/^\//, '');
 
+  // ── HTTP 服务（伪装页 + 订阅）提前监听，确保 PaaS 平台健康检查秒过 ──
+  const htmlPath = path.join(__dirname, 'index.html');
+  const INDEX_HTML = fs.existsSync(htmlPath)
+    ? fs.readFileSync(htmlPath, 'utf8')
+    : (fs.existsSync('./index.html')
+      ? fs.readFileSync('./index.html', 'utf8')
+      : '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Welcome</title></head>' +
+        '<body><h1>Hello World</h1></body></html>');
+
+  function handleHttp(req, res) {
+    const url = req.url.split('?')[0];
+
+    const baseHeaders = {
+      'Server': 'nginx/1.24.0',
+      'Connection': 'keep-alive'
+    };
+
+    if (url === '/favicon.ico') {
+      res.writeHead(204, baseHeaders);
+      res.end();
+      return;
+    }
+
+    if (url === '/robots.txt') {
+      res.writeHead(200, { ...baseHeaders, 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('User-agent: *\nDisallow: /');
+      return;
+    }
+
+    if (url === '/health' || url === '/healthz') {
+      res.writeHead(200, { ...baseHeaders, 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('ok');
+      return;
+    }
+
+    if (url === SUB_PATH) {
+      if (!global.SUB_CONTENT) {
+        res.writeHead(503, { ...baseHeaders, 'Retry-After': '5', 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('starting');
+      }
+      res.writeHead(200, {
+        ...baseHeaders,
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store, no-cache, must-revalidate'
+      });
+      res.end(global.SUB_CONTENT);
+    } else {
+      res.writeHead(200, {
+        ...baseHeaders,
+        'Content-Type': 'text/html; charset=utf-8'
+      });
+      res.end(INDEX_HTML);
+    }
+  }
+
+  const server = http.createServer(handleHttp);
+  server.on('error', (e) => {
+    console.error(`HTTP 服务监听失败 (端口 ${INBOUND_PORT}): ${e.code || ''} ${e.message}`);
+    process.exitCode = 1;
+    gracefulExit('LISTEN_ERROR');
+  });
+  server.listen(INBOUND_PORT, '0.0.0.0', () => {
+    console.log(`HTTP 服务启动，端口 ${INBOUND_PORT}`);
+  });
+
   const ARGO_DOMAIN = PRESET_ARGO_DOMAIN || process.env.ARGO_DOMAIN || '';
   const ARGO_AUTH   = PRESET_ARGO_AUTH   || process.env.ARGO_AUTH   || '';
 
@@ -694,22 +830,10 @@ async function main() {
 
   // 节点名称（若预设了 NAME 则跳过额外的地理位置网络探测以加快启动）
   let NAME = PRESET_NAME || process.env.NAME || '';
-  let COUNTRY = '';
   if (!NAME) {
-    const rawCountry = await httpGet('https://ipinfo.io/country') ||
-                      await httpGet('https://ifconfig.co/country-iso') || '';
-    if (/^[A-Za-z]{2}$/.test(rawCountry.trim())) {
-      COUNTRY = rawCountry.trim().toUpperCase();
-    }
-    let ASN_ORG = await httpGet('https://ipinfo.io/org') ||
-                  await httpGet('https://ifconfig.co/org') || '';
-    ASN_ORG = ASN_ORG
-      .replace(/^AS\d+\s+/, '')
-      .replace(/,?\s*Inc\.?$/, '').replace(/,?\s*LLC\.?/g, '')
-      .replace(/,?\s*Ltd\.?/g, '').replace(/,?\s*Corp\.?/g, '')
-      .trim().substring(0, 20);
-    NAME = COUNTRY && ASN_ORG ? `${COUNTRY}-${ASN_ORG}` :
-           COUNTRY ? `${COUNTRY}-sb` : 'sb';
+    const COUNTRY = normalizeCountry(await httpGet('https://ipinfo.io/country') || await httpGet('https://ifconfig.co/country-iso'));
+    const ASN_ORG = normalizeOrg(await httpGet('https://ipinfo.io/org') || await httpGet('https://ifconfig.co/org'));
+    NAME = COUNTRY && ASN_ORG ? `${COUNTRY}-${ASN_ORG}` : COUNTRY ? `${COUNTRY}-sb` : 'sb';
   }
 
   // 公网 IP（可选协议订阅需要，新增 S5/AnyTLS 也依赖公网IP）
@@ -1009,115 +1133,37 @@ async function main() {
     global.SB_START_FAILED = true;
   }
 
-  try {
-    if (os.platform() !== 'win32') {
-      const { spawnSync } = require('child_process');
-      spawnSync('pkill', ['-f', 'node /app/worker.js'], { stdio: 'ignore' });
-      spawnSync('pkill', ['-f', 'node-worker'], { stdio: 'ignore' });
-    }
-    await new Promise(r => setTimeout(r, 800));
-  } catch {}
+  killStaleByTag(['node /app/worker.js']);
+  await new Promise(r => setTimeout(r, 800));
 
   const sbEnv = { ...process.env };
   delete sbEnv.PORT;
 
   if (!global.SB_START_FAILED) {
     if (!FOREGROUND_CORE) {
-      function startWorker() {
-        if (isShuttingDown) return;
-        const sbLogFd = fs.openSync(SB_LOG_FILE, 'a');
-        const sb = spawn(sbBin, ['run', '-c', CONFIG_FILE], {
+      superviseProcess('核心工作进程', () => {
+        const sb = launchWithLog(sbBin, ['run', '-c', CONFIG_FILE], {
           argv0: os.platform() !== 'win32' ? 'node /app/worker.js' : undefined,
-          stdio: ['ignore', sbLogFd, sbLogFd],
           detached: os.platform() !== 'win32',
           env: sbEnv
-        });
-        fs.closeSync(sbLogFd);
-        trackedProcesses.push(sb);
+        }, SB_LOG_FILE);
         sb.unref();
-        console.log(`核心工作进程已在后台启动，PID: ${sb.pid}`);
-        console.log(`运行日志: ${SB_LOG_FILE}`);
-
-        sb.on('error', (err) => {
-          console.error(`核心进程启动失败: ${err.message}`);
-        });
-
-        sb.on('exit', (code, signal) => {
-          if (!isShuttingDown) {
-            console.warn(`[进程保活] 核心工作进程退出 (code=${code}, sig=${signal})，3 秒后自动重启保活...`);
-            setTimeout(startWorker, 3000).unref();
-          }
-        });
-      }
-
-      startWorker();
+        return sb;
+      });
+      console.log(`运行日志: ${SB_LOG_FILE}`);
     }
   }
 
   await new Promise(r => setTimeout(r, 1500));
 
-  // ── HTTP 服务（伪装页 + 订阅）函数定义 ──────────────
-  const htmlPath = path.join(__dirname, 'index.html');
-  const INDEX_HTML = fs.existsSync(htmlPath)
-    ? fs.readFileSync(htmlPath, 'utf8')
-    : (fs.existsSync('./index.html')
-      ? fs.readFileSync('./index.html', 'utf8')
-      : '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Welcome</title></head>' +
-        '<body><h1>Hello World</h1></body></html>');
-
-  function handleHttp(req, res) {
-    const url = req.url.split('?')[0];
-
-    // 标准 Web 服务器响应头伪装（掩盖 Node.js 指纹）
-    const baseHeaders = {
-      'Server': 'nginx/1.24.0',
-      'Connection': 'keep-alive'
-    };
-
-    if (url === '/favicon.ico') {
-      res.writeHead(204, baseHeaders);
-      res.end();
-      return;
-    }
-
-    if (url === '/robots.txt') {
-      res.writeHead(200, { ...baseHeaders, 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('User-agent: *\nDisallow: /');
-      return;
-    }
-
-    if (url === '/health' || url === '/healthz') {
-      res.writeHead(200, { ...baseHeaders, 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('ok');
-      return;
-    }
-
-    if (url === SUB_PATH) {
-      res.writeHead(200, {
-        ...baseHeaders,
-        'Content-Type': 'text/plain; charset=utf-8',
-        'Cache-Control': 'no-store, no-cache, must-revalidate'
-      });
-      res.end(global.SUB_CONTENT || '');
-    } else {
-      res.writeHead(200, {
-        ...baseHeaders,
-        'Content-Type': 'text/html; charset=utf-8'
-      });
-      res.end(INDEX_HTML);
-    }
-  }
-
-  const server = http.createServer(handleHttp);
-  server.on('error', err => console.error(`[HTTP服务异常] ${err.message}`));
-  server.listen(INBOUND_PORT, '0.0.0.0', () => {
-    console.log(`HTTP 服务启动，端口 ${INBOUND_PORT}`);
-  });
-
   // ── Node.js WS 反向代理（Argo 三协议路径分发与 HTTP 共享）──
   if (!DISABLE_ARGO) {
     const argoServer = http.createServer(handleHttp);
-    argoServer.on('error', err => console.error(`[Argo转发服务异常] ${err.message}`));
+    argoServer.on('error', (e) => {
+      console.error(`Argo 转发服务监听失败 (端口 ${ARGO_PORT}): ${e.code || ''} ${e.message}`);
+      process.exitCode = 1;
+      gracefulExit('LISTEN_ERROR');
+    });
 
     argoServer.on('upgrade', (req, socket, head) => {
       const reqPath = req.url.split('?')[0];
@@ -1169,11 +1215,10 @@ async function main() {
       if (kmBin && fs.existsSync(kmBin)) {
         const kmEndpoint = formatKomariEndpoint(KOMARI_DOMAIN);
 
-        function startKomari() {
-          if (isShuttingDown) return;
+        const km = superviseProcess('监控探针', () => {
           const kmLogStream = fs.createWriteStream(KOMARI_LOG_FILE, { flags: 'a' });
           const kmArgs = ['--disable-auto-update', '--ignore-unsafe-cert'];
-          const km = spawn(kmBin, kmArgs, {
+          const proc = spawn(kmBin, kmArgs, {
             argv0: os.platform() !== 'win32' ? 'node /app/metrics.js' : undefined,
             stdio: ['ignore', 'pipe', 'pipe'],
             detached: os.platform() !== 'win32',
@@ -1185,11 +1230,9 @@ async function main() {
               AGENT_TOKEN: KOMARI_TOKEN
             }
           });
+          proc.unref();
 
-          trackedProcesses.push(km);
-          km.unref();
-
-          km.stdout.on('data', (d) => {
+          proc.stdout.on('data', (d) => {
             try { kmLogStream.write(d); } catch {}
             const str = d.toString().trim();
             if (str && /connected|recovery|error|fail|warn/i.test(str)) {
@@ -1197,7 +1240,7 @@ async function main() {
             }
           });
 
-          km.stderr.on('data', (d) => {
+          proc.stderr.on('data', (d) => {
             try { kmLogStream.write(d); } catch {}
             const str = d.toString().trim();
             if (str) {
@@ -1205,26 +1248,20 @@ async function main() {
             }
           });
 
-          km.on('error', (err) => {
-            console.error(`[Komari 探针] 启动失败: ${err.message}`);
-          });
-
-          km.on('exit', (code, signal) => {
+          proc.on('exit', () => {
             try { kmLogStream.end(); } catch {}
-            const idx = trackedProcesses.indexOf(km);
-            if (idx !== -1) trackedProcesses.splice(idx, 1);
-            if (!isShuttingDown) {
-              console.warn(`[进程保活] Komari 监控探针退出 (code=${code}, sig=${signal})，5 秒后自动重启保活...`);
-              setTimeout(startKomari, 5000).unref();
-            }
           });
 
-          console.log(`监控探针已在后台启动，PID: ${km.pid}`);
+          return proc;
+        });
+
+        if (km) {
+          await new Promise((resolve) => {
+            km.once('spawn', () => { komariActive = true; resolve(); });
+            km.once('error', (err) => { console.error(`[Komari 探针] 启动失败: ${err.message}`); resolve(); });
+          });
           console.log(`监控日志: ${KOMARI_LOG_FILE}`);
         }
-
-        startKomari();
-        komariActive = true;
       }
     } catch (err) {
       console.warn(`启动 Komari 探针失败: ${err.message}`);
@@ -1404,18 +1441,25 @@ async function main() {
     console.log('[单进程模式] 订阅初始化与推送完成，核心工作进程接管前台运行...');
     await new Promise(r => setTimeout(r, 2000));
     try { if (fs.existsSync(SUB_FILE)) fs.unlinkSync(SUB_FILE); } catch {}
-    try { server.close(); } catch {}
-    const { spawnSync } = require('child_process');
-    spawnSync(sbBin, ['run', '-c', CONFIG_FILE], {
+    // 不再 server.close()：保留 /health 与订阅路径供平台健康检查
+    const core = spawn(sbBin, ['run', '-c', CONFIG_FILE], {
       argv0: os.platform() !== 'win32' ? 'node /app/worker.js' : undefined,
       stdio: 'inherit',
       env: sbEnv
     });
-    process.exit(0);
+    trackedProcesses.push(core);
+    core.on('error', (e) => {
+      console.error(`核心进程启动失败: ${e.message}`);
+      process.exit(1);
+    });
+    core.on('exit', (code) => {
+      if (!isShuttingDown) process.exit(code === null ? 1 : code);
+    });
   }
 }
 
 main().catch(err => {
-  console.error(err);
-  process.exit(1);
+  console.error(err && err.stack ? err.stack : err);
+  process.exitCode = 1;
+  gracefulExit('FATAL');
 });
