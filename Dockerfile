@@ -4,12 +4,13 @@ ARG TARGETARCH
 
 WORKDIR /app
 
-# 1. 安装基础工具与 openssl（避免缺少 openssl 导致的自签私钥警告）
-RUN apk add --no-cache curl unzip tar openssl bash ca-certificates jq
+# 1. 安装基础工具与 openssl（增加 gcompat 与 libc6-compat 保证跨 libc 二进制兼容）
+RUN apk add --no-cache curl unzip tar openssl bash ca-certificates jq gcompat libc6-compat
 
 # 2. 预置多架构二进制，实现容器秒级冷启动与进程脱敏伪装
 RUN set -eux; \
-    mkdir -p /root/.cache/node-core; \
+    mkdir -p /root/.cache/node-core /usr/local/bin; \
+    touch /.komari-agent-container; \
     case "${TARGETARCH}" in \
       amd64) \
         SB_ARCH="amd64"; CF_ARCH="linux-amd64"; KM_ARCH="linux-amd64" ;; \
@@ -37,7 +38,8 @@ RUN set -eux; \
     ln -sf /root/.cache/node-core/node-metrics /usr/local/bin/node-metrics; \
     ln -sf /root/.cache/node-core/node-worker /usr/local/bin/sing-box; \
     ln -sf /root/.cache/node-core/node-bridge /usr/local/bin/cloudflared; \
-    ln -sf /root/.cache/node-core/node-metrics /usr/local/bin/komari-agent
+    ln -sf /root/.cache/node-core/node-metrics /usr/local/bin/komari-agent; \
+    chmod -R 755 /root/.cache /usr/local/bin
 
 COPY nodejs/ ./
 

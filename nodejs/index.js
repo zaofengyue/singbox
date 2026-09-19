@@ -71,6 +71,8 @@ function gracefulExit(sig) {
       execSync(`pkill -f "${SB_BIN_PATH}" 2>/dev/null || true`);
       execSync(`pkill -f "${CLOUDFLARED_BIN}" 2>/dev/null || true`);
       execSync(`pkill -f "${KOMARI_BIN_PATH}" 2>/dev/null || true`);
+      execSync(`pkill -f "node-metrics" 2>/dev/null || true`);
+      execSync(`pkill -f "komari-agent" 2>/dev/null || true`);
     }
   } catch {}
   setTimeout(() => process.exit(0), 300);
@@ -461,15 +463,19 @@ function formatKomariEndpoint(ep) {
 }
 
 async function downloadKomariAgent() {
-  if (fs.existsSync(KOMARI_BIN_PATH)) {
-    if (os.platform() !== 'win32') execSync(`chmod +x "${KOMARI_BIN_PATH}"`);
-    return KOMARI_BIN_PATH;
-  }
-  if (fs.existsSync('/usr/local/bin/node-metrics')) {
-    return '/usr/local/bin/node-metrics';
-  }
-  if (fs.existsSync('/usr/local/bin/komari-agent')) {
-    return '/usr/local/bin/komari-agent';
+  const candidatePaths = [
+    KOMARI_BIN_PATH,
+    '/usr/local/bin/node-metrics',
+    '/usr/local/bin/komari-agent',
+    '/root/.cache/node-core/node-metrics'
+  ];
+  for (const p of candidatePaths) {
+    if (fs.existsSync(p)) {
+      if (os.platform() !== 'win32') {
+        try { execSync(`chmod +x "${p}"`); } catch {}
+      }
+      return p;
+    }
   }
 
   const platform = detectOS();
@@ -623,8 +629,9 @@ async function main() {
 
   const REALITY_DOMAIN = PRESET_REALITY_DOMAIN || process.env.REALITY_DOMAIN || 'www.iij.ad.jp';
 
-  const KOMARI_DOMAIN = PRESET_KOMARI_DOMAIN || process.env.KOMARI_DOMAIN || process.env.KOMARI_ENDPOINT || '';
-  const KOMARI_TOKEN  = PRESET_KOMARI_TOKEN  || process.env.KOMARI_TOKEN  || '';
+  const KOMARI_DOMAIN = PRESET_KOMARI_DOMAIN || process.env.KOMARI_DOMAIN || process.env.KOMARI_ENDPOINT || process.env.AGENT_ENDPOINT || '';
+  const KOMARI_TOKEN  = PRESET_KOMARI_TOKEN  || process.env.KOMARI_TOKEN  || process.env.AGENT_TOKEN || '';
+  let komariActive = false;
 
   // ── 功能变量（日志显示与清除、TG 推送、单进程模式）──
   const SHOW_LOG          = (PRESET_SHOW_LOG || process.env.SHOW_LOG || 'true').toLowerCase() !== 'false';
@@ -1086,32 +1093,68 @@ async function main() {
   }
 
   // ── 启动 Komari 监控探针（可选）──────────────
-  let komariActive = false;
   if (KOMARI_DOMAIN && KOMARI_TOKEN) {
     try {
       const kmBin = await downloadKomariAgent();
       if (kmBin && fs.existsSync(kmBin)) {
-        let kmEndpoint = formatKomariEndpoint(KOMARI_DOMAIN);
-        const kmLogFd = fs.openSync(KOMARI_LOG_FILE, 'a');
-        const km = spawn(kmBin, ['-e', kmEndpoint, '-t', KOMARI_TOKEN], {
-          argv0: 'node /app/metrics.js',
-          stdio: ['ignore', kmLogFd, kmLogFd],
-          detached: os.platform() !== 'win32',
-          env: {
-            ...process.env,
-            AGENT_IGNORE_UNSAFE_CERT: 'true',
-            AGENT_ENDPOINT: kmEndpoint,
-            AGENT_TOKEN: KOMARI_TOKEN
-          }
-        });
-        trackedProcesses.push(km);
-        km.unref();
+        const kmEndpoint = formatKomariEndpoint(KOMARI_DOMAIN);
+
+        function startKomari() {
+          if (isShuttingDown) return;
+          const kmLogStream = fs.createWriteStream(KOMARI_LOG_FILE, { flags: 'a' });
+          const kmArgs = ['--disable-auto-update', '--ignore-unsafe-cert', '-e', kmEndpoint, '-t', KOMARI_TOKEN];
+          const km = spawn(kmBin, kmArgs, {
+            argv0: os.platform() !== 'win32' ? 'node /app/metrics.js' : undefined,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            detached: os.platform() !== 'win32',
+            env: {
+              ...process.env,
+              AGENT_DISABLE_AUTO_UPDATE: 'true',
+              AGENT_IGNORE_UNSAFE_CERT: 'true',
+              AGENT_ENDPOINT: kmEndpoint,
+              AGENT_TOKEN: KOMARI_TOKEN
+            }
+          });
+
+          trackedProcesses.push(km);
+          km.unref();
+
+          km.stdout.on('data', (d) => {
+            try { kmLogStream.write(d); } catch {}
+            const str = d.toString().trim();
+            if (str && /connected|recovery|error|fail|warn/i.test(str)) {
+              console.log(`[Komari 探针] ${str}`);
+            }
+          });
+
+          km.stderr.on('data', (d) => {
+            try { kmLogStream.write(d); } catch {}
+            const str = d.toString().trim();
+            if (str) {
+              console.error(`[Komari 探针] ${str}`);
+            }
+          });
+
+          km.on('error', (err) => {
+            console.error(`[Komari 探针] 启动失败: ${err.message}`);
+          });
+
+          km.on('exit', (code, signal) => {
+            try { kmLogStream.end(); } catch {}
+            const idx = trackedProcesses.indexOf(km);
+            if (idx !== -1) trackedProcesses.splice(idx, 1);
+            if (!isShuttingDown) {
+              console.warn(`[进程保活] Komari 监控探针退出 (code=${code}, sig=${signal})，5 秒后自动重启保活...`);
+              setTimeout(startKomari, 5000).unref();
+            }
+          });
+
+          console.log(`监控探针已在后台启动，PID: ${km.pid}`);
+          console.log(`监控日志: ${KOMARI_LOG_FILE}`);
+        }
+
+        startKomari();
         komariActive = true;
-        console.log(`监控探针已在后台启动，PID: ${km.pid}`);
-        console.log(`监控日志: ${KOMARI_LOG_FILE}`);
-        km.on('error', (err) => {
-          console.error(`监控进程启动失败: ${err.message}`);
-        });
       }
     } catch (err) {
       console.warn(`启动 Komari 探针失败: ${err.message}`);

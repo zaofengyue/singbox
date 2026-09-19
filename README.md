@@ -16,6 +16,8 @@ docker run -d \
   -e UUID=你的UUID \
   -e ARGO_DOMAIN=你的域名 \
   -e ARGO_AUTH=你的Token \
+  -e KOMARI_DOMAIN=你的Komari域名 \
+  -e KOMARI_TOKEN=你的KomariToken \
   ghcr.io/zaofengyue/sbx:latest
 ```
 
@@ -91,8 +93,8 @@ bash <(wget -qO- https://raw.githubusercontent.com/zaofengyue/singbox/main/singb
 
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
-| `KOMARI_DOMAIN` | Komari 服务端域名（如 `komari.example.com`） | 留空不启用 |
-| `KOMARI_TOKEN` | Komari 探针通信密钥 Token | 留空不启用 |
+| `KOMARI_DOMAIN` / `KOMARI_ENDPOINT` / `AGENT_ENDPOINT` | Komari 服务端域名或地址（如 `komari.example.com` 或 `http://IP:25774`） | 留空不启用 |
+| `KOMARI_TOKEN` / `AGENT_TOKEN` | Komari 探针通信密钥 Token | 留空不启用 |
 
 ## 注意事项
 
