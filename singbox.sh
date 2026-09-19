@@ -722,22 +722,21 @@ SVCEOF
     log "服务已通过用户级 systemd 启动并设置开机自启（证书自动续期已配置）"
   else
     do_restart
+    # 清理此前可能遗留的 .bashrc/.profile 进程注入（避免与 cron 叠加导致竞争或依赖登录触发）
+    for RC in "$HOME_DIR/.bashrc" "$HOME_DIR/.profile"; do
+      [ -f "$RC" ] && sed -i '/singbox.*run/d' "$RC" 2>/dev/null || true
+    done
     if command -v crontab >/dev/null 2>&1; then
       (crontab -l 2>/dev/null | grep -v "singbox" ; \
        echo "@reboot sleep 20 && bash $APP_DIR/singbox.sh run >> $LOG_FILE 2>&1" ; \
        echo "0 3 * * * bash $APP_DIR/singbox.sh renew-cron >> $LOG_FILE 2>&1") | crontab - 2>/dev/null || true
+      echo ""
+      log "服务已通过 nohup 后台启动，开机自启（cron @reboot）与证书自动续期已配置"
     else
-      warn "未检测到 crontab，开机自启依托 ~/.bashrc 唤醒守卫，证书续期已启用常驻进程每日检查兜底"
+      warn "未检测到 crontab，开机自启任务未注册，已启用常驻看门狗内的每日证书检查作为兜底"
+      echo ""
+      log "服务已通过 nohup 后台启动"
     fi
-    # 针对容器/非 systemd 环境（如 SAP BAS / Docker），注入 ~/.bashrc 与 ~/.profile 实现进入终端/环境唤醒时自动保活拉起
-    for RC in "$HOME_DIR/.bashrc" "$HOME_DIR/.profile"; do
-      if [ -f "$RC" ]; then
-        sed -i '/singbox.*run/d' "$RC" 2>/dev/null || true
-        echo "[ -f \"$APP_DIR/config.env\" ] && ! pgrep -x \"sing-box\" >/dev/null 2>&1 && nohup bash \"$APP_DIR/singbox.sh\" run >> \"$LOG_FILE\" 2>&1 &" >> "$RC"
-      fi
-    done
-    echo ""
-    log "服务已通过 nohup 后台启动，开机自启与自愈守卫已配置"
   fi
 
   echo ""
