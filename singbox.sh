@@ -75,12 +75,22 @@ USED_PORTS_FILE="/tmp/sb-used-ports.txt"
 
 # ── 配置文件读写工具 ──────────────────────────────────────────────────────────
 get_val() {
-  local key="$1"
+  local key="$1" _val=""
   if [ -f "$ENV_FILE" ]; then
-    grep "^${key}=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d'=' -f2- | sed -e 's/^"//' -e 's/"$//'
+    _val="$(grep "^${key}=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d'=' -f2-)"
   elif [ -f "$LEGACY_WRAPPER" ]; then
-    grep "^export ${key}=" "$LEGACY_WRAPPER" 2>/dev/null | head -1 | sed 's/.*="\(.*\)"/\1/'
+    _val="$(grep "^export ${key}=" "$LEGACY_WRAPPER" 2>/dev/null | head -1 | sed 's/.*="\(.*\)"/\1/')"
   fi
+  [ -z "$_val" ] && return 0
+  _val="${_val#\"}"
+  _val="${_val%\"}"
+  printf '%s' "$_val" | sed -e 's/\\\\/\x01/g' -e 's/\\"/"/g' -e 's/\\\$/$/g' -e 's/\\`/`/g' -e 's/\x01/\\/g'
+}
+
+# ── 转义工具函数(用于配置文件写入,防止被当做代码执行注入命令) ─────────────────
+_escape_for_env() {
+  # 转义会被 shell 执行或破坏双引号语法的字符：反斜杠、双引号、$、反引号
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\$/\\$/g' -e 's/`/\\`/g'
 }
 
 set_val() {
@@ -91,46 +101,68 @@ set_val() {
     chmod 600 "$ENV_FILE" 2>/dev/null || true
   fi
 
+  local _esc
+  _esc="$(_escape_for_env "$val")"
+
   if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
-    sed -i "s|^${key}=.*|${key}=\"${val}\"|" "$ENV_FILE"
-  else
-    echo "${key}=\"${val}\"" >> "$ENV_FILE"
+    local _tmp
+    _tmp="$(mktemp "${APP_DIR}/.env.XXXXXX" 2>/dev/null || mktemp /tmp/.env.XXXXXX)"
+    grep -v "^${key}=" "$ENV_FILE" > "$_tmp"
+    mv "$_tmp" "$ENV_FILE"
+    chmod 600 "$ENV_FILE" 2>/dev/null || true
   fi
+  printf '%s="%s"\n' "$key" "$_esc" >> "$ENV_FILE"
 
   if [ -f "$LEGACY_WRAPPER" ]; then
     if grep -q "^export ${key}=" "$LEGACY_WRAPPER" 2>/dev/null; then
-      sed -i "s|^export ${key}=.*|export ${key}=\"${val}\"|" "$LEGACY_WRAPPER"
-    else
-      sed -i "/^cd /i export ${key}=\"${val}\"" "$LEGACY_WRAPPER" 2>/dev/null || true
+      local _tmp2
+      _tmp2="$(mktemp "${APP_DIR}/.wrap.XXXXXX" 2>/dev/null || mktemp /tmp/.wrap.XXXXXX)"
+      grep -v "^export ${key}=" "$LEGACY_WRAPPER" > "$_tmp2"
+      mv "$_tmp2" "$LEGACY_WRAPPER"
     fi
+    sed -i "/^cd /i export ${key}=\"${_esc}\"" "$LEGACY_WRAPPER" 2>/dev/null || true
   fi
 
   if [ -f "$SVCFILE" ]; then
     if grep -q "^Environment=${key}=" "$SVCFILE" 2>/dev/null; then
-      sed -i "s|^Environment=${key}=.*|Environment=${key}=${val}|" "$SVCFILE"
-    else
-      sed -i "/^\[Install\]/i Environment=${key}=${val}" "$SVCFILE" 2>/dev/null || true
+      local _tmp3
+      _tmp3="$(mktemp "${APP_DIR}/.svc.XXXXXX" 2>/dev/null || mktemp /tmp/.svc.XXXXXX)"
+      grep -v "^Environment=${key}=" "$SVCFILE" > "$_tmp3"
+      mv "$_tmp3" "$SVCFILE"
     fi
+    sed -i "/^\[Install\]/i Environment=${key}=${_esc}" "$SVCFILE" 2>/dev/null || true
     systemctl --user daemon-reload 2>/dev/null || true
   fi
 }
 
 load_env_file() {
+  local _src=""
   if [ -f "$ENV_FILE" ]; then
-    set -a
-    # shellcheck disable=SC1090
-    . "$ENV_FILE"
-    set +a
+    _src="$ENV_FILE"
   elif [ -f "$LEGACY_WRAPPER" ]; then
     log "从历史配置 start.sh 迁移配置项..."
     touch "$ENV_FILE"
     chmod 600 "$ENV_FILE" 2>/dev/null || true
     grep "^export " "$LEGACY_WRAPPER" | sed 's/^export //' >> "$ENV_FILE"
-    set -a
-    # shellcheck disable=SC1090
-    . "$ENV_FILE"
-    set +a
+    _src="$ENV_FILE"
   fi
+  [ -z "$_src" ] && return 0
+
+  local _line _key _val
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    case "$_line" in
+      ''|'#'*) continue ;;
+      *=*) ;;
+      *) continue ;;
+    esac
+    _key="${_line%%=*}"
+    _val="${_line#*=}"
+    _val="${_val#\"}"
+    _val="${_val%\"}"
+    _val="$(printf '%s' "$_val" | sed -e 's/\\\\/\x01/g' -e 's/\\"/"/g' -e 's/\\\$/$/g' -e 's/\\`/`/g' -e 's/\x01/\\/g')"
+    printf -v "$_key" '%s' "$_val"
+    export "$_key"
+  done < "$_src"
 }
 
 # ── 基础依赖自动安装 ──────────────────────────────────────────────────────────
@@ -617,6 +649,13 @@ do_install() {
     fi
   fi
 
+  IN_NAME="$(_escape_for_env "$IN_NAME")"
+  IN_ARGO_DOMAIN="$(_escape_for_env "$IN_ARGO_DOMAIN")"
+  IN_ARGO_AUTH="$(_escape_for_env "$IN_ARGO_AUTH")"
+  IN_REALITY_DOMAIN="$(_escape_for_env "${IN_REALITY_DOMAIN:-www.iij.ad.jp}")"
+  IN_KOMARI_DOMAIN="$(_escape_for_env "$IN_KOMARI_DOMAIN")"
+  IN_KOMARI_TOKEN="$(_escape_for_env "$IN_KOMARI_TOKEN")"
+
   cat > "$ENV_FILE" << EOF
 UUID="${IN_UUID}"
 PORT="${IN_PORT}"
@@ -628,7 +667,7 @@ DISABLE_ARGO="${IN_DISABLE_ARGO}"
 HY2_PORT="${IN_HY2_PORT}"
 TUIC_PORT="${IN_TUIC_PORT}"
 REALITY_PORT="${IN_REALITY_PORT}"
-REALITY_DOMAIN="${IN_REALITY_DOMAIN:-www.iij.ad.jp}"
+REALITY_DOMAIN="${IN_REALITY_DOMAIN}"
 SS_PORT="${IN_SS_PORT}"
 SOCKS5_PORT="${IN_SOCKS5_PORT}"
 TROJAN_PORT="${IN_TROJAN_PORT}"
@@ -673,6 +712,7 @@ SVCEOF
     systemctl --user daemon-reload
     systemctl --user enable singbox
     systemctl --user restart singbox
+    loginctl enable-linger "$USER" 2>/dev/null || true
     if command -v crontab >/dev/null 2>&1; then
       (crontab -l 2>/dev/null | grep -v "singbox" ; echo "0 3 * * * bash $APP_DIR/singbox.sh renew-cron >> $LOG_FILE 2>&1") | crontab - 2>/dev/null || true
     else
@@ -1587,12 +1627,30 @@ do_run() {
   WS_PATH="${WS_PATH:-/fengyue-vm}"
 
   setup_port_hop() {
-    [ -n "$HY2_HOP_RANGE" ] || [ -n "$TUIC_HOP_RANGE" ] || return 0
-
     if [ "$(id -u)" != "0" ]; then
-      warn "端口跳跃需要 root 权限，本次跳过（协议本身仍会用主端口正常工作）"
-      return 1
+      if [ -n "$HY2_HOP_RANGE" ] || [ -n "$TUIC_HOP_RANGE" ]; then
+        warn "端口跳跃需要 root 权限，本次跳过（协议本身仍会用主端口正常工作）"
+      fi
+      return 0
     fi
+
+    # 无论本次是否启用端口跳跃，都先清理上一次运行遗留的规则，
+    # 避免用户关闭/修改该功能后旧的重定向规则残留
+    command -v nft >/dev/null 2>&1 && nft delete table inet singbox_hop >/dev/null 2>&1
+    if command -v iptables >/dev/null 2>&1; then
+      iptables -t nat -F SINGBOX_HOP 2>/dev/null
+      iptables -t nat -D PREROUTING -j SINGBOX_HOP 2>/dev/null
+      iptables -t nat -X SINGBOX_HOP 2>/dev/null
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+      ip6tables -t nat -F SINGBOX_HOP 2>/dev/null
+      ip6tables -t nat -D PREROUTING -j SINGBOX_HOP 2>/dev/null
+      ip6tables -t nat -X SINGBOX_HOP 2>/dev/null
+    fi
+
+    HY2_HOP_ACTIVE=0
+    TUIC_HOP_ACTIVE=0
+    [ -n "$HY2_HOP_RANGE" ] || [ -n "$TUIC_HOP_RANGE" ] || return 0
 
     local _backend=""
     if command -v nft >/dev/null 2>&1; then
