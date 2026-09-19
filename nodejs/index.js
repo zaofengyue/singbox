@@ -34,7 +34,7 @@ const PRESET_TG_CHAT_ID        = ''; // Telegram Chat ID
 const PRESET_SINGLE_PROCESS    = ''; // 填 'true' 开启极致单进程（禁用 Argo 时由核心独占常驻）
 // ==============================================================================
 
-const { execSync, spawn } = require('child_process');
+const { execSync, spawn, spawnSync, execFile } = require('child_process');
 const fs     = require('fs');
 const os     = require('os');
 const https  = require('https');
@@ -49,12 +49,22 @@ const path   = require('path');
 const trackedProcesses = [];
 let isShuttingDown = false;
 
+// 与各处 spawn 的 argv0 保持一致
+const PROC_TAGS = ['node /app/worker.js', 'node /app/bridge.js', 'node /app/metrics.js'];
+
+function killStaleByTag(tags = PROC_TAGS) {
+  if (os.platform() === 'win32') return;
+  for (const tag of tags) {
+    try { spawnSync('pkill', ['-f', tag], { stdio: 'ignore' }); } catch {}
+  }
+}
+
 process.on('uncaughtException', (err) => {
-  console.error(`[系统防崩溃] 拦截未捕获异常: ${err && err.message ? err.message : err}`);
+  console.error(`[系统防崩溃] 拦截未捕获异常: ${err && err.stack ? err.stack : (err && err.message ? err.message : err)}`);
 });
 
 process.on('unhandledRejection', (reason) => {
-  console.warn(`[系统防崩溃] 拦截未处理异步拒绝: ${reason && reason.message ? reason.message : reason}`);
+  console.warn(`[系统防崩溃] 拦截未处理异步拒绝: ${reason && reason.stack ? reason.stack : (reason && reason.message ? reason.message : reason)}`);
 });
 
 function gracefulExit(sig) {
@@ -66,16 +76,8 @@ function gracefulExit(sig) {
       if (proc && !proc.killed) proc.kill('SIGTERM');
     } catch {}
   }
-  try {
-    if (os.platform() !== 'win32') {
-      execSync(`pkill -f "${SB_BIN_PATH}" 2>/dev/null || true`);
-      execSync(`pkill -f "${CLOUDFLARED_BIN}" 2>/dev/null || true`);
-      execSync(`pkill -f "${KOMARI_BIN_PATH}" 2>/dev/null || true`);
-      execSync(`pkill -f "node-metrics" 2>/dev/null || true`);
-      execSync(`pkill -f "komari-agent" 2>/dev/null || true`);
-    }
-  } catch {}
-  setTimeout(() => process.exit(0), 300);
+  killStaleByTag();
+  setTimeout(() => process.exit(process.exitCode || 0), 300);
 }
 
 process.on('SIGTERM', () => gracefulExit('SIGTERM'));
@@ -119,70 +121,194 @@ function getFreePort() {
   });
 }
 
-function httpGet(url, timeout = 5000) {
+function httpGet(url, timeout = 5000, redirects = 3) {
   return new Promise((resolve) => {
-    const mod = url.startsWith('https') ? https : http;
-    const req = mod.get(url, { timeout }, (res) => {
+    let mod;
+    try { mod = new URL(url).protocol === 'https:' ? https : http; } catch { return resolve(''); }
+    const req = mod.get(url, {
+      timeout,
+      headers: { 'User-Agent': 'curl/8.5.0', 'Accept': '*/*' }
+    }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return httpGet(res.headers.location, timeout).then(resolve);
+        res.resume();
+        if (redirects <= 0) return resolve('');
+        let next;
+        try { next = new URL(res.headers.location, url).href; } catch { return resolve(''); }
+        return httpGet(next, timeout, redirects - 1).then(resolve);
       }
       if (res.statusCode < 200 || res.statusCode >= 300) {
         res.resume();
         return resolve('');
       }
+      res.setEncoding('utf8');
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => resolve(data.trim()));
+      res.on('error', () => resolve(''));
     });
     req.on('error', () => resolve(''));
     req.on('timeout', () => { req.destroy(); resolve(''); });
   });
 }
 
-// 跨平台下载：优先 curl，再 wget，最后用 Node 原生请求兜底，并支持主流镜像回退
-async function download(url, dest) {
-  const mirrors = ['', 'https://ghfast.top/', 'https://ghproxy.net/', 'https://github.moeyy.xyz/', 'https://mirror.ghproxy.com/'];
+function downloadWithNode(url, dest, redirects = 5) {
+  return new Promise((resolve, reject) => {
+    let mod;
+    try { mod = new URL(url).protocol === 'https:' ? https : http; } catch (e) { return reject(e); }
+    const req = mod.get(url, { timeout: 30000, headers: { 'User-Agent': 'curl/8.5.0' } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        if (redirects <= 0) return reject(new Error('重定向次数过多'));
+        let next;
+        try { next = new URL(res.headers.location, url).href; } catch (e) { return reject(e); }
+        return downloadWithNode(next, dest, redirects - 1).then(resolve, reject);
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      const file = fs.createWriteStream(dest);
+      res.on('error', (e) => { file.destroy(); reject(e); });
+      res.on('aborted', () => { file.destroy(); reject(new Error('连接中断')); });
+      file.on('error', reject);
+      file.on('finish', () => file.close(() => resolve()));
+      res.pipe(file);
+    });
+    req.on('timeout', () => req.destroy(new Error('下载超时')));
+    req.on('error', reject);
+  });
+}
+
+const MIRRORS = ['https://ghfast.top/', 'https://ghproxy.net/', 'https://github.moeyy.xyz/', 'https://mirror.ghproxy.com/'];
+
+const runCmd = (cmd, args, timeout = 100000) =>
+  new Promise((resolve, reject) => execFile(cmd, args, { timeout }, (err) => (err ? reject(err) : resolve())));
+
+function sha256File(p) {
+  return crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+}
+
+function checkMagic(file, kind) {
+  if (!kind) return true;
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const b = Buffer.alloc(4);
+    fs.readSync(fd, b, 0, 4, 0);
+    const hex = b.toString('hex');
+    switch (kind) {
+      case 'gzip':  return hex.startsWith('1f8b');
+      case 'zip':   return hex.startsWith('504b');
+      case 'elf':   return hex === '7f454c46';
+      case 'pe':    return hex.startsWith('4d5a');
+      case 'macho': return ['cffaedfe', 'cefaedfe', 'cafebabe'].includes(hex);
+      default:      return true;
+    }
+  } catch { return false; }
+  finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
+}
+
+async function getAssetSha256(repo, tag, assetName) {
+  const api = tag === 'latest'
+    ? `https://api.github.com/repos/${repo}/releases/latest`
+    : `https://api.github.com/repos/${repo}/releases/tags/${tag}`;
+  try {
+    const rel = JSON.parse(await httpGet(api, 10000));
+    const asset = (rel.assets || []).find((a) => a.name === assetName);
+    const m = asset && typeof asset.digest === 'string' && asset.digest.match(/^sha256:([0-9a-f]{64})$/i);
+    return m ? m[1].toLowerCase() : '';
+  } catch { return ''; }
+}
+
+async function download(url, dest, { kind = null, minSize = 1 << 20, sha256 = '' } = {}) {
+  const tmp = `${dest}.part`;
+  // 镜像安全策略：拿到官方 SHA256 或显式配置 INSECURE_MIRROR=true 时才走第三方镜像
+  const prefixes = (sha256 || process.env.INSECURE_MIRROR === 'true') ? ['', ...MIRRORS] : [''];
   let lastErr = null;
-  for (const prefix of mirrors) {
-    const target = prefix ? `${prefix}${url}` : url;
-    try {
-      execSync(`curl -fsSL --max-time 90 "${target}" -o "${dest}"`, { stdio: 'pipe' });
-      if (fs.existsSync(dest) && fs.statSync(dest).size > 0) return;
-    } catch {}
-    try {
-      execSync(`wget -q --timeout=90 "${target}" -O "${dest}"`, { stdio: 'pipe' });
-      if (fs.existsSync(dest) && fs.statSync(dest).size > 0) return;
-    } catch {}
-    try {
-      await downloadWithNode(target, dest);
-      if (fs.existsSync(dest) && fs.statSync(dest).size > 0) return;
-    } catch (e) {
-      lastErr = e;
+  for (const prefix of prefixes) {
+    if (prefix) console.log(`尝试镜像: ${prefix}`);
+    const target = prefix + url;
+    const methods = [
+      () => runCmd('curl', ['-fsSL', '--max-time', '90', '-o', tmp, target]),
+      () => runCmd('wget', ['-q', '--timeout=90', '-O', tmp, target]),
+      () => downloadWithNode(target, tmp),
+    ];
+    for (const method of methods) {
+      try {
+        await method();
+        let ok = fs.existsSync(tmp) && fs.statSync(tmp).size >= minSize && checkMagic(tmp, kind);
+        if (ok && sha256) ok = sha256File(tmp) === sha256.toLowerCase();
+        if (ok) { fs.renameSync(tmp, dest); return; }
+        lastErr = new Error('下载内容校验未通过（大小 / 文件头魔数 / 哈希异常）');
+      } catch (e) { lastErr = e; }
+      try { fs.unlinkSync(tmp); } catch {}
     }
   }
   throw lastErr || new Error(`文件下载失败: ${url}`);
 }
 
-function downloadWithNode(url, dest) {
-  return new Promise((resolve, reject) => {
-    const mod = url.startsWith('https') ? https : http;
-    const file = fs.createWriteStream(dest);
-    const req = mod.get(url, (res) => {
-      // 处理重定向
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        file.close();
-        fs.unlinkSync(dest);
-        return downloadWithNode(res.headers.location, dest).then(resolve, reject);
-      }
-      if (res.statusCode !== 200) {
-        file.close();
-        return reject(new Error(`下载失败，HTTP状态码: ${res.statusCode}`));
-      }
-      res.pipe(file);
-      file.on('finish', () => file.close(resolve));
+function makeExecutable(p) {
+  if (os.platform() !== 'win32') {
+    try { fs.chmodSync(p, 0o755); } catch {}
+  }
+}
+
+function findFile(dir, names) {
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      const r = findFile(p, names);
+      if (r) return r;
+    } else if (names.includes(e.name)) {
+      return p;
+    }
+  }
+  return null;
+}
+
+function launchWithLog(bin, args, opts, logFile) {
+  const fd = fs.openSync(logFile, 'a');
+  try {
+    return spawn(bin, args, { ...opts, stdio: ['ignore', fd, fd] });
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function superviseProcess(name, spawnFn) {
+  let delay = 3000;
+  const launch = () => {
+    if (isShuttingDown) return null;
+    const startedAt = Date.now();
+    const child = spawnFn();
+    if (!child) return null;
+    trackedProcesses.push(child);
+    console.log(`[保活] ${name} 已启动，PID: ${child.pid}`);
+    child.on('error', (err) => console.error(`[保活] ${name} 启动失败: ${err.message}`));
+    child.on('exit', (code, sig) => {
+      const i = trackedProcesses.indexOf(child);
+      if (i >= 0) trackedProcesses.splice(i, 1);
+      if (isShuttingDown) return;
+      delay = (Date.now() - startedAt > 60000) ? 3000 : Math.min(delay * 2, 60000);
+      console.warn(`[保活] ${name} 退出 (code=${code}, sig=${sig})，${delay / 1000}s 后自动重启`);
+      setTimeout(launch, delay).unref();
     });
-    req.on('error', (err) => { try { fs.unlinkSync(dest); } catch {} reject(err); });
-  });
+    return child;
+  };
+  return launch();
+}
+
+function normalizeCountry(s) {
+  s = String(s || '').trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(s) ? s : '';
+}
+
+function normalizeOrg(s) {
+  return String(s || '')
+    .replace(/^AS\d+\s+/, '')
+    .replace(/,?\s*\b(Inc|LLC|Ltd|Corp)\b\.?/gi, '')
+    .replace(/[^A-Za-z0-9 ._-]/g, '')
+    .trim().substring(0, 20);
 }
 
 // SS2022 密码：2022-blake3-aes-128-gcm 需要 16 字节 key，base64 后 24 字符
@@ -313,14 +439,13 @@ function secureFilePermissions(filePath) {
 // ──────────────────────────────────────────────
 
 function detectArch() {
-  const arch = os.arch();
   const archMap = {
     x64:   'amd64',
     arm64: 'arm64',
     arm:   'armv7',
     ia32:  '386',
   };
-  return archMap[arch] || 'amd64';
+  return archMap[os.arch()] || null;
 }
 
 function detectOS() {
@@ -332,77 +457,56 @@ function detectOS() {
 
 async function downloadSingBox() {
   if (fs.existsSync(SB_BIN_PATH)) {
-    if (os.platform() !== 'win32') execSync(`chmod +x "${SB_BIN_PATH}"`);
+    makeExecutable(SB_BIN_PATH);
     return SB_BIN_PATH;
   }
-  if (fs.existsSync('/usr/local/bin/node-worker')) {
-    return '/usr/local/bin/node-worker';
-  }
-  if (fs.existsSync('/usr/local/bin/sing-box')) {
-    return '/usr/local/bin/sing-box';
-  }
+  if (fs.existsSync('/usr/local/bin/node-worker')) return '/usr/local/bin/node-worker';
+  if (fs.existsSync('/usr/local/bin/sing-box')) return '/usr/local/bin/sing-box';
 
   const arch = detectArch();
+  if (!arch) throw new Error(`核心组件暂不支持当前 CPU 架构: ${os.arch()}`);
   const platform = detectOS();
 
   console.log(`正在获取核心组件最新版本 (${platform}-${arch})...`);
-
-  // 兜底版本必须 >= 1.12.0，否则 AnyTLS 协议类型无法被识别，
-  // 核心会在配置校验阶段整体拒绝启动（影响全部协议，不仅是AnyTLS）
   let version = 'v1.12.0';
   try {
-    const data = await httpGet('https://api.github.com/repos/SagerNet/sing-box/releases');
+    const data = await httpGet('https://api.github.com/repos/SagerNet/sing-box/releases', 10000);
     if (data) {
       const releases = JSON.parse(data);
       const stable = releases.find(r => !r.prerelease && !r.draft);
       if (stable && stable.tag_name) version = stable.tag_name;
     }
-  } catch {}
+  } catch (e) {
+    console.warn(`获取最新版本失败（${e.message}），使用兜底版本 ${version}`);
+  }
 
   console.log(`核心组件版本: ${version}`);
   const verNum = version.replace(/^v/, '');
   const ext = platform === 'windows' ? 'zip' : 'tar.gz';
   const tarName = `sing-box-${verNum}-${platform}-${arch}.${ext}`;
   const url = `https://github.com/SagerNet/sing-box/releases/download/${version}/${tarName}`;
+  const sha256 = await getAssetSha256('SagerNet/sing-box', version, tarName);
 
   fs.mkdirSync(CORE_DIR, { recursive: true });
   const tmpArchive = `${CORE_DIR}/.worker_${Date.now()}.${ext}`;
+  const workDir    = `${CORE_DIR}/.extract_${Date.now()}`;
   console.log('正在下载核心组件...');
-  await download(url, tmpArchive);
-
-  if (ext === 'zip') {
-    // Windows 环境解压并提取为 SB_BIN_PATH
-    const unzipDir = `${CORE_DIR}/.unzip_${Date.now()}`;
-    fs.mkdirSync(unzipDir, { recursive: true });
-    execSync(`powershell -Command "Expand-Archive -Path '${tmpArchive}' -DestinationPath '${unzipDir}' -Force"`);
-    const files = fs.readdirSync(unzipDir, { recursive: true });
-    for (const f of files) {
-      if (typeof f === 'string' && (f.endsWith('sing-box.exe') || f.endsWith('node-worker.exe'))) {
-        const fullPath = path.join(unzipDir, f);
-        if (fs.statSync(fullPath).isFile()) {
-          fs.copyFileSync(fullPath, SB_BIN_PATH);
-          break;
-        }
-      }
+  try {
+    await download(url, tmpArchive, { kind: ext === 'zip' ? 'zip' : 'gzip', minSize: 1 << 20, sha256 });
+    fs.mkdirSync(workDir, { recursive: true });
+    if (ext === 'zip') {
+      await runCmd('powershell', ['-Command', `Expand-Archive -Path '${tmpArchive}' -DestinationPath '${workDir}' -Force`]);
+    } else {
+      await runCmd('tar', ['-xzf', tmpArchive, '-C', workDir]);
     }
-    try { fs.rmSync(unzipDir, { recursive: true, force: true }); } catch {}
-  } else {
-    // Linux / Darwin: 解压并重命名为 node-worker，去除原始特征名
-    const tmpExtractDir = `${CORE_DIR}/.extract_${Date.now()}`;
-    fs.mkdirSync(tmpExtractDir, { recursive: true });
-    execSync(`tar -xzf "${tmpArchive}" -C "${tmpExtractDir}" --strip-components=1`);
-    const files = fs.readdirSync(tmpExtractDir);
-    for (const f of files) {
-      if (f === 'sing-box' || f === 'node-worker') {
-        fs.copyFileSync(path.join(tmpExtractDir, f), SB_BIN_PATH);
-        break;
-      }
-    }
-    try { fs.rmSync(tmpExtractDir, { recursive: true, force: true }); } catch {}
+    const bin = findFile(workDir, ['sing-box', 'sing-box.exe', 'node-worker', 'node-worker.exe']);
+    if (!bin) throw new Error('压缩包内未找到核心可执行文件');
+    fs.copyFileSync(bin, SB_BIN_PATH);
+    makeExecutable(SB_BIN_PATH);
+  } finally {
+    try { fs.rmSync(tmpArchive, { force: true }); } catch {}
+    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
   }
-
-  if (platform !== 'windows') execSync(`chmod +x "${SB_BIN_PATH}"`);
-  try { fs.unlinkSync(tmpArchive); } catch {}
   console.log('核心组件准备完成');
   return SB_BIN_PATH;
 }
@@ -413,34 +517,47 @@ async function downloadSingBox() {
 
 async function downloadCloudflared() {
   if (fs.existsSync(CLOUDFLARED_BIN)) {
-    if (os.platform() !== 'win32') execSync(`chmod +x "${CLOUDFLARED_BIN}"`);
+    makeExecutable(CLOUDFLARED_BIN);
     return CLOUDFLARED_BIN;
   }
-  if (fs.existsSync('/usr/local/bin/node-bridge')) {
-    return '/usr/local/bin/node-bridge';
-  }
-  if (fs.existsSync('/usr/local/bin/node-tunnel')) {
-    return '/usr/local/bin/node-tunnel';
-  }
-  if (fs.existsSync('/usr/local/bin/cloudflared')) {
-    return '/usr/local/bin/cloudflared';
-  }
+  if (fs.existsSync('/usr/local/bin/node-bridge')) return '/usr/local/bin/node-bridge';
+  if (fs.existsSync('/usr/local/bin/node-tunnel')) return '/usr/local/bin/node-tunnel';
+  if (fs.existsSync('/usr/local/bin/cloudflared')) return '/usr/local/bin/cloudflared';
 
   const platform = os.platform();
-  const arch = os.arch();
-
-  const archMap = {
-    linux:  { x64: 'linux-amd64',   arm64: 'linux-arm64',   arm: 'linux-arm' },
-    darwin: { x64: 'darwin-amd64',  arm64: 'darwin-arm64' },
+  const table = {
+    linux:  { x64: 'linux-amd64', arm64: 'linux-arm64', arm: 'linux-arm' },
+    darwin: { x64: 'darwin-amd64', arm64: 'darwin-arm64' },
     win32:  { x64: 'windows-amd64.exe', ia32: 'windows-386.exe' },
   };
+  const suffix = table[platform] && table[platform][os.arch()];
+  if (!suffix) throw new Error(`桥接组件暂不支持 ${platform}-${os.arch()}`);
 
-  const suffix = (archMap[platform] && archMap[platform][arch]) || 'linux-amd64';
-  console.log(`正在下载桥接组件 (${suffix})...`);
-  const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${suffix}`;
+  const isMac = platform === 'darwin';
+  const asset = `cloudflared-${suffix}${isMac ? '.tgz' : ''}`;
+  const url   = `https://github.com/cloudflare/cloudflared/releases/latest/download/${asset}`;
+  const sha256 = await getAssetSha256('cloudflare/cloudflared', 'latest', asset);
   fs.mkdirSync(CORE_DIR, { recursive: true });
-  await download(url, CLOUDFLARED_BIN);
-  if (platform !== 'win32') execSync(`chmod +x "${CLOUDFLARED_BIN}"`);
+
+  console.log(`正在下载桥接组件 (${suffix})...`);
+  if (isMac) {
+    const tgz = `${CORE_DIR}/.bridge_${Date.now()}.tgz`;
+    const dir = `${CORE_DIR}/.bridge_extract_${Date.now()}`;
+    try {
+      await download(url, tgz, { kind: 'gzip', minSize: 1 << 20, sha256 });
+      fs.mkdirSync(dir, { recursive: true });
+      await runCmd('tar', ['-xzf', tgz, '-C', dir]);
+      const bin = findFile(dir, ['cloudflared']);
+      if (!bin) throw new Error('压缩包内未找到 cloudflared');
+      fs.copyFileSync(bin, CLOUDFLARED_BIN);
+    } finally {
+      try { fs.rmSync(tgz, { force: true }); } catch {}
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    }
+  } else {
+    await download(url, CLOUDFLARED_BIN, { kind: platform === 'win32' ? 'pe' : 'elf', minSize: 1 << 20, sha256 });
+  }
+  makeExecutable(CLOUDFLARED_BIN);
   console.log('桥接组件准备完成');
   return CLOUDFLARED_BIN;
 }
@@ -471,9 +588,7 @@ async function downloadKomariAgent() {
   ];
   for (const p of candidatePaths) {
     if (fs.existsSync(p)) {
-      if (os.platform() !== 'win32') {
-        try { execSync(`chmod +x "${p}"`); } catch {}
-      }
+      makeExecutable(p);
       return p;
     }
   }
@@ -481,18 +596,20 @@ async function downloadKomariAgent() {
   const platform = detectOS();
   const arch = detectArch();
   if (arch !== 'amd64' && arch !== 'arm64') {
-    console.warn(`Komari 官方探针暂不支持当前 CPU 架构 (${arch})，仅支持 x86_64 与 aarch64`);
+    console.warn(`Komari 官方探针暂不支持当前 CPU 架构 (${os.arch()})，仅支持 x86_64 与 aarch64`);
     return null;
   }
   const ext = platform === 'windows' ? '.exe' : '';
   const fileName = `komari-agent-${platform}-${arch}${ext}`;
   const url = `https://github.com/komari-monitor/komari-agent/releases/latest/download/${fileName}`;
+  const sha256 = await getAssetSha256('komari-monitor/komari-agent', 'latest', fileName);
 
   fs.mkdirSync(CORE_DIR, { recursive: true });
   console.log(`正在下载监控探针 (${fileName})...`);
   try {
-    await download(url, KOMARI_BIN_PATH);
-    if (platform !== 'windows') execSync(`chmod +x "${KOMARI_BIN_PATH}"`);
+    const kind = platform === 'windows' ? 'pe' : (platform === 'darwin' ? 'macho' : 'elf');
+    await download(url, KOMARI_BIN_PATH, { kind, minSize: 1 << 20, sha256 });
+    makeExecutable(KOMARI_BIN_PATH);
     console.log('监控探针准备完成');
     return KOMARI_BIN_PATH;
   } catch (err) {
@@ -515,8 +632,8 @@ function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = '
         'tunnel', '--edge-ip-version', 'auto', '--protocol', argoProtocol, '--no-autoupdate',
         'run', '--token', argoAuth
       ], {
-        argv0: 'node /app/bridge.js',
-        stdio: 'pipe'
+        argv0: os.platform() !== 'win32' ? 'node /app/bridge.js' : undefined,
+        stdio: 'ignore'
       });
       trackedProcesses.push(cf);
       cf.on('error', err => console.error('bridge 进程错误:', err));
@@ -528,14 +645,14 @@ function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = '
         'tunnel', '--edge-ip-version', 'auto', '--protocol', argoProtocol, '--no-autoupdate',
         '--url', `http://127.0.0.1:${argoPort}`
       ], {
-        argv0: 'node /app/bridge.js',
-        stdio: 'pipe'
+        argv0: os.platform() !== 'win32' ? 'node /app/bridge.js' : undefined,
+        stdio: ['ignore', 'ignore', 'pipe']
       });
       trackedProcesses.push(cf);
 
       cf.stderr.on('data', (data) => {
         const str   = data.toString();
-        const match = str.match(/https:\/\/([a-z0-9-]+\.trycloudflare\.com)/);
+        const match = str.match(/https:\/\/(?!api\.)([a-z0-9-]+\.trycloudflare\.com)/);
         if (match && !argoHost) {
           argoHost = match[1];
           console.log(`临时隧道域名: ${argoHost}`);
@@ -576,14 +693,19 @@ async function getPublicIP() {
 // ──────────────────────────────────────────────
 
 async function main() {
-  const DISABLE_ARGO = PRESET_DISABLE_ARGO === 'true' || process.env.DISABLE_ARGO === 'true';
+  const DISABLE_ARGO = (PRESET_DISABLE_ARGO || process.env.DISABLE_ARGO || '').toLowerCase() === 'true';
 
   // UUID
   let UUID = PRESET_UUID || process.env.UUID || '';
-  if (UUID) {
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (UUID && uuidRegex.test(UUID)) {
     fs.writeFileSync(UUID_FILE, UUID);
   } else if (fs.existsSync(UUID_FILE)) {
     UUID = fs.readFileSync(UUID_FILE, 'utf8').trim();
+    if (!uuidRegex.test(UUID)) {
+      UUID = crypto.randomUUID();
+      fs.writeFileSync(UUID_FILE, UUID);
+    }
   } else {
     UUID = crypto.randomUUID();
     fs.writeFileSync(UUID_FILE, UUID);
@@ -602,6 +724,71 @@ async function main() {
 
   const SUB_RAW  = PRESET_SUB || process.env.SUB || 'sub';
   const SUB_PATH = '/' + SUB_RAW.replace(/^\//, '');
+
+  // ── HTTP 服务（伪装页 + 订阅）提前监听，确保 PaaS 平台健康检查秒过 ──
+  const htmlPath = path.join(__dirname, 'index.html');
+  const INDEX_HTML = fs.existsSync(htmlPath)
+    ? fs.readFileSync(htmlPath, 'utf8')
+    : (fs.existsSync('./index.html')
+      ? fs.readFileSync('./index.html', 'utf8')
+      : '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Welcome</title></head>' +
+        '<body><h1>Hello World</h1></body></html>');
+
+  function handleHttp(req, res) {
+    const url = req.url.split('?')[0];
+
+    const baseHeaders = {
+      'Server': 'nginx/1.24.0',
+      'Connection': 'keep-alive'
+    };
+
+    if (url === '/favicon.ico') {
+      res.writeHead(204, baseHeaders);
+      res.end();
+      return;
+    }
+
+    if (url === '/robots.txt') {
+      res.writeHead(200, { ...baseHeaders, 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('User-agent: *\nDisallow: /');
+      return;
+    }
+
+    if (url === '/health' || url === '/healthz') {
+      res.writeHead(200, { ...baseHeaders, 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('ok');
+      return;
+    }
+
+    if (url === SUB_PATH) {
+      if (!global.SUB_CONTENT) {
+        res.writeHead(503, { ...baseHeaders, 'Retry-After': '5', 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('starting');
+      }
+      res.writeHead(200, {
+        ...baseHeaders,
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store, no-cache, must-revalidate'
+      });
+      res.end(global.SUB_CONTENT);
+    } else {
+      res.writeHead(200, {
+        ...baseHeaders,
+        'Content-Type': 'text/html; charset=utf-8'
+      });
+      res.end(INDEX_HTML);
+    }
+  }
+
+  const server = http.createServer(handleHttp);
+  server.on('error', (e) => {
+    console.error(`HTTP 服务监听失败 (端口 ${INBOUND_PORT}): ${e.code || ''} ${e.message}`);
+    process.exitCode = 1;
+    gracefulExit('LISTEN_ERROR');
+  });
+  server.listen(INBOUND_PORT, '0.0.0.0', () => {
+    console.log(`HTTP 服务启动，端口 ${INBOUND_PORT}`);
+  });
 
   const ARGO_DOMAIN = PRESET_ARGO_DOMAIN || process.env.ARGO_DOMAIN || '';
   const ARGO_AUTH   = PRESET_ARGO_AUTH   || process.env.ARGO_AUTH   || '';
@@ -639,22 +826,14 @@ async function main() {
   const TG_BOT_TOKEN      = PRESET_TG_BOT_TOKEN || process.env.TG_BOT_TOKEN || '';
   const TG_CHAT_ID        = PRESET_TG_CHAT_ID   || process.env.TG_CHAT_ID   || '';
   const SINGLE_PROCESS    = (PRESET_SINGLE_PROCESS || process.env.SINGLE_PROCESS || '').toLowerCase() === 'true';
+  const FOREGROUND_CORE   = SINGLE_PROCESS && DISABLE_ARGO && !(KOMARI_DOMAIN && KOMARI_TOKEN);
 
-  // 节点名称
-  const COUNTRY = await httpGet('https://ipinfo.io/country') ||
-                  await httpGet('https://ifconfig.co/country-iso') || '';
-
+  // 节点名称（若预设了 NAME 则跳过额外的地理位置网络探测以加快启动）
   let NAME = PRESET_NAME || process.env.NAME || '';
   if (!NAME) {
-    let ASN_ORG = await httpGet('https://ipinfo.io/org') ||
-                  await httpGet('https://ifconfig.co/org') || '';
-    ASN_ORG = ASN_ORG
-      .replace(/^AS\d+\s+/, '')
-      .replace(/,?\s*Inc\.?$/, '').replace(/,?\s*LLC\.?/g, '')
-      .replace(/,?\s*Ltd\.?/g, '').replace(/,?\s*Corp\.?/g, '')
-      .trim().substring(0, 20);
-    NAME = COUNTRY && ASN_ORG ? `${COUNTRY}-${ASN_ORG}` :
-           COUNTRY ? `${COUNTRY}-sb` : 'sb';
+    const COUNTRY = normalizeCountry(await httpGet('https://ipinfo.io/country') || await httpGet('https://ifconfig.co/country-iso'));
+    const ASN_ORG = normalizeOrg(await httpGet('https://ipinfo.io/org') || await httpGet('https://ifconfig.co/org'));
+    NAME = COUNTRY && ASN_ORG ? `${COUNTRY}-${ASN_ORG}` : COUNTRY ? `${COUNTRY}-sb` : 'sb';
   }
 
   // 公网 IP（可选协议订阅需要，新增 S5/AnyTLS 也依赖公网IP）
@@ -841,26 +1020,32 @@ async function main() {
       }
     }
 
-    global.REALITY_PUB_KEY = realityPubKey;
+    const realityFinal = !!(realityPrivKey && realityPubKey);
+    if (realityFinal) {
+      global.REALITY_PUB_KEY = realityPubKey;
 
-    inbounds.push({
-      type: 'vless',
-      tag: 'reality-in',
-      listen: '::',
-      listen_port: parseInt(REALITY_PORT),
-      users: [{ uuid: UUID, flow: 'xtls-rprx-vision' }],
-      tls: {
-        enabled: true,
-        server_name: REALITY_DOMAIN,
-        reality: {
+      inbounds.push({
+        type: 'vless',
+        tag: 'reality-in',
+        listen: '::',
+        listen_port: parseInt(REALITY_PORT),
+        users: [{ uuid: UUID, flow: 'xtls-rprx-vision' }],
+        tls: {
           enabled: true,
-          handshake: { server: REALITY_DOMAIN, server_port: 443 },
-          private_key: realityPrivKey,
-          short_id: ['']
+          server_name: REALITY_DOMAIN,
+          reality: {
+            enabled: true,
+            handshake: { server: REALITY_DOMAIN, server_port: 443 },
+            private_key: realityPrivKey,
+            short_id: ['']
+          }
         }
-      }
-    });
+      });
+    } else {
+      console.warn('因 Reality 密钥生成失败，已安全跳过 Reality 协议以保障其他协议正常启动');
+    }
   }
+  const realityFinal = realityActive && !!global.REALITY_PUB_KEY;
 
   // Shadowsocks 2022（可选，TCP）
   if (ssActive) {
@@ -917,6 +1102,7 @@ async function main() {
   };
 
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+  secureFilePermissions(CONFIG_FILE);
 
   // 打印实际拿到的核心组件版本，方便排查"协议不支持"类问题
   try {
@@ -947,56 +1133,36 @@ async function main() {
     global.SB_START_FAILED = true;
   }
 
-  try {
-    if (os.platform() !== 'win32') {
-      execSync(`pkill -f "${SB_BIN_PATH}" 2>/dev/null || true`);
-      execSync(`pkill -f "node /app/worker.js" 2>/dev/null || true`);
-    }
-    await new Promise(r => setTimeout(r, 800));
-  } catch {}
+  killStaleByTag(['node /app/worker.js']);
+  await new Promise(r => setTimeout(r, 800));
 
   const sbEnv = { ...process.env };
   delete sbEnv.PORT;
 
   if (!global.SB_START_FAILED) {
-    if (!(SINGLE_PROCESS && DISABLE_ARGO && !komariActive)) {
-      function startWorker() {
-        if (isShuttingDown) return;
-        const sbLogFd = fs.openSync(SB_LOG_FILE, 'a');
-        const sb = spawn(sbBin, ['run', '-c', CONFIG_FILE], {
-          argv0: 'node /app/worker.js',
-          stdio: ['ignore', sbLogFd, sbLogFd],
+    if (!FOREGROUND_CORE) {
+      superviseProcess('核心工作进程', () => {
+        const sb = launchWithLog(sbBin, ['run', '-c', CONFIG_FILE], {
+          argv0: os.platform() !== 'win32' ? 'node /app/worker.js' : undefined,
           detached: os.platform() !== 'win32',
           env: sbEnv
-        });
-        trackedProcesses.push(sb);
+        }, SB_LOG_FILE);
         sb.unref();
-        console.log(`核心工作进程已在后台启动，PID: ${sb.pid}`);
-        console.log(`运行日志: ${SB_LOG_FILE}`);
-
-        sb.on('error', (err) => {
-          console.error(`核心进程启动失败: ${err.message}`);
-        });
-
-        sb.on('exit', (code, signal) => {
-          if (!isShuttingDown) {
-            console.warn(`[进程保活] 核心工作进程退出 (code=${code}, sig=${signal})，3 秒后自动重启保活...`);
-            setTimeout(startWorker, 3000).unref();
-          }
-        });
-      }
-
-      startWorker();
+        return sb;
+      });
+      console.log(`运行日志: ${SB_LOG_FILE}`);
     }
   }
 
   await new Promise(r => setTimeout(r, 1500));
 
-  // ── Node.js WS 反向代理（Argo 三协议路径分发）──
+  // ── Node.js WS 反向代理（Argo 三协议路径分发与 HTTP 共享）──
   if (!DISABLE_ARGO) {
-    const argoServer = http.createServer((req, res) => {
-      res.writeHead(400);
-      res.end('Bad Request');
+    const argoServer = http.createServer(handleHttp);
+    argoServer.on('error', (e) => {
+      console.error(`Argo 转发服务监听失败 (端口 ${ARGO_PORT}): ${e.code || ''} ${e.message}`);
+      process.exitCode = 1;
+      gracefulExit('LISTEN_ERROR');
     });
 
     argoServer.on('upgrade', (req, socket, head) => {
@@ -1026,68 +1192,18 @@ async function main() {
     });
   }
 
-  // ── HTTP 服务（伪装页 + 订阅）──────────────
-  const htmlPath = path.join(__dirname, 'index.html');
-  const INDEX_HTML = fs.existsSync(htmlPath)
-    ? fs.readFileSync(htmlPath, 'utf8')
-    : (fs.existsSync('./index.html')
-      ? fs.readFileSync('./index.html', 'utf8')
-      : '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Welcome</title></head>' +
-        '<body><h1>Hello World</h1></body></html>');
-
-  const server = http.createServer((req, res) => {
-    const url = req.url.split('?')[0];
-
-    // 标准 Web 服务器响应头伪装（掩盖 Node.js 指纹）
-    const baseHeaders = {
-      'Server': 'nginx/1.24.0',
-      'Connection': 'keep-alive'
-    };
-
-    if (url === '/favicon.ico') {
-      res.writeHead(204, baseHeaders);
-      res.end();
-      return;
-    }
-
-    if (url === '/robots.txt') {
-      res.writeHead(200, { ...baseHeaders, 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('User-agent: *\nDisallow: /');
-      return;
-    }
-
-    if (url === '/health' || url === '/healthz') {
-      res.writeHead(200, { ...baseHeaders, 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('ok');
-      return;
-    }
-
-    if (url === SUB_PATH) {
-      res.writeHead(200, {
-        ...baseHeaders,
-        'Content-Type': 'text/plain; charset=utf-8',
-        'Cache-Control': 'no-store, no-cache, must-revalidate'
-      });
-      res.end(global.SUB_CONTENT || '');
-    } else {
-      res.writeHead(200, {
-        ...baseHeaders,
-        'Content-Type': 'text/html; charset=utf-8'
-      });
-      res.end(INDEX_HTML);
-    }
-  });
-
-  server.listen(INBOUND_PORT, '0.0.0.0', () => {
-    console.log(`HTTP 服务启动，端口 ${INBOUND_PORT}`);
-  });
-
   // ── 启动 cloudflared ───────────────────────
   let HOST = 'your-domain.com';
   if (!DISABLE_ARGO) {
-    const cfBin    = await downloadCloudflared();
-    const argoHost = await startArgoTunnel(cfBin, ARGO_PORT, ARGO_DOMAIN, ARGO_AUTH, ARGO_PROTOCOL);
-    HOST = argoHost || 'your-domain.com';
+    try {
+      const cfBin    = await downloadCloudflared();
+      if (cfBin) {
+        const argoHost = await startArgoTunnel(cfBin, ARGO_PORT, ARGO_DOMAIN, ARGO_AUTH, ARGO_PROTOCOL);
+        HOST = argoHost || 'your-domain.com';
+      }
+    } catch (err) {
+      console.error(`Argo 隧道启动失败: ${err.message}`);
+    }
   } else {
     console.log('Argo 隧道已禁用，跳过 cloudflared');
   }
@@ -1099,11 +1215,10 @@ async function main() {
       if (kmBin && fs.existsSync(kmBin)) {
         const kmEndpoint = formatKomariEndpoint(KOMARI_DOMAIN);
 
-        function startKomari() {
-          if (isShuttingDown) return;
+        const km = superviseProcess('监控探针', () => {
           const kmLogStream = fs.createWriteStream(KOMARI_LOG_FILE, { flags: 'a' });
-          const kmArgs = ['--disable-auto-update', '--ignore-unsafe-cert', '-e', kmEndpoint, '-t', KOMARI_TOKEN];
-          const km = spawn(kmBin, kmArgs, {
+          const kmArgs = ['--disable-auto-update', '--ignore-unsafe-cert'];
+          const proc = spawn(kmBin, kmArgs, {
             argv0: os.platform() !== 'win32' ? 'node /app/metrics.js' : undefined,
             stdio: ['ignore', 'pipe', 'pipe'],
             detached: os.platform() !== 'win32',
@@ -1115,11 +1230,9 @@ async function main() {
               AGENT_TOKEN: KOMARI_TOKEN
             }
           });
+          proc.unref();
 
-          trackedProcesses.push(km);
-          km.unref();
-
-          km.stdout.on('data', (d) => {
+          proc.stdout.on('data', (d) => {
             try { kmLogStream.write(d); } catch {}
             const str = d.toString().trim();
             if (str && /connected|recovery|error|fail|warn/i.test(str)) {
@@ -1127,7 +1240,7 @@ async function main() {
             }
           });
 
-          km.stderr.on('data', (d) => {
+          proc.stderr.on('data', (d) => {
             try { kmLogStream.write(d); } catch {}
             const str = d.toString().trim();
             if (str) {
@@ -1135,26 +1248,20 @@ async function main() {
             }
           });
 
-          km.on('error', (err) => {
-            console.error(`[Komari 探针] 启动失败: ${err.message}`);
-          });
-
-          km.on('exit', (code, signal) => {
+          proc.on('exit', () => {
             try { kmLogStream.end(); } catch {}
-            const idx = trackedProcesses.indexOf(km);
-            if (idx !== -1) trackedProcesses.splice(idx, 1);
-            if (!isShuttingDown) {
-              console.warn(`[进程保活] Komari 监控探针退出 (code=${code}, sig=${signal})，5 秒后自动重启保活...`);
-              setTimeout(startKomari, 5000).unref();
-            }
           });
 
-          console.log(`监控探针已在后台启动，PID: ${km.pid}`);
+          return proc;
+        });
+
+        if (km) {
+          await new Promise((resolve) => {
+            km.once('spawn', () => { komariActive = true; resolve(); });
+            km.once('error', (err) => { console.error(`[Komari 探针] 启动失败: ${err.message}`); resolve(); });
+          });
           console.log(`监控日志: ${KOMARI_LOG_FILE}`);
         }
-
-        startKomari();
-        komariActive = true;
       }
     } catch (err) {
       console.warn(`启动 Komari 探针失败: ${err.message}`);
@@ -1185,9 +1292,11 @@ async function main() {
     );
   }
 
+  const formattedIp = (net.isIPv6 && net.isIPv6(PUBLIC_IP)) ? `[${PUBLIC_IP}]` : PUBLIC_IP;
+
   if (hy2Final && PUBLIC_IP) {
     links.push(
-      `hysteria2://${UUID}@${PUBLIC_IP}:${HY2_PORT}` +
+      `hysteria2://${UUID}@${formattedIp}:${HY2_PORT}` +
       `?sni=www.bing.com&insecure=1&alpn=h3&obfs=none` +
       `#${encodeURIComponent(NAME)}`
     );
@@ -1195,15 +1304,15 @@ async function main() {
 
   if (tuicFinal && PUBLIC_IP) {
     links.push(
-      `tuic://${UUID}:${UUID}@${PUBLIC_IP}:${TUIC_PORT}` +
+      `tuic://${UUID}:${UUID}@${formattedIp}:${TUIC_PORT}` +
       `?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1` +
       `#${encodeURIComponent(NAME)}`
     );
   }
 
-  if (realityActive && PUBLIC_IP && global.REALITY_PUB_KEY) {
+  if (realityFinal && PUBLIC_IP && global.REALITY_PUB_KEY) {
     links.push(
-      `vless://${UUID}@${PUBLIC_IP}:${REALITY_PORT}` +
+      `vless://${UUID}@${formattedIp}:${REALITY_PORT}` +
       `?encryption=none&flow=xtls-rprx-vision&security=reality` +
       `&sni=${REALITY_DOMAIN}&fp=firefox&pbk=${global.REALITY_PUB_KEY}` +
       `&type=tcp&headerType=none` +
@@ -1214,7 +1323,7 @@ async function main() {
   if (ssActive && PUBLIC_IP) {
     const ssUserInfo = Buffer.from(`2022-blake3-aes-128-gcm:${SS_PASS}`).toString('base64');
     links.push(
-      `ss://${ssUserInfo}@${PUBLIC_IP}:${SS_PORT}` +
+      `ss://${ssUserInfo}@${formattedIp}:${SS_PORT}` +
       `#${encodeURIComponent(NAME)}`
     );
   }
@@ -1223,7 +1332,7 @@ async function main() {
   if (s5Active && PUBLIC_IP) {
     const s5UserInfo = Buffer.from(`${UUID.substring(0, 8)}:${UUID.slice(-12)}`).toString('base64');
     links.push(
-      `socks://${s5UserInfo}@${PUBLIC_IP}:${S5_PORT}` +
+      `socks://${s5UserInfo}@${formattedIp}:${S5_PORT}` +
       `#${encodeURIComponent(NAME)}`
     );
   }
@@ -1231,7 +1340,7 @@ async function main() {
   // ───── 新增：AnyTLS 订阅链接 ─────
   if (anytlsFinal && PUBLIC_IP) {
     links.push(
-      `anytls://${UUID}@${PUBLIC_IP}:${ANYTLS_PORT}` +
+      `anytls://${UUID}@${formattedIp}:${ANYTLS_PORT}` +
       `?security=tls&sni=www.bing.com&fp=chrome&insecure=1&allowInsecure=1` +
       `#${encodeURIComponent(NAME)}`
     );
@@ -1241,7 +1350,10 @@ async function main() {
   global.SUB_CONTENT = SUB_BASE64;
 
   const SUB_FILE = `${process.cwd()}/sub.txt`;
-  fs.writeFileSync(SUB_FILE, SUB_BASE64);
+  try {
+    fs.writeFileSync(SUB_FILE, SUB_BASE64);
+    secureFilePermissions(SUB_FILE);
+  } catch {}
 
   // ── Telegram Bot 节点推送 ──────────────────
   if (TG_BOT_TOKEN && TG_CHAT_ID) {
@@ -1249,12 +1361,16 @@ async function main() {
     const escapedHost  = escapeHtml(HOST);
     const escapedSub   = escapeHtml(SUB_PATH);
     const escapedLinks = escapeHtml(links.join('\n\n'));
-    const tgText = `🚀 <b>Singbox 节点部署成功</b>\n\n` +
+    let tgText = `🚀 <b>Singbox 节点部署成功</b>\n\n` +
       `📌 <b>节点名称:</b> <code>${escapedName}</code>\n` +
       `🌐 <b>订阅地址:</b> <code>https://${escapedHost}${escapedSub}</code>\n` +
       `🕒 <b>更新时间:</b> ${new Date().toLocaleString()}\n\n` +
-      `📋 <b>节点链接:</b>\n<pre>${escapedLinks}</pre>\n\n` +
-      `📦 <b>Base64 订阅:</b>\n<pre>${SUB_BASE64}</pre>`;
+      `📋 <b>节点链接:</b>\n<pre>${escapedLinks}</pre>`;
+
+    // Telegram 消息单条上限 4096 字符，若加 Base64 不超长则附加，超长则仅保留节点链接避免 400 失败
+    if (tgText.length + SUB_BASE64.length + 50 <= 4000) {
+      tgText += `\n\n📦 <b>Base64 订阅:</b>\n<pre>${SUB_BASE64}</pre>`;
+    }
 
     console.log('正在向 Telegram Bot 推送节点配置...');
     sendTelegramMessage(TG_BOT_TOKEN, TG_CHAT_ID, tgText).then((ok) => {
@@ -1280,7 +1396,7 @@ async function main() {
     }
     if (hy2Final)      console.log(`✓ Hysteria2     端口 ${HY2_PORT} (UDP)`);
     if (tuicFinal)     console.log(`✓ TUIC v5       端口 ${TUIC_PORT} (UDP)`);
-    if (realityActive) console.log(`✓ VLESS Reality 端口 ${REALITY_PORT}  PubKey: ${global.REALITY_PUB_KEY || '生成中'}`);
+    if (realityFinal)  console.log(`✓ VLESS Reality 端口 ${REALITY_PORT}  PubKey: ${global.REALITY_PUB_KEY || '生成中'}`);
     if (ssActive)      console.log(`✓ Shadowsocks   端口 ${SS_PORT} (TCP)  密码: ${SS_PASS}`);
     if (s5Active)      console.log(`✓ Socks5        端口 ${S5_PORT} (TCP)  账号: ${UUID.substring(0, 8)}`);
     if (anytlsFinal)   console.log(`✓ AnyTLS        端口 ${ANYTLS_PORT} (TCP)`);
@@ -1321,22 +1437,29 @@ async function main() {
     console.log('====================================================');
   }
 
-  if (SINGLE_PROCESS && DISABLE_ARGO && !komariActive && !global.SB_START_FAILED) {
+  if (FOREGROUND_CORE && !global.SB_START_FAILED) {
     console.log('[单进程模式] 订阅初始化与推送完成，核心工作进程接管前台运行...');
     await new Promise(r => setTimeout(r, 2000));
     try { if (fs.existsSync(SUB_FILE)) fs.unlinkSync(SUB_FILE); } catch {}
-    try { server.close(); } catch {}
-    const { spawnSync } = require('child_process');
-    spawnSync(sbBin, ['run', '-c', CONFIG_FILE], {
-      argv0: 'node /app/worker.js',
+    // 不再 server.close()：保留 /health 与订阅路径供平台健康检查
+    const core = spawn(sbBin, ['run', '-c', CONFIG_FILE], {
+      argv0: os.platform() !== 'win32' ? 'node /app/worker.js' : undefined,
       stdio: 'inherit',
       env: sbEnv
     });
-    process.exit(0);
+    trackedProcesses.push(core);
+    core.on('error', (e) => {
+      console.error(`核心进程启动失败: ${e.message}`);
+      process.exit(1);
+    });
+    core.on('exit', (code) => {
+      if (!isShuttingDown) process.exit(code === null ? 1 : code);
+    });
   }
 }
 
 main().catch(err => {
-  console.error(err);
-  process.exit(1);
+  console.error(err && err.stack ? err.stack : err);
+  process.exitCode = 1;
+  gracefulExit('FATAL');
 });
