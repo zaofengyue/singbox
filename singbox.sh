@@ -129,23 +129,48 @@ set_val() {
   printf '%s="%s"\n' "$key" "$_esc" >> "$ENV_FILE"
 
   if [ -f "$LEGACY_WRAPPER" ]; then
-    if grep -q "^export ${key}=" "$LEGACY_WRAPPER" 2>/dev/null; then
-      local _tmp2
-      _tmp2="$(mktemp "${APP_DIR}/.wrap.XXXXXX" 2>/dev/null || mktemp /tmp/.wrap.XXXXXX)"
-      grep -v "^export ${key}=" "$LEGACY_WRAPPER" > "$_tmp2"
-      mv "$_tmp2" "$LEGACY_WRAPPER"
+    local _tmp2
+    _tmp2="$(mktemp "${APP_DIR}/.wrap.XXXXXX" 2>/dev/null || mktemp /tmp/.wrap.XXXXXX)"
+    local _line2 _inserted2=0
+    while IFS= read -r _line2 || [ -n "$_line2" ]; do
+      case "$_line2" in
+        "export ${key}="*) continue ;;
+        "cd "*)
+          if [ "$_inserted2" = "0" ]; then
+            printf 'export %s="%s"\n' "$key" "$_esc" >> "$_tmp2"
+            _inserted2=1
+          fi
+          ;;
+      esac
+      printf '%s\n' "$_line2" >> "$_tmp2"
+    done < "$LEGACY_WRAPPER"
+    if [ "$_inserted2" = "0" ]; then
+      printf 'export %s="%s"\n' "$key" "$_esc" >> "$_tmp2"
     fi
-    sed -i "/^cd /i export ${key}=\"${_esc}\"" "$LEGACY_WRAPPER" 2>/dev/null || true
+    mv "$_tmp2" "$LEGACY_WRAPPER"
+    chmod 700 "$LEGACY_WRAPPER" 2>/dev/null || true
   fi
 
   if [ -f "$SVCFILE" ]; then
-    if grep -q "^Environment=${key}=" "$SVCFILE" 2>/dev/null; then
-      local _tmp3
-      _tmp3="$(mktemp "${APP_DIR}/.svc.XXXXXX" 2>/dev/null || mktemp /tmp/.svc.XXXXXX)"
-      grep -v "^Environment=${key}=" "$SVCFILE" > "$_tmp3"
-      mv "$_tmp3" "$SVCFILE"
+    local _tmp3
+    _tmp3="$(mktemp "${APP_DIR}/.svc.XXXXXX" 2>/dev/null || mktemp /tmp/.svc.XXXXXX)"
+    local _line3 _inserted3=0
+    while IFS= read -r _line3 || [ -n "$_line3" ]; do
+      case "$_line3" in
+        "Environment=${key}="*) continue ;;
+        "[Install]"*)
+          if [ "$_inserted3" = "0" ]; then
+            printf 'Environment=%s=%s\n' "$key" "$_esc" >> "$_tmp3"
+            _inserted3=1
+          fi
+          ;;
+      esac
+      printf '%s\n' "$_line3" >> "$_tmp3"
+    done < "$SVCFILE"
+    if [ "$_inserted3" = "0" ]; then
+      printf 'Environment=%s=%s\n' "$key" "$_esc" >> "$_tmp3"
     fi
-    sed -i "/^\[Install\]/i Environment=${key}=${_esc}" "$SVCFILE" 2>/dev/null || true
+    mv "$_tmp3" "$SVCFILE"
     systemctl --user daemon-reload 2>/dev/null || true
   fi
 }
