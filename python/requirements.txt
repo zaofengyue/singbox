@@ -1,0 +1,3 @@
+# py-sb single-file deployment
+# Zero external pip dependencies required.
+# All modules are built into standard Python (3.8+).
