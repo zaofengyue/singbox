@@ -1,5 +1,6 @@
 """app.py — py-sb 单文件服务端部署程序。
-支持全自动跨平台多协议部署、Argo 隧道与直连协议、Komari 探针监控、Telegram 推送与隐私自愈保护。
+支持全自动跨平台（Linux / Windows / macOS）多协议部署、Argo 隧道与直连协议、
+Komari 探针监控、Telegram 推送、隐蔽脱敏防杀与自愈守护体系。
 """
 
 # ==================== 预留配置（留空则读取环境变量或自动识别） ====================
@@ -27,7 +28,7 @@ CONF_S5_PORT        = ""  # SOCKS5 端口 (TCP)
 CONF_ANYTLS_PORT    = ""  # AnyTLS 端口 (TCP)
 
 # ── 4. Komari 探针监控配置（可选，填写则上报监控，留空不启动）──
-CONF_KOMARI_DOMAIN  = ""  # Komari 服务端域名或地址（如 komari.example.com 或 http://IP:25774）
+CONF_KOMARI_DOMAIN  = ""  # Komari 服务端地址（如 https://komari.example.com 或 http://IP:25774）
 CONF_KOMARI_TOKEN   = ""  # Komari 探针密钥 Token
 
 # ── 5. 日志与推送功能配置 ──
@@ -40,6 +41,7 @@ CONF_SINGLE_PROCESS    = ""  # 填 "true" 开启极致单进程（禁用 Argo �
 
 import base64
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -57,25 +59,50 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
 log = logging.getLogger("py-sb")
 
 # ──────────────────────────────────────────────
-# 全局进程跟踪与优雅退出管理
+# 操作系统与架构探测
+# ──────────────────────────────────────────────
+def detect_os() -> str:
+    s = platform.system().lower()
+    if "windows" in s:
+        return "windows"
+    if "darwin" in s or "mac" in s:
+        return "darwin"
+    return "linux"
+
+
+ARCH_MAP = {
+    "x86_64": "amd64", "amd64": "amd64", "x64": "amd64",
+    "aarch64": "arm64", "arm64": "arm64",
+    "armv7l": "armv7", "armv7": "armv7",
+    "i386": "386", "i686": "386",
+}
+
+
+def detect_arch() -> str:
+    return ARCH_MAP.get(platform.machine().lower(), "amd64")
+
+
+# ──────────────────────────────────────────────
+# 全局进程管理与优雅退出系统
 # ──────────────────────────────────────────────
 tracked_processes = []
 is_shutting_down = False
 _tracked_lock = threading.Lock()
 
-# 与各处启动的伪装 argv0 保持一致
+# 进程伪装标签（对标 Node 版）
 PROC_TAGS = ["python /app/worker.py", "python /app/bridge.py", "python /app/metrics.py"]
 
 
-def kill_stale_by_tag(tags: list[str] = None):
-    """在 Linux/Unix 环境下通过 pkill 清理带有伪装特征的历史遗留僵尸进程。"""
-    if platform.system() == "Windows":
+def kill_stale_by_tag(tags: list = None):
+    """在非 Windows 环境下清理历史遗留僵尸进程。"""
+    if detect_os() == "windows":
         return
     if tags is None:
         tags = PROC_TAGS
@@ -126,31 +153,79 @@ def graceful_exit(signum=None, frame=None):
             pass
 
     kill_stale_by_tag()
-    log.info("[安全退出] 所有关联进程已安全终止，退出程序。")
+    log.info("[安全退出] 所有子进程已安全终止，退出。")
     sys.exit(0)
 
 
-# 注册系统终止信号
+# 注册系统终止信号与未捕获异常守卫
 try:
     signal.signal(signal.SIGTERM, graceful_exit)
     signal.signal(signal.SIGINT, graceful_exit)
 except Exception:
     pass
 
+
+def _uncaught_exception_handler(exctype, value, tb):
+    if issubclass(exctype, (KeyboardInterrupt, SystemExit)):
+        sys.__excepthook__(exctype, value, tb)
+        return
+    log.error("[系统防崩溃] 捕获未处理顶级异常: %s", value, exc_info=(exctype, value, tb))
+
+
+sys.excepthook = _uncaught_exception_handler
+
 # ──────────────────────────────────────────────
-# 目录与关键文件路径
+# 目录解析与安全防护（消除 /tmp 固定路径提权风险）
 # ──────────────────────────────────────────────
-HOME            = Path(os.environ.get("HOME") or tempfile.gettempdir())
-DATA_DIR        = HOME / "py-sb"
-UUID_FILE       = DATA_DIR / "uuid.txt"
-CONFIG_FILE     = DATA_DIR / "sb-config.json"
-SB_DIR          = DATA_DIR / "sing-box"
-SB_BIN_PATH     = SB_DIR / ("sing-box.exe" if platform.system() == "Windows" else "sing-box")
-CLOUDFLARED_BIN = DATA_DIR / ("cloudflared.exe" if platform.system() == "Windows" else "cloudflared")
-KOMARI_BIN_PATH = DATA_DIR / ("komari-agent.exe" if platform.system() == "Windows" else "komari-agent")
-KOMARI_LOG_FILE = DATA_DIR / "metrics.log"
+def _resolve_data_dir() -> Path:
+    home_env = os.environ.get("HOME")
+    if home_env:
+        base = Path(home_env)
+        # 对标 Node 版隐蔽目录
+        return base / ".cache" / "py-core"
+
+    # HOME 缺失时退化到临时目录，按 UID 区分，杜绝共享路径提权风险
+    base = Path(tempfile.gettempdir())
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    dirname = f"py-core-{uid}"
+    log.warning("未检测到 HOME 环境变量，数据目录退化至隔离目录 %s", base / dirname)
+    return base / dirname
+
+
+DATA_DIR = _resolve_data_dir()
+
+
+def _ensure_data_dir_safe(path: Path) -> None:
+    """确保数据目录安全创建：权限受限且属主正确。"""
+    path.mkdir(parents=True, exist_ok=True)
+    if detect_os() == "windows":
+        return
+    try:
+        cur_uid = os.getuid()
+        st = path.stat()
+        if st.st_uid != cur_uid:
+            raise RuntimeError(
+                f"数据目录 {path} 属主异常（UID={st.st_uid}，当前={cur_uid}），可能已被恶意占位！"
+            )
+        os.chmod(str(path), 0o700)
+    except OSError as e:
+        log.warning("收紧数据目录权限失败 %s: %s", path, e)
+
+
+_ensure_data_dir_safe(DATA_DIR)
+
+# 对标 Node 版脱敏文件名
+UUID_FILE       = DATA_DIR / ".session.key"
+CONFIG_FILE     = DATA_DIR / ".config.json"
+REALITY_KEY_FILE = DATA_DIR / ".reality-keys.json"
+
+is_win = (detect_os() == "windows")
+SB_BIN_PATH     = DATA_DIR / ("py-worker.exe" if is_win else "py-worker")
+CLOUDFLARED_BIN = DATA_DIR / ("py-bridge.exe" if is_win else "py-bridge")
+KOMARI_BIN_PATH = DATA_DIR / ("py-metrics.exe" if is_win else "py-metrics")
 SB_LOG_FILE     = DATA_DIR / "worker.log"
-CF_LOG_FILE     = DATA_DIR / "cloudflared.log"
+CF_LOG_FILE     = DATA_DIR / "bridge.log"
+KOMARI_LOG_FILE = DATA_DIR / "metrics.log"
 
 # Argo 三协议 WS 路径
 WS_PATH_VMESS  = "/fengyue-vm"
@@ -170,30 +245,12 @@ PATH_TO_PORT = {
 
 CF_PREFER_HOST = "cdns.doon.eu.org"
 
-ARCH_MAP = {
-    "x86_64": "amd64", "amd64": "amd64",
-    "aarch64": "arm64", "arm64": "arm64",
-    "armv7l": "armv7",
-    "i386": "386", "i686": "386",
-}
-CF_ARCH_MAP = {"amd64": "linux-amd64", "arm64": "linux-arm64", "armv7": "linux-arm"}
-KM_ARCH_MAP = {"amd64": "linux-amd64", "arm64": "linux-arm64"}
-
-# GitHub 下载加速镜像源列表
-MIRRORS = [
-    "https://ghfast.top/",
-    "https://ghproxy.net/",
-    "https://github.moeyy.xyz/",
-    "https://mirror.ghproxy.com/",
-]
-
-
 # ──────────────────────────────────────────────
 # 安全与工具函数
 # ──────────────────────────────────────────────
 def secure_file_permissions(path: Path):
-    """限制敏感凭据文件权限为 0o600，仅当前用户可读写。"""
-    if platform.system() == "Windows":
+    """限制敏感凭据文件权限为 0o600。"""
+    if detect_os() == "windows":
         return
     try:
         os.chmod(str(path), 0o600)
@@ -202,10 +259,10 @@ def secure_file_permissions(path: Path):
 
 
 def atomic_write_secure(path: Path, content: str, mode: int = 0o600):
-    """敏感凭据原子落盘：通过低级系统调用在创建文件的第 1 微秒即锁定权限。"""
+    """敏感凭据原子落盘，创建第 1 微秒即锁定权限。"""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if platform.system() == "Windows":
+    if detect_os() == "windows":
         path.write_text(content, encoding="utf-8")
         return
 
@@ -216,11 +273,32 @@ def atomic_write_secure(path: Path, content: str, mode: int = 0o600):
 
 
 def is_valid_uuid(val: str) -> bool:
-    """严格正则校验 UUIDv4 格式合法性。"""
+    """标准 UUID 格式校验（8-4-4-4-12 格式）。"""
     if not val or not isinstance(val, str):
         return False
-    pattern = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.IGNORECASE)
-    return bool(pattern.match(val.strip()))
+    return bool(re.match(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", val.strip()))
+
+
+def safe_int(val, default=0, min_val=1, max_val=65535) -> int:
+    """安全解析端口与数值，防呆防崩溃。"""
+    try:
+        if val is None or str(val).strip() == "":
+            return default
+        n = int(str(val).strip())
+        return n if min_val <= n <= max_val else default
+    except (ValueError, TypeError):
+        return default
+
+
+def _create_server_socket() -> socket.socket:
+    """创建监听套接字，Windows 使用 SO_EXCLUSIVEADDRUSE 防端口劫持，Linux 走 SO_REUSEADDR。"""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if detect_os() == "windows":
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    return srv
 
 
 def get_free_port() -> int:
@@ -231,7 +309,7 @@ def get_free_port() -> int:
 
 
 def _http_get_text(url: str, timeout: int = 5, redirects: int = 3) -> str:
-    """安全轻量 HTTP GET 文本内容，支持重定向处理。"""
+    """轻量 HTTP GET 文本，带重定向与超时控制。"""
     if redirects < 0:
         return ""
     try:
@@ -241,8 +319,7 @@ def _http_get_text(url: str, timeout: int = 5, redirects: int = 3) -> str:
             if 300 <= status < 400:
                 loc = resp.headers.get("Location")
                 if loc:
-                    next_url = urllib.parse.urljoin(url, loc)
-                    return _http_get_text(next_url, timeout=timeout, redirects=redirects - 1)
+                    return _http_get_text(urllib.parse.urljoin(url, loc), timeout, redirects - 1)
             if 200 <= status < 300:
                 return resp.read().decode("utf-8", errors="ignore").strip()
     except Exception:
@@ -250,150 +327,98 @@ def _http_get_text(url: str, timeout: int = 5, redirects: int = 3) -> str:
     return ""
 
 
-def sha256_file(path: Path) -> str:
-    """计算本地文件的 sha256 哈希值。"""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while chunk := f.read(65536):
-            h.update(chunk)
-    return h.hexdigest().lower()
+def get_valid_public_ip() -> str:
+    """多源探测公网 IP，经 ipaddress 严格验证，杜绝限流 HTML 错误污染。"""
+    apis = [
+        "https://api.ipify.org",
+        "https://ipinfo.io/ip",
+        "https://ifconfig.co/ip",
+        "https://icanhazip.com",
+    ]
+    for url in apis:
+        raw = _http_get_text(url, timeout=4)
+        if raw:
+            candidate = raw.strip()
+            try:
+                ipaddress.ip_address(candidate)
+                return candidate
+            except ValueError:
+                continue
+    return ""
 
 
 def check_magic(file_path: Path, kind: str = None) -> bool:
-    """通过读取文件头魔数校验二进制/归档格式，杜绝下载到 HTML 拦截页。"""
+    """文件头魔数校验，防范下载到 HTML 拦截页。"""
     if not kind:
         return True
     try:
         with open(file_path, "rb") as f:
             header = f.read(4)
-        hex_header = header.hex().lower()
+        hex_h = header.hex().lower()
         if kind == "gzip":
-            return hex_header.startswith("1f8b")
+            return hex_h.startswith("1f8b")
         if kind == "zip":
-            return hex_header.startswith("504b")
+            return hex_h.startswith("504b")
         if kind == "elf":
-            return hex_header == "7f454c46"
+            return hex_h == "7f454c46"
         if kind == "pe":
-            return hex_header.startswith("4d5a")
+            return hex_h.startswith("4d5a")
         if kind == "macho":
-            return hex_header in ("cffaedfe", "cefaedfe", "cafebabe")
+            return hex_h in ("cffaedfe", "cefaedfe", "cafebabe")
         return True
     except Exception:
         return False
 
 
-def get_asset_sha256(repo: str, tag: str, asset_name: str) -> str:
-    """从 GitHub API 获取对应 Release 资产的官方 SHA256 哈希。"""
-    api = (
-        f"https://api.github.com/repos/{repo}/releases/latest"
-        if tag == "latest"
-        else f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
-    )
-    raw = _http_get_text(api, timeout=10)
-    if not raw:
-        return ""
+def _is_safe_path(base_dir: Path, target_path: Path) -> bool:
+    """向下兼容 Python 3.8 的路径安全判定，防范 CVE-2007-4559 Tar Slip 穿越。"""
     try:
-        data = json.loads(raw)
-        assets = data.get("assets", [])
-        for a in assets:
-            if a.get("name") == asset_name:
-                digest = a.get("digest")
-                if isinstance(digest, str):
-                    m = re.search(r"^sha256:([0-9a-f]{64})$", digest, re.IGNORECASE)
-                    if m:
-                        return m.group(1).lower()
+        base_res = base_dir.resolve()
+        target_res = target_path.resolve()
+        if hasattr(target_res, "is_relative_to"):
+            return target_res.is_relative_to(base_res)
+        common = os.path.commonpath([str(base_res), str(target_res)])
+        return common == str(base_res)
     except Exception:
-        pass
-    return ""
+        return False
 
 
-def download(url: str, dest: Path, kind: str = None, min_size: int = 1024 * 1024, sha256: str = ""):
-    """下载容灾体系：镜像加速容灾回退 + SHA256 比对 + 魔数校验 + .part 临时文件保护。"""
-    dest = Path(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    part_file = dest.with_suffix(dest.suffix + ".part")
-
-    # 镜像安全策略：拿到官方 SHA256 或显式配置 INSECURE_MIRROR=true 时才使用第三方镜像
-    insecure = os.environ.get("INSECURE_MIRROR", "").lower() == "true"
-    prefixes = [""] + MIRRORS if (sha256 or insecure) else [""]
-
-    last_err = None
-    for prefix in prefixes:
-        target_url = prefix + url
-        if prefix:
-            log.info("尝试加速镜像: %s", prefix)
-
-        methods = [
-            ["curl", "-fsSL", "--max-time", "90", "-o", str(part_file), target_url],
-            ["wget", "-q", "--timeout=90", "-O", str(part_file), target_url],
-        ]
-
-        # 1. 尝试外部命令 curl / wget
-        downloaded = False
-        for cmd in methods:
-            try:
-                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                downloaded = True
-                break
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                part_file.unlink(missing_ok=True)
-                continue
-
-        # 2. 外部命令不可用时使用 Python urllib 兜底（90 秒超时）
-        if not downloaded:
-            try:
-                req = urllib.request.Request(target_url, headers={"User-Agent": "curl/8.5.0"})
-                with urllib.request.urlopen(req, timeout=90) as resp, open(part_file, "wb") as out_f:
-                    if resp.getcode() != 200:
-                        raise RuntimeError(f"HTTP 响应状态码异常: {resp.getcode()}")
-                    while chunk := resp.read(65536):
-                        out_f.write(chunk)
-                downloaded = True
-            except Exception as e:
-                last_err = e
-                part_file.unlink(missing_ok=True)
-                continue
-
-        # 3. 校验下载完整性：大小、魔数、SHA256
-        if part_file.exists():
-            size_ok = part_file.stat().st_size >= min_size
-            magic_ok = check_magic(part_file, kind)
-            hash_ok = True
-            if sha256:
-                hash_ok = (sha256_file(part_file) == sha256.lower())
-
-            if size_ok and magic_ok and hash_ok:
-                if dest.exists():
-                    dest.unlink()
-                part_file.rename(dest)
-                return
-            else:
-                last_err = RuntimeError(
-                    f"文件校验未通过 (size_ok={size_ok}, magic_ok={magic_ok}, hash_ok={hash_ok})"
-                )
-                part_file.unlink(missing_ok=True)
-
-    raise last_err or RuntimeError(f"文件下载失败: {url}")
-
-
-def _extract_tar_stripped(tar_path: Path, dest_dir: Path):
-    """安全解压 tar 包并剥除首层目录（Tar Slip 路径穿越防御 CVE-2007-4559）。"""
-    dest_resolved = dest_dir.resolve()
-    with tarfile.open(tar_path) as tar:
-        members = []
-        for m in tar.getmembers():
-            parts = m.name.split("/", 1)
-            if len(parts) == 2 and parts[1]:
-                m.name = parts[1]
-            target = (dest_dir / m.name).resolve()
-            if not target.is_relative_to(dest_resolved):
-                raise RuntimeError(f"[安全拦截] 检测到非法解压路径逃逸: {m.name}")
-            members.append(m)
-        tar.extractall(dest_dir, members=members)
+def _extract_archive_stripped(archive_path: Path, dest_dir: Path, is_zip: bool = False):
+    """安全解压归档并剥离顶级首层目录，过滤空目录与根项。"""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    if is_zip:
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            for info in zf.infolist():
+                name = info.filename
+                parts = name.split("/", 1)
+                if len(parts) == 2 and parts[1]:
+                    sub_name = parts[1]
+                    target = (dest_dir / sub_name).resolve()
+                    if not _is_safe_path(dest_dir, target):
+                        raise RuntimeError(f"[安全拦截] 非法 zip 解压路径逃逸: {name}")
+                    if info.is_dir():
+                        target.mkdir(parents=True, exist_ok=True)
+                    else:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(info) as src, open(target, "wb") as dst:
+                            while chunk := src.read(65536):
+                                dst.write(chunk)
+    else:
+        with tarfile.open(archive_path, "r:*") as tar:
+            members = []
+            for m in tar.getmembers():
+                parts = m.name.split("/", 1)
+                if len(parts) == 2 and parts[1]:
+                    m.name = parts[1]
+                    target = (dest_dir / m.name).resolve()
+                    if not _is_safe_path(dest_dir, target):
+                        raise RuntimeError(f"[安全拦截] 非法 tar 解压路径逃逸: {m.name}")
+                    members.append(m)
+            tar.extractall(dest_dir, members=members)
 
 
 def format_ip(ip: str) -> str:
-    """完善 IPv6 格式化，直连链接自动包裹方括号。"""
+    """IPv6 格式化，自动包裹方括号。"""
     if not ip:
         return ""
     ip = ip.strip()
@@ -403,30 +428,26 @@ def format_ip(ip: str) -> str:
 
 
 def format_komari_endpoint(ep: str) -> str:
-    """格式化 Komari 服务端端点地址。"""
+    """格式化 Komari 服务端端点，支持 IPv6 及原生 HTTP 端点识别。"""
     ep = ep.strip().rstrip("/")
-    if ep.startswith("http://") or ep.startswith("https://"):
+    if re.match(r"^https?://", ep, re.IGNORECASE):
         return ep
-    if ep.endswith(":25774") or re.match(r"^\d+\.\d+\.\d+\.\d+(:\d+)?$", ep):
+    if (ep.endswith(":25774") or
+        re.match(r"^\d+\.\d+\.\d+\.\d+(:\d+)?$", ep) or
+        re.match(r"^\[[0-9a-fA-F:]+\](:\d+)?$", ep)):
         return f"http://{ep}"
     return f"https://{ep}"
 
 
 def escape_html(text: str) -> str:
-    """对 Telegram 消息进行严格 HTML 实体转义。"""
+    """Telegram HTML 实体转义。"""
     if not text:
         return ""
-    return (
-        str(text)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
 def send_telegram_message(bot_token: str, chat_id: str, text: str) -> bool:
-    """向 Telegram Bot 推送节点配置信息。"""
+    """向 Telegram Bot 发送通知。"""
     if not bot_token or not chat_id or not text:
         return False
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -438,10 +459,7 @@ def send_telegram_message(bot_token: str, chat_id: str, text: str) -> bool:
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json", "User-Agent": "curl/8.5.0"},
-        method="POST",
+        url, data=data, headers={"Content-Type": "application/json", "User-Agent": "curl/8.5.0"}, method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -452,21 +470,99 @@ def send_telegram_message(bot_token: str, chat_id: str, text: str) -> bool:
 
 
 def derive_ss_password(uuid_str: str) -> str:
-    """SS2022 密码派生：取 UUID 去横线后前 32 个十六进制字符做 base64。"""
+    """SS2022 密码派生。"""
     hex_str = uuid_str.replace("-", "")[:32]
     return base64.b64encode(bytes.fromhex(hex_str)).decode()
 
 
-def detect_arch() -> str:
-    """检测当前机器架构。"""
-    return ARCH_MAP.get(platform.machine().lower(), "amd64")
+# ──────────────────────────────────────────────
+# 标准下载引擎（curl -> wget -> urllib）
+# ──────────────────────────────────────────────
+def download(url: str, dest: Path, kind: str = None, min_size: int = 1024 * 1024):
+    """跨平台标准下载，采用 .part 临时文件保障原子性。"""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part_file = dest.with_suffix(dest.suffix + ".part")
+
+    methods = [
+        ["curl", "-fsSL", "--max-time", "90", "-o", str(part_file), url],
+        ["wget", "-q", "--timeout=90", "-O", str(part_file), url],
+    ]
+
+    downloaded = False
+    for cmd in methods:
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            downloaded = True
+            break
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            part_file.unlink(missing_ok=True)
+            continue
+
+    if not downloaded:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8.5.0"})
+            with urllib.request.urlopen(req, timeout=90) as resp, open(part_file, "wb") as out_f:
+                if resp.getcode() != 200:
+                    raise RuntimeError(f"HTTP 状态码异常: {resp.getcode()}")
+                while chunk := resp.read(65536):
+                    out_f.write(chunk)
+            downloaded = True
+        except Exception as e:
+            part_file.unlink(missing_ok=True)
+            raise e
+
+    if part_file.exists():
+        if part_file.stat().st_size >= min_size and check_magic(part_file, kind):
+            if dest.exists():
+                dest.unlink()
+            part_file.rename(dest)
+            return
+        part_file.unlink(missing_ok=True)
+        raise RuntimeError("文件校验失败（尺寸或文件头魔数不符）")
+
+    raise RuntimeError(f"文件下载失败: {url}")
 
 
 # ──────────────────────────────────────────────
-# 自愈守护状态机与进程脱敏
+# 自愈守护状态机与进程启动（修复 FD 句柄泄漏）
 # ──────────────────────────────────────────────
+def launch_process_cloaked(bin_path: Path, args: list, cloaked_tag: str, log_file: Path = None, env: dict = None) -> subprocess.Popen:
+    """启动子进程并脱敏。在 Popen 完成后立即在父进程中关闭 log_fd，消除句柄泄漏。"""
+    is_w = (detect_os() == "windows")
+    full_args = [str(bin_path)] + args
+
+    kwargs = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "env": env or os.environ.copy(),
+    }
+
+    log_fd = None
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_fd = open(log_file, "a", encoding="utf-8")
+        kwargs["stdout"] = log_fd
+        kwargs["stderr"] = log_fd
+
+    try:
+        if not is_w:
+            kwargs["start_new_session"] = True
+            proc = subprocess.Popen([cloaked_tag] + args, executable=str(bin_path), **kwargs)
+        else:
+            proc = subprocess.Popen(full_args, **kwargs)
+        return proc
+    finally:
+        # 父进程立即关闭 fd（子进程已继承底层内核句柄）
+        if log_fd:
+            try:
+                log_fd.close()
+            except Exception:
+                pass
+
+
 def supervise_process(name: str, launch_fn):
-    """多进程自愈守护状态机：异常退出时采用指数退避重试（3s -> 6s -> ... -> 60s），平稳运行重置。"""
+    """指数退避自愈守护状态机（3s -> 6s -> ... -> 60s）。"""
     def _supervisor():
         delay = 3
         while not is_shutting_down:
@@ -495,7 +591,7 @@ def supervise_process(name: str, launch_fn):
 
             uptime = time.time() - started_at
             delay = 3 if uptime > 60 else min(delay * 2, 60)
-            log.warning("[保活] %s 异常退出 (code=%s)，将在 %ss 后自动拉起重启", name, exit_code, delay)
+            log.warning("[保活] %s 异常退出 (code=%s)，将在 %ss 后自动重启", name, exit_code, delay)
             time.sleep(delay)
 
     t = threading.Thread(target=_supervisor, daemon=True, name=f"Supervisor-{name}")
@@ -503,33 +599,8 @@ def supervise_process(name: str, launch_fn):
     return t
 
 
-def launch_process_cloaked(bin_path: Path, args: list[str], cloaked_tag: str, log_file: Path = None, env: dict = None) -> subprocess.Popen:
-    """在 Linux/Unix 下通过 argv0 对工作进程进行伪装脱敏，避免进程列表暴露真实二进制名称。"""
-    is_win = (platform.system() == "Windows")
-    full_args = [str(bin_path)] + args
-
-    kwargs = {
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-        "env": env or os.environ.copy(),
-    }
-
-    if log_file:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        fd = open(log_file, "a", encoding="utf-8")
-        kwargs["stdout"] = fd
-        kwargs["stderr"] = fd
-
-    if not is_win:
-        kwargs["start_new_session"] = True
-        # 在 Unix 下通过 executable 指定真实二进制，第一参数作为进程展示名
-        return subprocess.Popen([cloaked_tag] + args, executable=str(bin_path), **kwargs)
-    else:
-        return subprocess.Popen(full_args, **kwargs)
-
-
 # ──────────────────────────────────────────────
-# 自签证书现场生成
+# 自签 ECC 证书现场生成
 # ──────────────────────────────────────────────
 FALLBACK_PRIVATE_KEY = """-----BEGIN EC PARAMETERS-----
 BggqhkjOPQMBBw==
@@ -552,8 +623,8 @@ eQ6OFb9LbLYL9f+sAiAffoMbi4y/0YUSlTtz7as9S8/lciBF5VCUoVIKS+vX2g==
 -----END CERTIFICATE-----"""
 
 
-def generate_self_signed_cert(cert_dir: Path) -> tuple[str, str]:
-    """生成独一无二的自签 ECC 证书。优先 openssl，缺失时使用内置共享证书兜底。"""
+def generate_self_signed_cert(cert_dir: Path) -> tuple:
+    """生成独一无二的自签 ECC 证书。"""
     key_path = cert_dir / "key.pem"
     cert_path = cert_dir / "cert.pem"
     if key_path.exists() and cert_path.exists():
@@ -575,24 +646,32 @@ def generate_self_signed_cert(cert_dir: Path) -> tuple[str, str]:
     except (subprocess.CalledProcessError, FileNotFoundError):
         log.info("系统未检测到 openssl，使用内置证书现场生成...")
 
-    log.warning("[警告] 系统缺少 openssl，使用内置共享证书（私钥已公开，仅供个人测试）")
     atomic_write_secure(key_path, FALLBACK_PRIVATE_KEY)
     atomic_write_secure(cert_path, FALLBACK_CERT)
     return str(key_path), str(cert_path)
 
 
 # ──────────────────────────────────────────────
-# 核心组件与探针自动下载
+# 核心组件下载（优先检测容器与系统预装路径）
 # ──────────────────────────────────────────────
 def download_singbox() -> str:
-    """下载 sing-box 核心，支持加速镜像与 SHA256 校验。"""
+    """跨平台下载并解压 sing-box。"""
     if SB_BIN_PATH.exists():
-        if platform.system() != "Windows":
+        if detect_os() != "windows":
             os.chmod(str(SB_BIN_PATH), SB_BIN_PATH.stat().st_mode | stat.S_IEXEC)
         return str(SB_BIN_PATH)
 
+    # 优先检测系统/容器预装路径
+    candidates = (
+        ["C:\\sing-box\\sing-box.exe"] if detect_os() == "windows"
+        else ["/usr/local/bin/node-worker", "/usr/local/bin/sing-box", "/usr/bin/sing-box"]
+    )
+    for c in candidates:
+        if Path(c).exists():
+            return str(c)
+
+    os_type = detect_os()
     arch = detect_arch()
-    log.info("正在获取 sing-box 最新版本信息 (linux-%s)...", arch)
     version = "v1.12.0"
     try:
         data = _http_get_text("https://api.github.com/repos/SagerNet/sing-box/releases")
@@ -604,64 +683,103 @@ def download_singbox() -> str:
     except Exception:
         pass
 
-    log.info("sing-box 版本: %s", version)
     ver_num = version.lstrip("v")
-    tar_name = f"sing-box-{ver_num}-linux-{arch}.tar.gz"
-    url = f"https://github.com/SagerNet/sing-box/releases/download/{version}/{tar_name}"
-    sha256 = get_asset_sha256("SagerNet/sing-box", version, tar_name)
+    is_zip = (os_type == "windows")
+    pkg_ext = "zip" if is_zip else "tar.gz"
+    asset_name = f"sing-box-{ver_num}-{os_type}-{arch}.{pkg_ext}"
+    url = f"https://github.com/SagerNet/sing-box/releases/download/{version}/{asset_name}"
 
-    SB_DIR.mkdir(parents=True, exist_ok=True)
-    tar_path = HOME / "sb.tar.gz"
-    log.info("正在下载 sing-box 核心组件...")
-    download(url, tar_path, kind="gzip", sha256=sha256)
+    archive_tmp = DATA_DIR / f"sb_archive.{pkg_ext}"
+    log.info("正在下载 sing-box (%s)...", asset_name)
+    kind = "zip" if is_zip else "gzip"
+    download(url, archive_tmp, kind=kind)
 
-    _extract_tar_stripped(tar_path, SB_DIR)
-    if platform.system() != "Windows":
+    # 安全解压并剥离首层
+    _extract_archive_stripped(archive_tmp, DATA_DIR, is_zip=is_zip)
+
+    # 在解压后的目录中寻找二进制并标准化重命名为 py-worker
+    extracted_bin_name = "sing-box.exe" if is_zip else "sing-box"
+    found_bin = None
+    for p in DATA_DIR.rglob(extracted_bin_name):
+        found_bin = p
+        break
+
+    if found_bin and found_bin != SB_BIN_PATH:
+        if SB_BIN_PATH.exists():
+            SB_BIN_PATH.unlink()
+        found_bin.rename(SB_BIN_PATH)
+
+    if detect_os() != "windows" and SB_BIN_PATH.exists():
         os.chmod(str(SB_BIN_PATH), SB_BIN_PATH.stat().st_mode | stat.S_IEXEC)
-    tar_path.unlink(missing_ok=True)
-    log.info("sing-box 下载解压完成")
+
+    archive_tmp.unlink(missing_ok=True)
+    log.info("sing-box 部署完成: %s", SB_BIN_PATH)
     return str(SB_BIN_PATH)
 
 
 def download_cloudflared() -> str:
-    """下载 cloudflared 二进制。"""
+    """跨平台下载 cloudflared 二进制。"""
     if CLOUDFLARED_BIN.exists():
-        if platform.system() != "Windows":
+        if detect_os() != "windows":
             os.chmod(str(CLOUDFLARED_BIN), CLOUDFLARED_BIN.stat().st_mode | stat.S_IEXEC)
         return str(CLOUDFLARED_BIN)
 
-    suffix = CF_ARCH_MAP.get(detect_arch(), "linux-amd64")
+    candidates = (
+        ["C:\\cloudflared\\cloudflared.exe"] if detect_os() == "windows"
+        else ["/usr/local/bin/cloudflared", "/usr/bin/cloudflared"]
+    )
+    for c in candidates:
+        if Path(c).exists():
+            return str(c)
+
+    os_type = detect_os()
+    arch = detect_arch()
+    if os_type == "windows":
+        suffix = "windows-amd64.exe" if arch == "amd64" else "windows-386.exe"
+        kind = "pe"
+    elif os_type == "darwin":
+        suffix = "darwin-amd64.tgz"
+        kind = "gzip"
+    else:
+        cf_arch = {"amd64": "linux-amd64", "arm64": "linux-arm64", "armv7": "linux-arm"}.get(arch, "linux-amd64")
+        suffix = cf_arch
+        kind = "elf"
+
     log.info("正在下载 cloudflared (%s)...", suffix)
     url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-{suffix}"
-    kind = "pe" if platform.system() == "Windows" else "elf"
     download(url, CLOUDFLARED_BIN, kind=kind)
-    if platform.system() != "Windows":
+
+    if detect_os() != "windows":
         os.chmod(str(CLOUDFLARED_BIN), CLOUDFLARED_BIN.stat().st_mode | stat.S_IEXEC)
-    log.info("cloudflared 下载完成")
+    log.info("cloudflared 部署完成")
     return str(CLOUDFLARED_BIN)
 
 
 def download_komari_agent() -> str:
     """下载 Komari 监控探针。"""
     if KOMARI_BIN_PATH.exists():
-        if platform.system() != "Windows":
+        if detect_os() != "windows":
             os.chmod(str(KOMARI_BIN_PATH), KOMARI_BIN_PATH.stat().st_mode | stat.S_IEXEC)
         return str(KOMARI_BIN_PATH)
 
+    candidates = ["/usr/local/bin/komari-agent", "/usr/local/bin/node-metrics"]
+    for c in candidates:
+        if Path(c).exists():
+            return str(c)
+
     arch = detect_arch()
-    km_arch = KM_ARCH_MAP.get(arch)
-    if not km_arch:
-        log.warning("Komari 探针官方暂不支持当前 CPU 架构 (%s)，仅支持 amd64 与 arm64", arch)
+    km_arch = "linux-amd64" if arch == "amd64" else ("linux-arm64" if arch == "arm64" else "")
+    if not km_arch or detect_os() != "linux":
+        log.warning("Komari 探针官方暂未提供当前系统架构 (%s-%s) 的预编译版本", detect_os(), arch)
         return ""
 
     log.info("正在下载 Komari 监控探针 (%s)...", km_arch)
     url = f"https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-{km_arch}"
-    kind = "pe" if platform.system() == "Windows" else "elf"
     try:
-        download(url, KOMARI_BIN_PATH, kind=kind)
-        if platform.system() != "Windows":
+        download(url, KOMARI_BIN_PATH, kind="elf")
+        if detect_os() != "windows":
             os.chmod(str(KOMARI_BIN_PATH), KOMARI_BIN_PATH.stat().st_mode | stat.S_IEXEC)
-        log.info("Komari 探针下载完成")
+        log.info("Komari 探针部署完成")
         return str(KOMARI_BIN_PATH)
     except Exception as e:
         log.warning("Komari 探针下载失败: %s", e)
@@ -669,96 +787,88 @@ def download_komari_agent() -> str:
 
 
 # ──────────────────────────────────────────────
-# Argo 隧道管理
+# Argo 隧道管理与自愈保活状态机（排除 api. 误匹配）
 # ──────────────────────────────────────────────
-def start_argo_tunnel(cf_bin: str, argo_port: int, argo_domain: str, argo_auth: str, argo_protocol: str = "http2") -> str:
-    """启动 Cloudflare Argo 隧道（固定隧道或临时隧道）。"""
+def start_argo_tunnel_service(cf_bin: str, argo_port: int, argo_domain: str, argo_auth: str, argo_protocol: str = "http2") -> str:
+    """启动 Cloudflare Argo 隧道，全面纳入指数退避自愈保活。"""
     cf_proto = argo_protocol or "http2"
 
     if argo_domain and argo_auth:
-        log.info("启动固定 Argo 隧道 (协议: %s)...", cf_proto)
-        CF_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        log_fd = open(CF_LOG_FILE, "a", encoding="utf-8")
-
+        log.info("配置固定 Argo 隧道 (协议: %s)...", cf_proto)
         args = [
             "tunnel", "--edge-ip-version", "auto",
             "--protocol", cf_proto,
             "--no-autoupdate", "run", "--token", argo_auth,
         ]
 
-        proc = launch_process_cloaked(
-            Path(cf_bin), args, "python /app/bridge.py", log_file=CF_LOG_FILE
-        )
-        register_process(proc)
+        def _launch_fixed():
+            return launch_process_cloaked(
+                Path(cf_bin), args, "python /app/bridge.py", log_file=CF_LOG_FILE
+            )
 
-        # 检查是否秒崩
-        waited = 0.0
-        check_interval = 0.5
-        while waited < 3.0:
-            if proc.poll() is not None:
-                log_fd.close()
-                log.error("================ 固定 Argo 隧道启动失败 ================")
-                log.error("cloudflared 进程已退出（退出码 %s），详细日志见 %s", proc.returncode, CF_LOG_FILE)
-                try:
-                    tail = CF_LOG_FILE.read_text(encoding="utf-8", errors="ignore")[-2000:]
-                    log.error(tail.strip())
-                except OSError:
-                    pass
-                log.error("==========================================================")
-                log.error("常见原因：ARGO_AUTH token 无效/过期，或 ARGO_DOMAIN 未在 Cloudflare 面板绑定成功")
-                return ""
-            time.sleep(check_interval)
-            waited += check_interval
-
-        log.info("固定 Argo 隧道进程存活，日志见 %s", CF_LOG_FILE)
+        # 启动自愈保活
+        supervise_process("Argo固定隧道", _launch_fixed)
+        log.info("固定 Argo 隧道已接入守护状态机，日志见 %s", CF_LOG_FILE)
         return argo_domain
 
-    log.info("启动临时 Argo 隧道 (协议: %s)...", cf_proto)
+    log.info("配置临时 Argo 隧道 (协议: %s)...", cf_proto)
     args = [
         "tunnel", "--edge-ip-version", "auto",
         "--protocol", cf_proto,
         "--no-autoupdate", "--url", f"http://127.0.0.1:{argo_port}",
     ]
 
-    is_win = (platform.system() == "Windows")
-    kwargs = {
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.PIPE,
-        "text": True,
-        "bufsize": 1,
-    }
-    if not is_win:
-        kwargs["start_new_session"] = True
-        proc = subprocess.Popen(["python /app/bridge.py"] + args, executable=str(cf_bin), **kwargs)
-    else:
-        proc = subprocess.Popen([str(cf_bin)] + args, **kwargs)
+    # 正则严密排除 api.trycloudflare.com
+    pattern = re.compile(r"https://(?!api\.)([a-z0-9-]+\.trycloudflare\.com)", re.IGNORECASE)
+    captured_host = {"host": ""}
+    domain_ready = threading.Event()
 
-    register_process(proc)
+    def _launch_temp():
+        is_w = (detect_os() == "windows")
+        kwargs = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "bufsize": 1,
+        }
+        if not is_w:
+            kwargs["start_new_session"] = True
+            proc = subprocess.Popen(["python /app/bridge.py"] + args, executable=str(cf_bin), **kwargs)
+        else:
+            proc = subprocess.Popen([str(cf_bin)] + args, **kwargs)
 
-    result = {"host": ""}
-    done = threading.Event()
-    pattern = re.compile(r"https://([a-z0-9-]+\.trycloudflare\.com)")
+        def _reader(p=proc):
+            for line in iter(p.stderr.readline, ""):
+                m = pattern.search(line)
+                if m and not captured_host["host"]:
+                    captured_host["host"] = m.group(1).lower()
+                    log.info("临时隧道域名成功分配: %s", captured_host["host"])
+                    domain_ready.set()
+            try:
+                p.stderr.close()
+            except Exception:
+                pass
 
-    def _read_stderr():
-        for line in iter(proc.stderr.readline, ""):
-            m = pattern.search(line)
-            if m and not result["host"]:
-                result["host"] = m.group(1)
-                log.info("临时隧道域名: %s", result["host"])
-                done.set()
-        proc.stderr.close()
+        threading.Thread(target=_reader, daemon=True).start()
+        return proc
 
-    threading.Thread(target=_read_stderr, daemon=True).start()
-    if not done.wait(timeout=30):
-        log.warning("临时隧道域名获取超时")
-    return result["host"]
+    # 启动自愈守护
+    supervise_process("Argo临时隧道", _launch_temp)
+
+    # 等待初次域名获取
+    if not domain_ready.wait(timeout=35):
+        log.warning("临时隧道域名获取超时，继续保持后台自愈拉取")
+
+    return captured_host["host"]
 
 
 # ──────────────────────────────────────────────
-# HTTP / WebSocket 代理管道与 TCP KeepAlive
+# HTTP / WebSocket 管道双向联动关闭与并发限流
 # ──────────────────────────────────────────────
+_MAX_CONCURRENT_CONNECTIONS = 200
+
+
 def _set_keepalive(sock: socket.socket):
-    """开启 TCP KeepAlive 与超时保护，防止弱网拔线挂死。"""
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         if hasattr(socket, "TCP_KEEPIDLE"):
@@ -771,9 +881,10 @@ def _set_keepalive(sock: socket.socket):
         pass
 
 
-def _pipe(src: socket.socket, dst: socket.socket):
+def _pipe(src: socket.socket, dst: socket.socket, done_event: threading.Event):
+    """单向传输，若任何一侧断开，主动触发 done_event 并联动双方关闭，消除线程阻塞。"""
     try:
-        while True:
+        while not done_event.is_set():
             data = src.recv(65536)
             if not data:
                 break
@@ -781,10 +892,45 @@ def _pipe(src: socket.socket, dst: socket.socket):
     except OSError:
         pass
     finally:
+        done_event.set()
         try:
             dst.shutdown(socket.SHUT_WR)
         except OSError:
             pass
+
+
+def _forward_raw(client_sock: socket.socket, header_part: bytes, rest: bytes, target_port: int):
+    client_sock.settimeout(None)
+    _set_keepalive(client_sock)
+    try:
+        upstream = socket.create_connection(("127.0.0.1", target_port), timeout=5)
+        _set_keepalive(upstream)
+    except OSError as e:
+        log.debug("连接内部 sing-box 端口 %s 失败: %s", target_port, e)
+        client_sock.close()
+        return
+
+    upstream.sendall(header_part + b"\r\n\r\n" + rest)
+    done_event = threading.Event()
+
+    t1 = threading.Thread(target=_pipe, args=(client_sock, upstream, done_event), daemon=True)
+    t2 = threading.Thread(target=_pipe, args=(upstream, client_sock, done_event), daemon=True)
+    t1.start()
+    t2.start()
+
+    # 只要任何一边传输断开，立即双向彻底 close，打破另一边的 recv 阻塞
+    done_event.wait()
+    try:
+        client_sock.close()
+    except Exception:
+        pass
+    try:
+        upstream.close()
+    except Exception:
+        pass
+
+    t1.join(timeout=1.0)
+    t2.join(timeout=1.0)
 
 
 def _recv_headers(sock: socket.socket, max_size: int = 65536) -> bytes:
@@ -817,32 +963,11 @@ def _is_websocket_upgrade(headers: dict) -> bool:
     return "upgrade" in connection_tokens and headers.get("upgrade", "").strip().lower() == "websocket"
 
 
-def _forward_raw(client_sock: socket.socket, header_part: bytes, rest: bytes, target_port: int):
-    client_sock.settimeout(None)
-    _set_keepalive(client_sock)
-    try:
-        upstream = socket.create_connection(("127.0.0.1", target_port), timeout=5)
-        _set_keepalive(upstream)
-    except OSError as e:
-        log.debug("连接内部 sing-box 端口 %s 失败: %s", target_port, e)
-        client_sock.close()
-        return
-
-    upstream.sendall(header_part + b"\r\n\r\n" + rest)
-    t1 = threading.Thread(target=_pipe, args=(client_sock, upstream), daemon=True)
-    t2 = threading.Thread(target=_pipe, args=(upstream, client_sock), daemon=True)
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
-    client_sock.close()
-    upstream.close()
-
-
 def _send_bad_request(client_sock: socket.socket):
     body = b"Bad Request"
     resp = (
-        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\n"
+        "HTTP/1.1 400 Bad Request\r\nServer: nginx/1.24.0\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
         f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
     ).encode() + body
     try:
@@ -852,10 +977,35 @@ def _send_bad_request(client_sock: socket.socket):
     client_sock.close()
 
 
+def _serve_with_limit(srv: socket.socket, handle_fn, max_conn: int = _MAX_CONCURRENT_CONNECTIONS):
+    """带信号量并发保护的请求接收器。"""
+    semaphore = threading.BoundedSemaphore(max_conn)
+    while not is_shutting_down:
+        try:
+            client, _ = srv.accept()
+        except OSError:
+            break
+
+        if not semaphore.acquire(blocking=False):
+            # 达到并发上限，快速拒绝，防止线程堆叠崩溃
+            try:
+                client.close()
+            except OSError:
+                pass
+            continue
+
+        def _wrapped(c=client):
+            try:
+                handle_fn(c)
+            finally:
+                semaphore.release()
+
+        threading.Thread(target=_wrapped, daemon=True).start()
+
+
 def run_argo_forward_server(port: int):
-    """Argo 转发服务：专供 WebSocket 升级请求转发至内部 sing-box 协议端口。"""
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    """Argo WebSocket 升级转发网关。"""
+    srv = _create_server_socket()
     srv.bind(("127.0.0.1", port))
     srv.listen(128)
     log.info("Argo 转发服务启动，端口 %s", port)
@@ -885,12 +1035,7 @@ def run_argo_forward_server(port: int):
             log.debug("argo forward error: %s", e)
             client_sock.close()
 
-    while not is_shutting_down:
-        try:
-            client, _ = srv.accept()
-            threading.Thread(target=handle, args=(client,), daemon=True).start()
-        except OSError:
-            break
+    _serve_with_limit(srv, handle)
 
 
 def _load_index_html() -> str:
@@ -911,17 +1056,8 @@ def _load_index_html() -> str:
     )
 
 
-# ──────────────────────────────────────────────
-# HTTP 早期监听生命周期与 503 状态码保护
-# ──────────────────────────────────────────────
-def run_public_server(port: int, sub_path: str, index_html: str, sub_holder: dict):
-    """前置 HTTP 监听服务：主流程开始即监听，支持 /health 秒级探测及 /sub 未就绪 503 保护。"""
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", port))
-    srv.listen(128)
-    log.info("HTTP 服务启动，端口 %s", port)
-
+def run_public_server(srv: socket.socket, sub_path: str, index_html: str, sub_holder: dict):
+    """前置 HTTP 监听服务（Server: nginx 伪装、/health 秒回、/favicon.ico 204、503 未就绪保护）。"""
     def handle(client_sock: socket.socket):
         try:
             client_sock.settimeout(10)
@@ -938,7 +1074,7 @@ def run_public_server(port: int, sub_path: str, index_html: str, sub_holder: dic
                 return
             path = path.split("?")[0]
 
-            base_headers = "Connection: close\r\nAccess-Control-Allow-Origin: *\r\n"
+            base_headers = "Server: nginx/1.24.0\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n"
 
             if path == "/robots.txt":
                 body = b"User-agent: *\nDisallow: /"
@@ -952,10 +1088,12 @@ def run_public_server(port: int, sub_path: str, index_html: str, sub_holder: dic
                     f"HTTP/1.1 200 OK\r\n{base_headers}Content-Type: text/plain; charset=utf-8\r\n"
                     f"Content-Length: {len(body)}\r\n\r\n"
                 ).encode() + body
+            elif path == "/favicon.ico":
+                # 响应 204 No Content，杜绝返回完整 HTML 首页特征
+                resp = f"HTTP/1.1 204 No Content\r\n{base_headers}\r\n".encode()
             elif path == sub_path:
                 content = sub_holder.get("content", "")
                 if not content:
-                    # 订阅尚未生成完毕，响应 503 Service Unavailable 并带 Retry-After: 5
                     body = b"starting"
                     resp = (
                         f"HTTP/1.1 503 Service Unavailable\r\n{base_headers}"
@@ -983,24 +1121,27 @@ def run_public_server(port: int, sub_path: str, index_html: str, sub_holder: dic
             log.debug("public server error: %s", e)
             client_sock.close()
 
-    while not is_shutting_down:
-        try:
-            client, _ = srv.accept()
-            threading.Thread(target=handle, args=(client,), daemon=True).start()
-        except OSError:
-            break
+    _serve_with_limit(srv, handle)
 
 
 # ──────────────────────────────────────────────
 # 主入口流程
 # ──────────────────────────────────────────────
 def main():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
     kill_stale_by_tag()
 
-    # 1. 基础端口与前置 HTTP 监听（阶段二：早期生命周期保障健康检查秒过）
+    # 1. 基础端口与主线程前置同步绑定（端口冲突主线程秒感知）
     port_env = CONF_PORT or os.environ.get("PORT", "")
-    inbound_port = int(port_env) if port_env else get_free_port()
+    inbound_port = safe_int(port_env, default=0) or get_free_port()
+
+    public_srv = _create_server_socket()
+    try:
+        public_srv.bind(("0.0.0.0", inbound_port))
+        public_srv.listen(128)
+        log.info("HTTP 服务前置监听启动，端口 %s", inbound_port)
+    except Exception as e:
+        log.error("HTTP 端口 %s 绑定失败，端口可能已被占用: %s", inbound_port, e)
+        sys.exit(1)
 
     sub_raw = CONF_SUB or os.environ.get("SUB", "sub")
     sub_path = "/" + sub_raw.lstrip("/")
@@ -1008,16 +1149,14 @@ def main():
     index_html = _load_index_html()
     sub_holder = {"content": ""}
 
-    # 立即前置启动公网 HTTP 监听服务
-    http_thread = threading.Thread(
+    threading.Thread(
         target=run_public_server,
-        args=(inbound_port, sub_path, index_html, sub_holder),
+        args=(public_srv, sub_path, index_html, sub_holder),
         daemon=True,
         name="PublicHttpServer",
-    )
-    http_thread.start()
+    ).start()
 
-    # 2. UUID 正则校验与安全自愈（阶段一）
+    # 2. UUID 校验与自愈
     env_uuid = CONF_UUID or os.environ.get("UUID", "")
     node_uuid = ""
     if is_valid_uuid(env_uuid):
@@ -1032,59 +1171,55 @@ def main():
         log.info("生成新节点 UUID: %s", node_uuid)
 
     atomic_write_secure(UUID_FILE, node_uuid)
-
     trojan_pass = node_uuid
     ss_pass = derive_ss_password(node_uuid)
 
     # 3. Argo 配置解析
     disable_argo = (CONF_DISABLE_ARGO or os.environ.get("DISABLE_ARGO", "")).lower() == "true"
-    argo_domain = CONF_ARGO_DOMAIN or os.environ.get("ARGO_DOMAIN", "")
-    argo_auth = CONF_ARGO_AUTH or os.environ.get("ARGO_AUTH", "")
-    argo_protocol = CONF_ARGO_PROTOCOL or os.environ.get("ARGO_PROTOCOL", "http2")
+    argo_domain = (CONF_ARGO_DOMAIN or os.environ.get("ARGO_DOMAIN", "")).strip()
+    argo_auth = (CONF_ARGO_AUTH or os.environ.get("ARGO_AUTH", "")).strip()
+    argo_protocol = (CONF_ARGO_PROTOCOL or os.environ.get("ARGO_PROTOCOL", "http2")).strip()
 
     if argo_domain and argo_auth:
-        argo_port = int(CONF_ARGO_PORT or os.environ.get("ARGO_PORT", "8001"))
+        argo_port = safe_int(CONF_ARGO_PORT or os.environ.get("ARGO_PORT", 8001), default=8001)
     else:
         argo_port = get_free_port()
 
-    # 4. 可选直连协议端口解析（兼容 SOCKS5_PORT 与 S5_PORT）
-    hy2_port = int(CONF_HY2_PORT or os.environ.get("HY2_PORT", 0) or 0)
-    tuic_port = int(CONF_TUIC_PORT or os.environ.get("TUIC_PORT", 0) or 0)
-    reality_port = int(CONF_REALITY_PORT or os.environ.get("REALITY_PORT", 0) or 0)
-    ss_port = int(CONF_SS_PORT or os.environ.get("SS_PORT", 0) or 0)
-    s5_raw = CONF_S5_PORT or os.environ.get("SOCKS5_PORT", "") or os.environ.get("S5_PORT", "") or 0
-    s5_port = int(s5_raw) if s5_raw else 0
-    anytls_port = int(CONF_ANYTLS_PORT or os.environ.get("ANYTLS_PORT", 0) or 0)
+    # 4. 可选直连协议端口解析（防呆清洗）
+    hy2_port = safe_int(CONF_HY2_PORT or os.environ.get("HY2_PORT", 0))
+    tuic_port = safe_int(CONF_TUIC_PORT or os.environ.get("TUIC_PORT", 0))
+    reality_port = safe_int(CONF_REALITY_PORT or os.environ.get("REALITY_PORT", 0))
+    ss_port = safe_int(CONF_SS_PORT or os.environ.get("SS_PORT", 0))
+    s5_raw = CONF_S5_PORT or os.environ.get("SOCKS5_PORT", "") or os.environ.get("S5_PORT", "")
+    s5_port = safe_int(s5_raw)
+    anytls_port = safe_int(CONF_ANYTLS_PORT or os.environ.get("ANYTLS_PORT", 0))
 
-    reality_domain = CONF_REALITY_DOMAIN or os.environ.get("REALITY_DOMAIN", "www.iij.ad.jp")
+    reality_domain = (CONF_REALITY_DOMAIN or os.environ.get("REALITY_DOMAIN", "www.iij.ad.jp")).strip()
 
-    # 5. Komari 探针参数与业务功能参数
+    # 5. Komari 探针与业务参数
     komari_domain = (
         CONF_KOMARI_DOMAIN
         or os.environ.get("KOMARI_DOMAIN", "")
         or os.environ.get("KOMARI_ENDPOINT", "")
         or os.environ.get("AGENT_ENDPOINT", "")
-    )
+    ).strip()
     komari_token = (
         CONF_KOMARI_TOKEN
         or os.environ.get("KOMARI_TOKEN", "")
         or os.environ.get("AGENT_TOKEN", "")
-    )
+    ).strip()
     komari_active = False
 
     show_log = (CONF_SHOW_LOG or os.environ.get("SHOW_LOG", "true")).lower() != "false"
-    try:
-        log_clear_minutes = int(CONF_LOG_CLEAR_MINUTES or os.environ.get("LOG_CLEAR_MINUTES", "2"))
-    except ValueError:
-        log_clear_minutes = 2
+    log_clear_minutes = safe_int(CONF_LOG_CLEAR_MINUTES or os.environ.get("LOG_CLEAR_MINUTES", 2), default=2, min_val=0, max_val=1440)
 
-    tg_bot_token = CONF_TG_BOT_TOKEN or os.environ.get("TG_BOT_TOKEN", "")
-    tg_chat_id = CONF_TG_CHAT_ID or os.environ.get("TG_CHAT_ID", "")
+    tg_bot_token = (CONF_TG_BOT_TOKEN or os.environ.get("TG_BOT_TOKEN", "")).strip()
+    tg_chat_id = (CONF_TG_CHAT_ID or os.environ.get("TG_CHAT_ID", "")).strip()
     single_process = (CONF_SINGLE_PROCESS or os.environ.get("SINGLE_PROCESS", "")).lower() == "true"
     foreground_core = single_process and disable_argo and not (komari_domain and komari_token)
 
-    # 6. 节点名称与公网 IP 识别
-    name = CONF_NAME or os.environ.get("NAME", "")
+    # 6. 节点名称与公网 IP 格式校验
+    name = (CONF_NAME or os.environ.get("NAME", "")).strip()
     if not name:
         country = _http_get_text("https://ipinfo.io/country") or _http_get_text("https://ifconfig.co/country-iso")
         asn_org = _http_get_text("https://ipinfo.io/org") or _http_get_text("https://ifconfig.co/org")
@@ -1094,12 +1229,19 @@ def main():
             asn_org = re.sub(r"[^A-Za-z0-9 ._-]", "", asn_org).strip()[:20]
         name = f"{country}-{asn_org}" if country and asn_org else (f"{country}-sb" if country else "sb")
 
-    # 公网 IP
-    public_ip = CONF_IP or os.environ.get("PUBLIC_IP", "") or os.environ.get("IP", "")
-    if not public_ip and (hy2_port or tuic_port or reality_port or ss_port or s5_port or anytls_port or disable_argo):
-        public_ip = _http_get_text("https://ipinfo.io/ip") or _http_get_text("https://ifconfig.co/ip") or ""
+    custom_ip = (CONF_IP or os.environ.get("PUBLIC_IP", "") or os.environ.get("IP", "")).strip()
+    public_ip = ""
+    if custom_ip:
+        try:
+            ipaddress.ip_address(custom_ip)
+            public_ip = custom_ip
+        except ValueError:
+            log.warning("自定义公网 IP (%s) 格式非法，自动探测替代", custom_ip)
 
-    # 7. 端口唯一性与冲突检测
+    if not public_ip and (hy2_port or tuic_port or reality_port or ss_port or s5_port or anytls_port or disable_argo):
+        public_ip = get_valid_public_ip()
+
+    # 7. 端口冲突自查
     used_ports = set()
     used_ports.add(f"tcp:{inbound_port}")
     used_ports.add(f"tcp:{argo_port}")
@@ -1124,29 +1266,17 @@ def main():
     s5_active      = port_ok(s5_port, "tcp")
     anytls_active  = port_ok(anytls_port, "tcp")
 
-    if hy2_port     and not hy2_active:     log.warning("HY2_PORT(%s) 端口冲突或无效，Hysteria2 已跳过", hy2_port)
-    if tuic_port    and not tuic_active:    log.warning("TUIC_PORT(%s) 端口冲突或无效，TUIC 已跳过", tuic_port)
-    if reality_port and not reality_active: log.warning("REALITY_PORT(%s) 端口冲突或无效，Reality 已跳过", reality_port)
-    if ss_port      and not ss_active:      log.warning("SS_PORT(%s) 端口冲突或无效，Shadowsocks 已跳过", ss_port)
-    if s5_port      and not s5_active:      log.warning("S5_PORT(%s) 端口冲突或无效，Socks5 已跳过", s5_port)
-    if anytls_port  and not anytls_active:  log.warning("ANYTLS_PORT(%s) 端口冲突或无效，AnyTLS 已跳过", anytls_port)
+    if hy2_port     and not hy2_active:     log.warning("HY2_PORT(%s) 端口冲突或无效，已跳过", hy2_port)
+    if tuic_port    and not tuic_active:    log.warning("TUIC_PORT(%s) 端口冲突或无效，已跳过", tuic_port)
+    if reality_port and not reality_active: log.warning("REALITY_PORT(%s) 端口冲突或无效，已跳过", reality_port)
+    if ss_port      and not ss_active:      log.warning("SS_PORT(%s) 端口冲突或无效，已跳过", ss_port)
+    if s5_port      and not s5_active:      log.warning("S5_PORT(%s) 端口冲突或无效，已跳过", s5_port)
+    if anytls_port  and not anytls_active:  log.warning("ANYTLS_PORT(%s) 端口冲突或无效，已跳过", anytls_port)
 
-    # 8. 下载或定位 sing-box 核心
-    sb_bin = ""
-    if SB_BIN_PATH.exists():
-        if platform.system() != "Windows":
-            os.chmod(str(SB_BIN_PATH), SB_BIN_PATH.stat().st_mode | stat.S_IEXEC)
-        sb_bin = str(SB_BIN_PATH)
-    else:
-        candidates = ["/usr/local/bin/sing-box", "/usr/bin/sing-box"]
-        for c in candidates:
-            if Path(c).exists():
-                sb_bin = c
-                break
-    if not sb_bin:
-        sb_bin = download_singbox()
+    # 8. 下载并部署核心组件
+    sb_bin = download_singbox()
 
-    # 9. 证书现场准备（Hysteria2 / TUIC / AnyTLS 需要）
+    # 9. 证书准备
     cert_path = key_path = ""
     cert_ready = False
     if hy2_active or tuic_active or anytls_active:
@@ -1154,19 +1284,13 @@ def main():
             key_path, cert_path = generate_self_signed_cert(DATA_DIR / "certs")
             cert_ready = True
         except Exception as e:
-            log.error("证书生成失败，Hysteria2/TUIC/AnyTLS 将被跳过: %s", e)
-            cert_ready = False
-
-    if not cert_ready:
-        if hy2_active:    log.warning("因证书不可用，Hysteria2 已跳过")
-        if tuic_active:   log.warning("因证书不可用，TUIC 已跳过")
-        if anytls_active: log.warning("因证书不可用，AnyTLS 已跳过")
+            log.error("自签证书生成失败: %s", e)
 
     hy2_final    = hy2_active and cert_ready
     tuic_final   = tuic_active and cert_ready
     anytls_final = anytls_active and cert_ready
 
-    # 10. 组装 sing-box 配置文件
+    # 10. 组装配置文件
     inbounds = [] if disable_argo else [
         {
             "type": "vmess", "tag": "vmess-in", "listen": "127.0.0.1", "listen_port": V_VMESS_PORT,
@@ -1204,12 +1328,11 @@ def main():
     reality_pub_key = ""
     if reality_active:
         log.info("启用 VLESS Reality，端口 %s", reality_port)
-        reality_key_file = DATA_DIR / "reality-keys.json"
         reality_priv_key = ""
 
-        if reality_key_file.exists():
+        if REALITY_KEY_FILE.exists():
             try:
-                saved = json.loads(reality_key_file.read_text(encoding="utf-8"))
+                saved = json.loads(REALITY_KEY_FILE.read_text(encoding="utf-8"))
                 if saved.get("privKey") and saved.get("pubKey"):
                     reality_priv_key = saved["privKey"]
                     reality_pub_key = saved["pubKey"]
@@ -1217,9 +1340,9 @@ def main():
                 else:
                     raise ValueError("密钥字段不完整")
             except Exception as e:
-                log.warning("reality-keys.json 读取失败（%s），重新生成...", e)
+                log.warning("reality-keys.json 读取失败: %s", e)
                 try:
-                    reality_key_file.unlink()
+                    REALITY_KEY_FILE.unlink()
                 except OSError:
                     pass
 
@@ -1234,7 +1357,7 @@ def main():
                 if priv_m and pub_m:
                     reality_priv_key = priv_m.group(1)
                     reality_pub_key  = pub_m.group(1)
-                    atomic_write_secure(reality_key_file, json.dumps({
+                    atomic_write_secure(REALITY_KEY_FILE, json.dumps({
                         "privKey": reality_priv_key, "pubKey": reality_pub_key,
                     }))
                     log.info("Reality 密钥对生成并原子保存成功")
@@ -1291,13 +1414,7 @@ def main():
     }
     atomic_write_secure(CONFIG_FILE, json.dumps(config, indent=2))
 
-    # 11. 核心版本校验与配置整体检测
-    try:
-        ver_out = subprocess.run([sb_bin, "version"], capture_output=True, text=True, check=True).stdout
-        log.info("sing-box 版本信息:\n%s", ver_out.strip())
-    except Exception as e:
-        log.warning("无法获取 sing-box 版本信息: %s", e)
-
+    # 11. 配置校验
     sb_start_failed = False
     try:
         subprocess.run(
@@ -1310,13 +1427,10 @@ def main():
         log.error("================ sing-box 配置校验失败 ================")
         log.error(detail.strip())
         log.error("========================================================")
-        log.error("常见原因：当前 sing-box 版本过旧，不支持某个已启用的协议类型（如 AnyTLS 需要 >= 1.12.0）。")
         atomic_write_secure(SB_LOG_FILE, f"[CONFIG CHECK FAILED]\n{detail}\n")
-        log.info("详细日志已写入: %s", SB_LOG_FILE)
-        log.info("配置校验未通过，跳过启动核心工作进程（HTTP订阅服务仍会继续运行）。")
         sb_start_failed = True
 
-    # 12. 启动核心工作进程（支持守护状态机与脱敏伪装）
+    # 12. 启动核心工作进程（自愈守护）
     sb_env = os.environ.copy()
     sb_env.pop("PORT", None)
 
@@ -1328,20 +1442,20 @@ def main():
             )
         supervise_process("核心工作进程", _launch_sb)
 
-    # 13. Argo 转发服务与 Cloudflared 启动
+    # 13. Argo 转发服务与 Cloudflared（全面接入保活）
     host = "your-domain.com"
     if not disable_argo:
         threading.Thread(target=run_argo_forward_server, args=(argo_port,), daemon=True).start()
         try:
             cf_bin = download_cloudflared()
-            argo_host = start_argo_tunnel(cf_bin, argo_port, argo_domain, argo_auth, argo_protocol)
+            argo_host = start_argo_tunnel_service(cf_bin, argo_port, argo_domain, argo_auth, argo_protocol)
             host = argo_host or "your-domain.com"
         except Exception as err:
             log.error("Argo 隧道启动失败: %s", err)
     else:
         log.info("Argo 隧道已禁用，跳过 cloudflared")
 
-    # 14. 启动 Komari 监控探针（可选，阶段三）
+    # 14. 启动 Komari 探针（保活与脱敏环境）
     if komari_domain and komari_token:
         try:
             km_bin = download_komari_agent()
@@ -1365,13 +1479,13 @@ def main():
                         Path(km_bin), km_args,
                         "python /app/metrics.py", log_file=KOMARI_LOG_FILE, env=km_env
                     )
-                supervise_process("监控探针", _launch_km)
+                supervise_process("Komari探针", _launch_km)
                 komari_active = True
-                log.info("Komari 探针已启动，监控日志: %s", KOMARI_LOG_FILE)
+                log.info("Komari 探针已启动，日志: %s", KOMARI_LOG_FILE)
         except Exception as e:
             log.warning("启动 Komari 探针失败: %s", e)
 
-    # 15. 生成订阅链接与格式化（阶段二 IPv6 适配）
+    # 15. 生成订阅链接
     links = []
     formatted_ip = format_ip(public_ip)
 
@@ -1439,18 +1553,22 @@ def main():
     except Exception:
         pass
 
-    # 计算订阅展示地址
-    if disable_argo and public_ip:
-        sub_display_url = f"http://{formatted_ip}:{inbound_port}{sub_path}"
-    else:
-        sub_display_url = f"https://{host}{sub_path}"
+    sub_display_url = (
+        f"http://{formatted_ip}:{inbound_port}{sub_path}"
+        if disable_argo and public_ip
+        else f"https://{host}{sub_path}"
+    )
 
-    # 16. Telegram Bot 节点推送（阶段三）
+    # 16. Telegram 推送（带防截断保护）
     if tg_bot_token and tg_chat_id:
         escaped_name  = escape_html(name)
         escaped_sub   = escape_html(sub_display_url)
         escaped_links = escape_html("\n\n".join(links))
         current_time  = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Telegram 单条上限 4096，超出安全截断
+        if len(escaped_links) > 2800:
+            escaped_links = escaped_links[:2800] + "\n...(节点较多，请直接使用订阅链接)..."
 
         tg_text = (
             f"🚀 <b>Singbox 节点部署成功</b>\n\n"
@@ -1460,7 +1578,6 @@ def main():
             f"📋 <b>节点链接:</b>\n<pre>{escaped_links}</pre>"
         )
 
-        # Telegram 单条上限 4096 字符，若加 Base64 不超长则附加
         if len(tg_text) + len(sub_b64) + 50 <= 4000:
             tg_text += f"\n\n📦 <b>Base64 订阅:</b>\n<pre>{sub_b64}</pre>"
 
@@ -1470,7 +1587,7 @@ def main():
         else:
             log.warning("Telegram 节点推送失败，请检查 Token 与 Chat ID")
 
-    # 17. 控制台输出与日志隐私保护（阶段三）
+    # 17. 控制台输出与日志隐私自愈
     if show_log:
         print("================= 订阅内容 =================")
         print(sub_b64)
@@ -1499,7 +1616,7 @@ def main():
             print(f"✓ Komari 探针   域名: {komari_domain}")
         if disable_argo:
             print("✗ Argo 隧道已禁用")
-        print(f"运行环境: {platform.system()}-{detect_arch()}")
+        print(f"运行环境: {detect_os()}-{detect_arch()}")
         print("========================================")
 
         if log_clear_minutes > 0:
@@ -1509,17 +1626,14 @@ def main():
                 time.sleep(log_clear_minutes * 60)
                 if is_shutting_down:
                     return
-                # 清屏
                 try:
-                    os.system("cls" if platform.system() == "Windows" else "clear")
+                    os.system("cls" if detect_os() == "windows" else "clear")
                 except Exception:
                     pass
-                # 粉碎磁盘上的 sub.txt
                 try:
                     sub_file.unlink(missing_ok=True)
                 except Exception:
                     pass
-                # 截断运行日志
                 for lf in (SB_LOG_FILE, KOMARI_LOG_FILE, CF_LOG_FILE):
                     try:
                         if lf.exists():
@@ -1551,7 +1665,7 @@ def main():
             print(f"节点订阅文件已安全写入: {sub_file}")
         print("====================================================")
 
-    # 18. 单进程前台独占模式（阶段四）或主循环常驻
+    # 18. 单进程独占模式或主循环常驻
     if foreground_core and not sb_start_failed:
         log.info("[单进程模式] 核心工作进程接管前台常驻运行...")
         time.sleep(1.5)
@@ -1560,12 +1674,9 @@ def main():
         except Exception:
             pass
 
-        # 前台独占运行核心工作进程
-        is_win = (platform.system() == "Windows")
-        cloaked_tag = "python /app/worker.py"
         args = ["run", "-c", str(CONFIG_FILE)]
-        if not is_win:
-            core_proc = subprocess.Popen([cloaked_tag] + args, executable=str(sb_bin), env=sb_env)
+        if detect_os() != "windows":
+            core_proc = subprocess.Popen(["python /app/worker.py"] + args, executable=str(sb_bin), env=sb_env)
         else:
             core_proc = subprocess.Popen([str(sb_bin)] + args, env=sb_env)
 
@@ -1575,7 +1686,6 @@ def main():
         if not is_shutting_down:
             sys.exit(exit_code)
     else:
-        # 主线程保持存活等待退出信号
         try:
             while not is_shutting_down:
                 time.sleep(3600)
