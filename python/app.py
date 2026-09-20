@@ -1686,21 +1686,32 @@ def main():
             print(f"节点订阅文件已安全写入: {sub_file}")
         print("====================================================")
 
-    # 18. 单进程独占模式或主循环常驻
+    # 18. 单进程独占模式（翼龙面板等小内存环境极致常驻优化）或主循环常驻
     if foreground_core and not sb_start_failed:
-        log.info("[单进程模式] 核心工作进程接管前台常驻运行...")
+        log.info("[单进程模式] 订阅初始化与推送完成，核心工作进程原地接管前台（释放 Python 解释器内存）...")
         time.sleep(1.5)
         try:
             sub_file.unlink(missing_ok=True)
         except Exception:
             pass
 
-        args = ["run", "-c", str(CONFIG_FILE)]
-        if detect_os() != "windows":
-            core_proc = subprocess.Popen(["python /app/worker.py"] + args, executable=str(sb_bin), env=sb_env)
-        else:
-            core_proc = subprocess.Popen([str(sb_bin)] + args, env=sb_env)
+        # 刷新所有标准输出流缓冲区，确保控制台信息完整落盘
+        sys.stdout.flush()
+        sys.stderr.flush()
 
+        cloaked_tag = "python /app/worker.py"
+        args = [cloaked_tag, "run", "-c", str(CONFIG_FILE)]
+
+        if detect_os() != "windows":
+            # Linux / 翼龙面板环境：通过系统级 os.execv 原地替换进程内存镜像
+            # 彻底释放 Python 解释器全部内存，PID 保持不变，面板监控不报退出，常驻仅 ~18MB！
+            try:
+                os.execv(str(sb_bin), args)
+            except OSError as e:
+                log.warning("os.execv 原地接管失败 (%s)，回退至常规单进程等待", e)
+
+        # Windows 或 execv 异常回退场景
+        core_proc = subprocess.Popen([str(sb_bin)] + args[1:], env=sb_env)
         register_process(core_proc)
         exit_code = core_proc.wait()
         unregister_process(core_proc)
