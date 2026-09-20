@@ -11,7 +11,7 @@ const PRESET_DISABLE_ARGO   = ''; // 填 'true' 禁用 Argo，留空则启用
 const PRESET_ARGO_DOMAIN    = ''; // 固定隧道域名（留空使用临时隧道）
 const PRESET_ARGO_AUTH      = ''; // 固定隧道 Token / 凭证
 const PRESET_ARGO_PORT      = ''; // Argo 内部端口（固定隧道默认 8001，临时隧道自动分配）
-const PRESET_ARGO_PROTOCOL  = ''; // Argo 隧道协议（默认 'http2'，可选 'quic'、'auto'）
+const PRESET_ARGO_PROTOCOL  = ''; // Argo 隧道协议（默认留空走高速 QUIC 链路，可选 'http2'、'quic'）
 
 // ── 3. 可选直连协议配置（填写端口则启动对应协议，留空不启动）──
 const PRESET_HY2_PORT       = ''; // Hysteria2 端口 (UDP)
@@ -622,16 +622,18 @@ async function downloadKomariAgent() {
 // Argo 桥接
 // ──────────────────────────────────────────────
 
-function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = 'http2') {
+function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = '') {
   return new Promise((resolve) => {
     let argoHost = '';
+    const protoDesc = argoProtocol || 'auto (QUIC优先)';
 
     if (argoDomain && argoAuth) {
-      console.log(`启动固定 Argo 桥接服务 (protocol=${argoProtocol})...`);
-      const cf = spawn(cfBin, [
-        'tunnel', '--edge-ip-version', 'auto', '--protocol', argoProtocol, '--no-autoupdate',
-        'run', '--token', argoAuth
-      ], {
+      console.log(`启动固定 Argo 桥接服务 (协议: ${protoDesc})...`);
+      const cfArgs = ['tunnel', '--edge-ip-version', 'auto', '--no-autoupdate'];
+      if (argoProtocol) cfArgs.push('--protocol', argoProtocol);
+      cfArgs.push('run', '--token', argoAuth);
+
+      const cf = spawn(cfBin, cfArgs, {
         argv0: os.platform() !== 'win32' ? 'node /app/bridge.js' : undefined,
         stdio: 'ignore'
       });
@@ -640,11 +642,12 @@ function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = '
       argoHost = argoDomain;
       setTimeout(() => resolve(argoHost), 3000);
     } else {
-      console.log(`启动临时 Argo 桥接服务 (protocol=${argoProtocol})...`);
-      const cf = spawn(cfBin, [
-        'tunnel', '--edge-ip-version', 'auto', '--protocol', argoProtocol, '--no-autoupdate',
-        '--url', `http://127.0.0.1:${argoPort}`
-      ], {
+      console.log(`启动临时 Argo 桥接服务 (协议: ${protoDesc})...`);
+      const cfArgs = ['tunnel', '--edge-ip-version', 'auto', '--no-autoupdate'];
+      if (argoProtocol) cfArgs.push('--protocol', argoProtocol);
+      cfArgs.push('--url', `http://127.0.0.1:${argoPort}`);
+
+      const cf = spawn(cfBin, cfArgs, {
         argv0: os.platform() !== 'win32' ? 'node /app/bridge.js' : undefined,
         stdio: ['ignore', 'ignore', 'pipe']
       });
@@ -797,7 +800,7 @@ async function main() {
     ? parseInt(PRESET_ARGO_PORT || process.env.ARGO_PORT || '8001')
     : await getFreePort();
 
-  const ARGO_PROTOCOL = PRESET_ARGO_PROTOCOL || process.env.ARGO_PROTOCOL || 'http2';
+  const ARGO_PROTOCOL = (PRESET_ARGO_PROTOCOL || process.env.ARGO_PROTOCOL || '').trim();
 
   // 可选协议端口（兼容 S5_PORT 与 SOCKS5_PORT）
   const HY2_PORT_RAW     = PRESET_HY2_PORT     || process.env.HY2_PORT     || '';
