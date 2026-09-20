@@ -548,9 +548,7 @@ def launch_process_cloaked(bin_path: Path, args: list, cloaked_tag: str, log_fil
     try:
         if not is_w:
             kwargs["start_new_session"] = True
-            proc = subprocess.Popen([cloaked_tag] + args, executable=str(bin_path), **kwargs)
-        else:
-            proc = subprocess.Popen(full_args, **kwargs)
+        proc = subprocess.Popen(full_args, **kwargs)
         return proc
     finally:
         # 父进程立即关闭 fd（子进程已继承底层内核句柄）
@@ -799,17 +797,18 @@ def download_komari_agent() -> str:
 # ──────────────────────────────────────────────
 # Argo 隧道管理与自愈保活状态机（排除 api. 误匹配）
 # ──────────────────────────────────────────────
-def start_argo_tunnel_service(cf_bin: str, argo_port: int, argo_domain: str, argo_auth: str, argo_protocol: str = "http2") -> str:
-    """启动 Cloudflare Argo 隧道，全面纳入指数退避自愈保活。"""
-    cf_proto = argo_protocol or "http2"
+def start_argo_tunnel_service(cf_bin: str, argo_port: int, argo_domain: str, argo_auth: str, argo_protocol: str = "") -> str:
+    """启动 Cloudflare Argo 隧道，未显式指定协议时走默认高速链路（QUIC优先）。"""
+    proto_desc = argo_protocol or "auto (QUIC优先)"
 
     if argo_domain and argo_auth:
-        log.info("配置固定 Argo 隧道 (协议: %s)...", cf_proto)
+        log.info("配置固定 Argo 隧道 (协议: %s)...", proto_desc)
         args = [
             "tunnel", "--edge-ip-version", "auto",
-            "--protocol", cf_proto,
             "--no-autoupdate", "run", "--token", argo_auth,
         ]
+        if argo_protocol:
+            args.extend(["--protocol", argo_protocol])
 
         def _argo_fixed_diagnostic(exit_code):
             log.error("================ 固定 Argo 隧道启动异常 ================")
@@ -832,12 +831,13 @@ def start_argo_tunnel_service(cf_bin: str, argo_port: int, argo_domain: str, arg
         log.info("固定 Argo 隧道已接入守护状态机，日志见 %s", CF_LOG_FILE)
         return argo_domain
 
-    log.info("配置临时 Argo 隧道 (协议: %s)...", cf_proto)
+    log.info("配置临时 Argo 隧道 (协议: %s)...", proto_desc)
     args = [
         "tunnel", "--edge-ip-version", "auto",
-        "--protocol", cf_proto,
         "--no-autoupdate", "--url", f"http://127.0.0.1:{argo_port}",
     ]
+    if argo_protocol:
+        args.extend(["--protocol", argo_protocol])
 
     # 正则严密排除 api.trycloudflare.com
     pattern = re.compile(r"https://(?!api\.)([a-z0-9-]+\.trycloudflare\.com)", re.IGNORECASE)
@@ -854,9 +854,7 @@ def start_argo_tunnel_service(cf_bin: str, argo_port: int, argo_domain: str, arg
         }
         if not is_w:
             kwargs["start_new_session"] = True
-            proc = subprocess.Popen(["python /app/bridge.py"] + args, executable=str(cf_bin), **kwargs)
-        else:
-            proc = subprocess.Popen([str(cf_bin)] + args, **kwargs)
+        proc = subprocess.Popen([str(cf_bin)] + args, **kwargs)
 
         def _reader(p=proc):
             for line in iter(p.stderr.readline, ""):
@@ -902,10 +900,10 @@ def _set_keepalive(sock: socket.socket):
         pass
 
 
-def _pipe(src: socket.socket, dst: socket.socket, done_event: threading.Event):
-    """单向传输，若任何一侧断开，主动触发 done_event 并联动双方关闭，消除线程阻塞。"""
+def _pipe(src: socket.socket, dst: socket.socket):
+    """双向独立传输管道，对标原版纯粹全双工转发。"""
     try:
-        while not done_event.is_set():
+        while True:
             data = src.recv(65536)
             if not data:
                 break
@@ -913,7 +911,6 @@ def _pipe(src: socket.socket, dst: socket.socket, done_event: threading.Event):
     except OSError:
         pass
     finally:
-        done_event.set()
         try:
             dst.shutdown(socket.SHUT_WR)
         except OSError:
@@ -921,26 +918,25 @@ def _pipe(src: socket.socket, dst: socket.socket, done_event: threading.Event):
 
 
 def _forward_raw(client_sock: socket.socket, header_part: bytes, rest: bytes, target_port: int):
+    """原版全双工数据转发核心：彻底移除单向断开即强杀全局的 done_event，并消除 upstream 5秒超时。"""
     client_sock.settimeout(None)
-    _set_keepalive(client_sock)
     try:
         upstream = socket.create_connection(("127.0.0.1", target_port), timeout=5)
-        _set_keepalive(upstream)
+        upstream.settimeout(None)
     except OSError as e:
         log.debug("连接内部 sing-box 端口 %s 失败: %s", target_port, e)
         client_sock.close()
         return
 
     upstream.sendall(header_part + b"\r\n\r\n" + rest)
-    done_event = threading.Event()
-
-    t1 = threading.Thread(target=_pipe, args=(client_sock, upstream, done_event), daemon=True)
-    t2 = threading.Thread(target=_pipe, args=(upstream, client_sock, done_event), daemon=True)
+    t1 = threading.Thread(target=_pipe, args=(client_sock, upstream), daemon=True)
+    t2 = threading.Thread(target=_pipe, args=(upstream, client_sock), daemon=True)
     t1.start()
     t2.start()
 
-    # 只要任何一边传输断开，立即双向彻底 close，打破另一边的 recv 阻塞
-    done_event.wait()
+    # 保持原版 join 机制，等待两端数据完整互传完毕再释放套接字
+    t1.join()
+    t2.join()
     try:
         client_sock.close()
     except Exception:
@@ -949,9 +945,6 @@ def _forward_raw(client_sock: socket.socket, header_part: bytes, rest: bytes, ta
         upstream.close()
     except Exception:
         pass
-
-    t1.join(timeout=1.0)
-    t2.join(timeout=1.0)
 
 
 def _recv_headers(sock: socket.socket, max_size: int = 65536) -> bytes:
@@ -998,34 +991,8 @@ def _send_bad_request(client_sock: socket.socket):
     client_sock.close()
 
 
-def _serve_with_limit(srv: socket.socket, handle_fn, max_conn: int = _MAX_CONCURRENT_CONNECTIONS):
-    """带信号量并发保护的请求接收器。"""
-    semaphore = threading.BoundedSemaphore(max_conn)
-    while not is_shutting_down:
-        try:
-            client, _ = srv.accept()
-        except OSError:
-            break
-
-        if not semaphore.acquire(blocking=False):
-            # 达到并发上限，快速拒绝，防止线程堆叠崩溃
-            try:
-                client.close()
-            except OSError:
-                pass
-            continue
-
-        def _wrapped(c=client):
-            try:
-                handle_fn(c)
-            finally:
-                semaphore.release()
-
-        threading.Thread(target=_wrapped, daemon=True).start()
-
-
 def run_argo_forward_server(port: int):
-    """Argo WebSocket 升级转发网关。"""
+    """Argo WebSocket 升级转发网关，对标原版原生并发监听。"""
     srv = _create_server_socket()
     srv.bind(("127.0.0.1", port))
     srv.listen(128)
@@ -1056,7 +1023,12 @@ def run_argo_forward_server(port: int):
             log.debug("argo forward error: %s", e)
             client_sock.close()
 
-    _serve_with_limit(srv, handle)
+    while not is_shutting_down:
+        try:
+            client, _ = srv.accept()
+        except OSError:
+            break
+        threading.Thread(target=handle, args=(client,), daemon=True).start()
 
 
 def _load_index_html() -> str:
