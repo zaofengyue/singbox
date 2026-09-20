@@ -16,7 +16,7 @@ CONF_DISABLE_ARGO   = ""  # 填 "true" 禁用 Argo，留空则启用
 CONF_ARGO_DOMAIN    = ""  # 固定隧道域名（留空使用临时隧道）
 CONF_ARGO_AUTH      = ""  # 固定隧道 Token / 凭证
 CONF_ARGO_PORT      = ""  # Argo 内部端口（固定隧道默认 8001，临时隧道自动分配）
-CONF_ARGO_PROTOCOL  = ""  # Argo 隧道协议（默认 "http2"，可选 "quic"、"auto"）
+CONF_ARGO_PROTOCOL  = ""  # Argo 隧道协议（默认留空走高速 QUIC 链路，可选 "http2"、"quic"）
 
 # ── 3. 可选直连协议配置（填写端口则启动对应协议，留空不启动）──
 CONF_HY2_PORT       = ""  # Hysteria2 端口 (UDP)
@@ -922,8 +922,15 @@ def _forward_raw(client_sock: socket.socket, header_part: bytes, rest: bytes, ta
     """原版全双工数据转发核心：彻底移除单向断开即强杀全局的 done_event，并消除 upstream 5秒超时。"""
     client_sock.settimeout(None)
     try:
+        client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        _set_keepalive(client_sock)
+    except Exception:
+        pass
+    try:
         upstream = socket.create_connection(("127.0.0.1", target_port), timeout=5)
         upstream.settimeout(None)
+        upstream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        _set_keepalive(upstream)
     except OSError as e:
         log.debug("连接内部 sing-box 端口 %s 失败: %s", target_port, e)
         client_sock.close()
