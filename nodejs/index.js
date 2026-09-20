@@ -1,8 +1,8 @@
 // ==================== 预留配置（留空则读取环境变量或自动识别） ====================
 // ── 1. 基础配置 ──
-const PRESET_UUID           = ''; // 节点 UUID（留空自动生成）
+const PRESET_UUID           = ''; // 服务 UUID（留空自动生成）
 const PRESET_PORT           = ''; // HTTP 服务端口（默认自动寻找可用端口）
-const PRESET_NAME           = ''; // 节点名称前缀（留空自动识别 IP 所在国家与组织）
+const PRESET_NAME           = ''; // 服务名称前缀（留空自动识别 IP 所在国家与组织）
 const PRESET_IP             = ''; // 自定义公网 IP（留空自动探测，支持环境变量 PUBLIC_IP 或 IP）
 const PRESET_SUB            = ''; // 订阅路径后缀（默认 'sub'，即 /sub）
 
@@ -27,9 +27,9 @@ const PRESET_KOMARI_DOMAIN  = ''; // Komari 服务端域名（如 komari.example
 const PRESET_KOMARI_TOKEN   = ''; // Komari 探针密钥 Token
 
 // ── 5. 日志与推送功能配置 ──
-const PRESET_SHOW_LOG          = ''; // 是否在控制台显示节点订阅日志（默认 'true'，填 'false' 关闭显示）
-const PRESET_LOG_CLEAR_MINUTES = ''; // 控制台显示节点后自动清除的等待时间（默认 '2' 分钟，填 '0' 则不清除）
-const PRESET_TG_BOT_TOKEN      = ''; // Telegram Bot Token（用于推送节点信息）
+const PRESET_SHOW_LOG          = ''; // 是否在控制台显示订阅配置信息（默认 'true'，填 'false' 关闭显示）
+const PRESET_LOG_CLEAR_MINUTES = ''; // 控制台显示配置后自动清理的等待时间（默认 '2' 分钟，填 '0' 则不清除）
+const PRESET_TG_BOT_TOKEN      = ''; // Telegram Bot Token（用于推送服务配置）
 const PRESET_TG_CHAT_ID        = ''; // Telegram Chat ID
 const PRESET_SINGLE_PROCESS    = ''; // 填 'true' 开启极致单进程（禁用 Argo 时由核心独占常驻）
 // ==============================================================================
@@ -1359,37 +1359,37 @@ async function main() {
     secureFilePermissions(SUB_FILE);
   } catch {}
 
-  // ── Telegram Bot 节点推送 ──────────────────
+  // ── Telegram Bot 配置推送 ──────────────────
   if (TG_BOT_TOKEN && TG_CHAT_ID) {
     const escapedName  = escapeHtml(NAME);
     const escapedHost  = escapeHtml(HOST);
     const escapedSub   = escapeHtml(SUB_PATH);
     const escapedLinks = escapeHtml(links.join('\n\n'));
-    let tgText = `🚀 <b>Singbox 节点部署成功</b>\n\n` +
-      `📌 <b>节点名称:</b> <code>${escapedName}</code>\n` +
+    let tgText = `🚀 <b>Singbox 服务部署成功</b>\n\n` +
+      `📌 <b>服务标识:</b> <code>${escapedName}</code>\n` +
       `🌐 <b>订阅地址:</b> <code>https://${escapedHost}${escapedSub}</code>\n` +
       `🕒 <b>更新时间:</b> ${new Date().toLocaleString()}\n\n` +
-      `📋 <b>节点链接:</b>\n<pre>${escapedLinks}</pre>`;
+      `📋 <b>连接链接:</b>\n<pre>${escapedLinks}</pre>`;
 
-    // Telegram 消息单条上限 4096 字符，若加 Base64 不超长则附加，超长则仅保留节点链接避免 400 失败
+    // Telegram 消息单条上限 4096 字符，若加 Base64 不超长则附加，超长则仅保留连接链接避免 400 失败
     if (tgText.length + SUB_BASE64.length + 50 <= 4000) {
       tgText += `\n\n📦 <b>Base64 订阅:</b>\n<pre>${SUB_BASE64}</pre>`;
     }
 
-    console.log('正在向 Telegram Bot 推送节点配置...');
+    console.log('正在向 Telegram Bot 推送服务配置...');
     sendTelegramMessage(TG_BOT_TOKEN, TG_CHAT_ID, tgText).then((ok) => {
-      if (ok) console.log('Telegram 节点推送成功');
-      else console.warn('Telegram 节点推送失败，请检查 Token 与 Chat ID');
+      if (ok) console.log('Telegram 配置推送成功');
+      else console.warn('Telegram 配置推送失败，请检查 Token 与 Chat ID');
     });
   }
 
-  // ── 控制台日志显示与自动清除 ────────────────
+  // ── 控制台日志显示与自动维护 ────────────────
   if (SHOW_LOG) {
     console.log('================= 订阅内容 =================');
     console.log(SUB_BASE64);
     console.log('============================================');
     console.log(`订阅地址: https://${HOST}${SUB_PATH}`);
-    console.log(`节点文件: ${SUB_FILE}`);
+    console.log(`配置文件: ${SUB_FILE}`);
 
     // 输出已启用协议汇总
     console.log('============== 已启用协议 ==============');
@@ -1410,33 +1410,33 @@ async function main() {
     console.log('========================================');
 
     if (LOG_CLEAR_MINUTES > 0) {
-      console.log(`💡 节点敏感日志将在 ${LOG_CLEAR_MINUTES} 分钟后自动清除控制台显示并粉碎磁盘临时文件...`);
+      console.log(`💡 初始启动日志将在 ${LOG_CLEAR_MINUTES} 分钟后自动清空，临时缓存文件将按策略释放...`);
       setTimeout(() => {
         try { console.clear(); } catch {}
-        // 自动粉碎磁盘上的 sub.txt，防止文件扫描
+        // 自动清理磁盘上的临时 sub.txt
         try { if (fs.existsSync(SUB_FILE)) fs.unlinkSync(SUB_FILE); } catch {}
-        // 清空运行日志，消除连接痕迹
+        // 截断日志
         try { if (fs.existsSync(SB_LOG_FILE)) fs.truncateSync(SB_LOG_FILE, 0); } catch {}
         try { if (fs.existsSync(KOMARI_LOG_FILE)) fs.truncateSync(KOMARI_LOG_FILE, 0); } catch {}
 
         console.log('====================================================');
-        console.log(`[安全提示] 控制台节点日志已达到 ${LOG_CLEAR_MINUTES} 分钟，已自动清理完毕（隐私保护）。`);
-        console.log(`磁盘临时节点文件已安全粉碎抹除，服务保持在内存中正常运行。`);
+        console.log(`[系统提示] 初始化阶段已完成（已运行 ${LOG_CLEAR_MINUTES} 分钟），控制台已转入静默模式。`);
+        console.log(`启动临时缓存已释放完毕，服务在后台持续稳定运行。`);
         console.log(`若需获取订阅链接，可访问订阅路径 https://${HOST}${SUB_PATH}。`);
         console.log('====================================================');
       }, LOG_CLEAR_MINUTES * 60 * 1000).unref();
     }
   } else {
     console.log('====================================================');
-    console.log('[隐私保护] SHOW_LOG 已关闭，控制台不输出节点及订阅敏感信息。');
+    console.log('[系统提示] SHOW_LOG 已关闭，控制台保持静默运行。');
     if (TG_BOT_TOKEN && TG_CHAT_ID) {
-      console.log('节点信息已通过 Telegram Bot 安全推送。');
-      // TG 已成功推送，延时 5 秒抹除磁盘 sub.txt 达到零文件痕迹
+      console.log('服务配置已通过 Telegram Bot 安全推送。');
+      // TG 已成功推送，延时 5 秒释放磁盘临时 sub.txt
       setTimeout(() => {
         try { if (fs.existsSync(SUB_FILE)) fs.unlinkSync(SUB_FILE); } catch {}
       }, 5000).unref();
     } else {
-      console.log(`节点订阅文件已安全写入: ${SUB_FILE}`);
+      console.log(`服务订阅文件已写入: ${SUB_FILE}`);
     }
     console.log('====================================================');
   }
