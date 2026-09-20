@@ -561,10 +561,11 @@ def launch_process_cloaked(bin_path: Path, args: list, cloaked_tag: str, log_fil
                 pass
 
 
-def supervise_process(name: str, launch_fn):
-    """指数退避自愈守护状态机（3s -> 6s -> ... -> 60s）。"""
+def supervise_process(name: str, launch_fn, early_exit_threshold: float = 3.0, diagnostic_fn=None):
+    """指数退避自愈守护状态机（3s -> 6s -> ... -> 60s），支持首次早期退出即时诊断。"""
     def _supervisor():
         delay = 3
+        first_attempt = True
         while not is_shutting_down:
             started_at = time.time()
             proc = None
@@ -590,6 +591,15 @@ def supervise_process(name: str, launch_fn):
                 break
 
             uptime = time.time() - started_at
+
+            # 首次启动就提前退出，大概率是配置错误（如 Token/密钥错误），输出详细诊断
+            if first_attempt and uptime < early_exit_threshold and diagnostic_fn:
+                try:
+                    diagnostic_fn(exit_code)
+                except Exception:
+                    pass
+
+            first_attempt = False
             delay = 3 if uptime > 60 else min(delay * 2, 60)
             log.warning("[保活] %s 异常退出 (code=%s)，将在 %ss 后自动重启", name, exit_code, delay)
             time.sleep(delay)
@@ -801,13 +811,24 @@ def start_argo_tunnel_service(cf_bin: str, argo_port: int, argo_domain: str, arg
             "--no-autoupdate", "run", "--token", argo_auth,
         ]
 
+        def _argo_fixed_diagnostic(exit_code):
+            log.error("================ 固定 Argo 隧道启动异常 ================")
+            log.error("cloudflared 进程提前退出（退出码 %s），详细日志见 %s", exit_code, CF_LOG_FILE)
+            try:
+                tail = CF_LOG_FILE.read_text(encoding="utf-8", errors="ignore")[-2000:]
+                log.error(tail.strip())
+            except OSError:
+                pass
+            log.error("==========================================================")
+            log.error("常见原因：ARGO_AUTH token 无效/过期，或 ARGO_DOMAIN 未在 Cloudflare 面板绑定成功")
+
         def _launch_fixed():
             return launch_process_cloaked(
                 Path(cf_bin), args, "python /app/bridge.py", log_file=CF_LOG_FILE
             )
 
-        # 启动自愈保活
-        supervise_process("Argo固定隧道", _launch_fixed)
+        # 启动自愈保活，配置秒退诊断
+        supervise_process("Argo固定隧道", _launch_fixed, diagnostic_fn=_argo_fixed_diagnostic)
         log.info("固定 Argo 隧道已接入守护状态机，日志见 %s", CF_LOG_FILE)
         return argo_domain
 
