@@ -5,9 +5,9 @@ Komari 探针监控、Telegram 推送、隐蔽脱敏防杀与自愈守护体系�
 
 # ==================== 预留配置（留空则读取环境变量或自动识别） ====================
 # ── 1. 基础配置 ──
-CONF_UUID           = ""  # 节点 UUID（留空自动生成）
+CONF_UUID           = ""  # 服务 UUID（留空自动生成）
 CONF_PORT           = ""  # HTTP 服务端口（默认自动寻找可用端口）
-CONF_NAME           = ""  # 节点名称前缀（留空自动识别 IP 所在国家与组织）
+CONF_NAME           = ""  # 服务名称前缀（留空自动识别 IP 所在国家与组织）
 CONF_IP             = ""  # 自定义公网 IP（留空自动探测）
 CONF_SUB            = ""  # 订阅路径后缀（默认 "sub"，即 /sub）
 
@@ -32,9 +32,9 @@ CONF_KOMARI_DOMAIN  = ""  # Komari 服务端地址（如 https://komari.example.
 CONF_KOMARI_TOKEN   = ""  # Komari 探针密钥 Token
 
 # ── 5. 日志与推送功能配置 ──
-CONF_SHOW_LOG          = ""  # 是否在控制台显示节点订阅日志（默认 "true"，填 "false" 关闭显示）
-CONF_LOG_CLEAR_MINUTES = ""  # 控制台显示节点后自动清除的等待时间（默认 "2" 分钟，填 "0" 则不清除）
-CONF_TG_BOT_TOKEN      = ""  # Telegram Bot Token（用于推送节点信息）
+CONF_SHOW_LOG          = ""  # 是否在控制台显示订阅配置信息（默认 "true"，填 "false" 关闭显示）
+CONF_LOG_CLEAR_MINUTES = ""  # 控制台显示配置后自动清理的等待时间（默认 "2" 分钟，填 "0" 则不清理）
+CONF_TG_BOT_TOKEN      = ""  # Telegram Bot Token（用于推送服务配置）
 CONF_TG_CHAT_ID        = ""  # Telegram Chat ID
 CONF_SINGLE_PROCESS    = ""  # 填 "true" 开启极致单进程（禁用 Argo 且无探针时由核心独占常驻前台）
 # ==============================================================================
@@ -1162,7 +1162,7 @@ def main():
 
     if not node_uuid:
         node_uuid = str(uuid.uuid4()).lower()
-        log.info("生成新节点 UUID: %s", node_uuid)
+        log.info("生成新服务 UUID: %s", node_uuid)
 
     atomic_write_secure(UUID_FILE, node_uuid)
     trojan_pass = node_uuid
@@ -1172,7 +1172,7 @@ def main():
     disable_argo = (CONF_DISABLE_ARGO or os.environ.get("DISABLE_ARGO", "")).lower() == "true"
     argo_domain = (CONF_ARGO_DOMAIN or os.environ.get("ARGO_DOMAIN", "")).strip()
     argo_auth = (CONF_ARGO_AUTH or os.environ.get("ARGO_AUTH", "")).strip()
-    argo_protocol = (CONF_ARGO_PROTOCOL or os.environ.get("ARGO_PROTOCOL", "http2")).strip()
+    argo_protocol = (CONF_ARGO_PROTOCOL or os.environ.get("ARGO_PROTOCOL", "")).strip()
 
     if argo_domain and argo_auth:
         argo_port = safe_int(CONF_ARGO_PORT or os.environ.get("ARGO_PORT", 8001), default=8001)
@@ -1212,7 +1212,7 @@ def main():
     single_process = (CONF_SINGLE_PROCESS or os.environ.get("SINGLE_PROCESS", "")).lower() == "true"
     foreground_core = single_process and disable_argo and not (komari_domain and komari_token)
 
-    # 6. 节点名称与公网 IP 格式校验
+    # 6. 服务名称与公网 IP 格式校验
     name = (CONF_NAME or os.environ.get("NAME", "")).strip()
     if not name:
         country = _http_get_text("https://ipinfo.io/country") or _http_get_text("https://ifconfig.co/country-iso")
@@ -1562,29 +1562,29 @@ def main():
 
         # Telegram 单条上限 4096，超出安全截断
         if len(escaped_links) > 2800:
-            escaped_links = escaped_links[:2800] + "\n...(节点较多，请直接使用订阅链接)..."
+            escaped_links = escaped_links[:2800] + "\n...(配置项较多，请直接使用订阅链接)..."
 
         tg_text = (
-            f"🚀 <b>Singbox 节点部署成功</b>\n\n"
-            f"📌 <b>节点名称:</b> <code>{escaped_name}</code>\n"
+            f"🚀 <b>Singbox 服务部署成功</b>\n\n"
+            f"📌 <b>服务标识:</b> <code>{escaped_name}</code>\n"
             f"🌐 <b>订阅地址:</b> <code>{escaped_sub}</code>\n"
             f"🕒 <b>更新时间:</b> {current_time}\n\n"
-            f"📋 <b>节点链接:</b>\n<pre>{escaped_links}</pre>"
+            f"📋 <b>连接链接:</b>\n<pre>{escaped_links}</pre>"
         )
 
         if len(tg_text) + len(sub_b64) + 50 <= 4000:
             tg_text += f"\n\n📦 <b>Base64 订阅:</b>\n<pre>{sub_b64}</pre>"
 
-        log.info("正在向 Telegram Bot 推送节点配置...")
+        log.info("正在向 Telegram Bot 推送服务配置...")
         if send_telegram_message(tg_bot_token, tg_chat_id, tg_text):
-            log.info("Telegram 节点推送成功")
+            log.info("Telegram 配置推送成功")
         else:
-            log.warning("Telegram 节点推送失败，请检查 Token 与 Chat ID")
+            log.warning("Telegram 配置推送失败，请检查 Token 与 Chat ID")
 
     _sub_clean_scheduled = False
 
     def schedule_sub_file_cleanup(delay_sec: int):
-        """在后台调度 sub.txt 延迟粉碎，支持完全脱离主进程（兼容 os.execve 原地镜像替换）。"""
+        """在后台调度 sub.txt 延迟清理，支持完全脱离主进程（兼容 os.execve 原地镜像替换）。"""
         nonlocal _sub_clean_scheduled
         if _sub_clean_scheduled or not sub_file.exists():
             return
@@ -1592,7 +1592,7 @@ def main():
 
         if detect_os() != "windows":
             try:
-                # Linux 环境：派生完全脱离 Python 会话的后台 shell 定时粉碎任务，对路径进行严格安全转义
+                # Linux 环境：派生完全脱离 Python 会话的后台 shell 定时清理任务，对路径进行严格安全转义
                 quoted_sub = shlex.quote(str(sub_file))
                 subprocess.Popen(
                     f"sleep {delay_sec} && rm -f {quoted_sub}",
@@ -1620,7 +1620,7 @@ def main():
         print(sub_b64)
         print("============================================")
         print(f"订阅地址: {sub_display_url}")
-        print(f"节点文件: {sub_file}")
+        print(f"配置文件: {sub_file}")
 
         print("============== 已启用协议 ==============")
         if not disable_argo:
@@ -1647,8 +1647,8 @@ def main():
         print("========================================")
 
         if log_clear_minutes > 0:
-            print(f"💡 节点敏感日志将在 {log_clear_minutes} 分钟后自动清除控制台显示并粉碎磁盘临时文件...")
-            # 独立后台调度粉碎，确保在单进程 os.execve 镜像替换后依然准时销毁文件
+            print(f"💡 初始启动日志将在 {log_clear_minutes} 分钟后自动清空，临时缓存文件将按策略释放...")
+            # 独立后台调度清理，确保在单进程 os.execve 镜像替换后依然准时销毁文件
             schedule_sub_file_cleanup(log_clear_minutes * 60)
 
             def _auto_clear():
@@ -1672,21 +1672,21 @@ def main():
                         pass
 
                 print("====================================================")
-                print(f"[安全提示] 控制台节点日志已达到 {log_clear_minutes} 分钟，已自动清理完毕（隐私保护）。")
-                print("磁盘临时节点文件已安全粉碎抹除，服务保持在内存中正常运行。")
+                print(f"[系统提示] 初始化阶段已完成（已运行 {log_clear_minutes} 分钟），控制台已转入静默模式。")
+                print("启动临时缓存已释放完毕，服务在后台持续稳定运行。")
                 print(f"若需获取订阅链接，可访问订阅路径 {sub_display_url}。")
                 print("====================================================")
 
             threading.Thread(target=_auto_clear, daemon=True, name="LogClearThread").start()
     else:
         print("====================================================")
-        print("[隐私保护] SHOW_LOG 已关闭，控制台不输出节点及订阅敏感信息。")
+        print("[系统提示] SHOW_LOG 已关闭，控制台保持静默运行。")
         if tg_bot_token and tg_chat_id:
-            print("节点信息已通过 Telegram Bot 安全推送。")
+            print("服务配置已通过 Telegram Bot 安全推送。")
             schedule_sub_file_cleanup(5)
         else:
-            print(f"节点订阅文件已安全写入: {sub_file}")
-            print("💡 隐私保护提示：sub.txt 将在运行 2 分钟（120秒）后自动粉碎抹除，请尽快保存！")
+            print(f"服务订阅文件已写入: {sub_file}")
+            print("💡 系统提示：sub.txt 将在运行 2 分钟（120秒）后自动释放清理，请妥善保存！")
             schedule_sub_file_cleanup(120)
         print("====================================================")
 
