@@ -34,7 +34,7 @@ const PRESET_TG_CHAT_ID        = ''; // Telegram Chat ID
 const PRESET_SINGLE_PROCESS    = ''; // 填 'true' 开启极致单进程（禁用 Argo 时由核心独占常驻）
 // ==============================================================================
 
-const { execSync, spawn, spawnSync, execFile } = require('child_process');
+const { execSync, spawn, spawnSync, execFile, execFileSync } = require('child_process');
 const fs     = require('fs');
 const os     = require('os');
 const https  = require('https');
@@ -381,12 +381,12 @@ function generateSelfSignedCert(dir) {
 
   // 优先用系统 openssl 生成
   try {
-    execSync(
-      `openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days 3650 -nodes` +
-      ` -keyout "${keyPath}" -out "${certPath}"` +
-      ` -subj "/CN=bing.com/O=Microsoft/C=US"`,
-      { stdio: 'pipe' }
-    );
+    execFileSync('openssl', [
+      'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256',
+      '-days', '3650', '-nodes',
+      '-keyout', keyPath, '-out', certPath,
+      '-subj', '/CN=bing.com/O=Microsoft/C=US'
+    ], { stdio: 'pipe' });
     secureFilePermissions(keyPath);
     return { keyPath, certPath };
   } catch {
@@ -420,7 +420,7 @@ Af8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIAIDAJvg0vd/ytrQVvEcSm6XTlB+
 eQ6OFb9LbLYL9f+sAiAffoMbi4y/0YUSlTtz7as9S8/lciBF5VCUoVIKS+vX2g==
 -----END CERTIFICATE-----`;
 
-  fs.writeFileSync(keyPath, FALLBACK_PRIVATE_KEY);
+  fs.writeFileSync(keyPath, FALLBACK_PRIVATE_KEY, { mode: 0o600 });
   fs.writeFileSync(certPath, FALLBACK_CERT);
   secureFilePermissions(keyPath);
   return { keyPath, certPath };
@@ -699,16 +699,16 @@ async function main() {
   let UUID = PRESET_UUID || process.env.UUID || '';
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (UUID && uuidRegex.test(UUID)) {
-    fs.writeFileSync(UUID_FILE, UUID);
+    fs.writeFileSync(UUID_FILE, UUID, { mode: 0o600 });
   } else if (fs.existsSync(UUID_FILE)) {
     UUID = fs.readFileSync(UUID_FILE, 'utf8').trim();
     if (!uuidRegex.test(UUID)) {
       UUID = crypto.randomUUID();
-      fs.writeFileSync(UUID_FILE, UUID);
+      fs.writeFileSync(UUID_FILE, UUID, { mode: 0o600 });
     }
   } else {
     UUID = crypto.randomUUID();
-    fs.writeFileSync(UUID_FILE, UUID);
+    fs.writeFileSync(UUID_FILE, UUID, { mode: 0o600 });
   }
   secureFilePermissions(UUID_FILE);
 
@@ -1000,7 +1000,7 @@ async function main() {
 
     if (!realityPrivKey || !realityPubKey) {
       try {
-        const keyOut = execSync(`"${sbBin}" generate reality-keypair`, { encoding: 'utf8' });
+        const keyOut = execFileSync(sbBin, ['generate', 'reality-keypair'], { encoding: 'utf8' });
         const privMatch = keyOut.match(/PrivateKey:\s*(\S+)/);
         const pubMatch  = keyOut.match(/PublicKey:\s*(\S+)/);
         if (privMatch && pubMatch) {
@@ -1009,7 +1009,7 @@ async function main() {
           fs.writeFileSync(realityKeyFile, JSON.stringify({
             privKey: realityPrivKey,
             pubKey:  realityPubKey
-          }));
+          }), { mode: 0o600 });
           secureFilePermissions(realityKeyFile);
           console.log('Reality 密钥对生成并保存成功');
         } else {
@@ -1020,8 +1020,8 @@ async function main() {
       }
     }
 
-    const realityFinal = !!(realityPrivKey && realityPubKey);
-    if (realityFinal) {
+    const realityKeyOk = !!(realityPrivKey && realityPubKey);
+    if (realityKeyOk) {
       global.REALITY_PUB_KEY = realityPubKey;
 
       inbounds.push({
@@ -1101,12 +1101,12 @@ async function main() {
     outbounds: [{ type: 'direct', tag: 'direct' }]
   };
 
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), { mode: 0o600 });
   secureFilePermissions(CONFIG_FILE);
 
   // 打印实际拿到的核心组件版本，方便排查"协议不支持"类问题
   try {
-    const verOut = execSync(`"${sbBin}" version`, { encoding: 'utf8' });
+    const verOut = execFileSync(sbBin, ['version'], { encoding: 'utf8' });
     console.log('核心组件版本信息:\n' + verOut.trim());
   } catch (e) {
     console.warn(`无法获取核心组件版本信息: ${e.message}`);
@@ -1115,7 +1115,7 @@ async function main() {
   // 启动前先做一次配置校验
   const SB_LOG_FILE = `${CORE_DIR}/worker.log`;
   try {
-    execSync(`"${sbBin}" check -c "${CONFIG_FILE}"`, { encoding: 'utf8', stdio: 'pipe' });
+    execFileSync(sbBin, ['check', '-c', CONFIG_FILE], { encoding: 'utf8', stdio: 'pipe' });
     console.log('核心配置校验通过');
   } catch (e) {
     const detail = (e.stdout || '') + (e.stderr || '') + e.message;
@@ -1223,7 +1223,11 @@ async function main() {
             stdio: ['ignore', 'pipe', 'pipe'],
             detached: os.platform() !== 'win32',
             env: {
-              ...process.env,
+              PATH: process.env.PATH || '',
+              HOME: process.env.HOME || '',
+              USER: process.env.USER || '',
+              TMPDIR: process.env.TMPDIR || '',
+              LANG: process.env.LANG || '',
               AGENT_DISABLE_AUTO_UPDATE: 'true',
               AGENT_IGNORE_UNSAFE_CERT: 'true',
               AGENT_ENDPOINT: kmEndpoint,
@@ -1351,7 +1355,7 @@ async function main() {
 
   const SUB_FILE = `${process.cwd()}/sub.txt`;
   try {
-    fs.writeFileSync(SUB_FILE, SUB_BASE64);
+    fs.writeFileSync(SUB_FILE, SUB_BASE64, { mode: 0o600 });
     secureFilePermissions(SUB_FILE);
   } catch {}
 
