@@ -1608,7 +1608,34 @@ def main():
         else:
             log.warning("Telegram 节点推送失败，请检查 Token 与 Chat ID")
 
-    # 17. 控制台输出与日志隐私自愈
+    def schedule_sub_file_cleanup(delay_sec: int):
+        """在后台调度 sub.txt 延迟粉碎，支持完全脱离主进程（兼容 os.execve 原地镜像替换）。"""
+        if not sub_file.exists():
+            return
+        if detect_os() != "windows":
+            try:
+                # Linux 环境：派生完全脱离 Python 会话的后台 shell 定时粉碎任务
+                subprocess.Popen(
+                    f"sleep {delay_sec} && rm -f '{sub_file}'",
+                    shell=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                    start_new_session=True,
+                )
+                return
+            except Exception:
+                pass
+        # Windows 或降级模式：使用后台守护线程
+        def _delayed_rm():
+            time.sleep(delay_sec)
+            try:
+                sub_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+        threading.Thread(target=_delayed_rm, daemon=True, name="SubFileCleaner").start()
+
     if show_log:
         print("================= 订阅内容 =================")
         print(sub_b64)
@@ -1675,43 +1702,71 @@ def main():
         print("[隐私保护] SHOW_LOG 已关闭，控制台不输出节点及订阅敏感信息。")
         if tg_bot_token and tg_chat_id:
             print("节点信息已通过 Telegram Bot 安全推送。")
-            def _shred_fast():
-                time.sleep(5)
-                try:
-                    sub_file.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            threading.Thread(target=_shred_fast, daemon=True).start()
+            schedule_sub_file_cleanup(5)
         else:
             print(f"节点订阅文件已安全写入: {sub_file}")
+            print("💡 隐私保护提示：sub.txt 将在运行 2 分钟（120秒）后自动粉碎抹除，请尽快保存！")
+            schedule_sub_file_cleanup(120)
         print("====================================================")
 
     # 18. 单进程独占模式（翼龙面板等小内存环境极致常驻优化）或主循环常驻
     if foreground_core and not sb_start_failed:
         log.info("[单进程模式] 订阅初始化与推送完成，核心工作进程原地接管前台（释放 Python 解释器内存）...")
         time.sleep(1.5)
+
+        # ── 痕迹安全大清扫（提升隐蔽性，消灭磁盘特征与无用文件） ──
+        # 1. 订阅文件清理调度（若未配置 TG，给予 120 秒安全窗口供用户下载复制；已配置 TG 则 5 秒粉碎）
+        if tg_bot_token and tg_chat_id:
+            schedule_sub_file_cleanup(5)
+        elif not show_log:
+            schedule_sub_file_cleanup(120)
+
+        # 2. 彻底递归清除 Python 自动生成的字节码缓存目录 __pycache__
+        for pycache in [Path.cwd() / "__pycache__", Path(__file__).parent / "__pycache__"]:
+            try:
+                if pycache.exists():
+                    import shutil
+                    shutil.rmtree(pycache, ignore_errors=True)
+            except Exception:
+                pass
+
+        # 3. 清除未启用的多余空日志文件，减少磁盘扫描特征
+        for unused_lf in [CF_LOG_FILE, KOMARI_LOG_FILE]:
+            try:
+                unused_lf.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        # 4. 彻底显式关闭前置 HTTP 监听，防止套接字句柄泄漏继承给 sing-box 导致端口锁死
         try:
-            sub_file.unlink(missing_ok=True)
+            public_srv.close()
         except Exception:
             pass
 
-        # 刷新所有标准输出流缓冲区，确保控制台信息完整落盘
+        # 5. 刷新所有标准流输出缓冲区，确保控制台信息完整落盘
         sys.stdout.flush()
         sys.stderr.flush()
 
         cloaked_tag = "python /app/worker.py"
         args = [cloaked_tag, "run", "-c", str(CONFIG_FILE)]
+        resolved_sb_bin = str(Path(sb_bin).resolve())
 
         if detect_os() != "windows":
-            # Linux / 翼龙面板环境：通过系统级 os.execv 原地替换进程内存镜像
+            # 7. 确保二进制具有绝对执行权限
+            try:
+                os.chmod(resolved_sb_bin, os.stat(resolved_sb_bin).st_mode | stat.S_IEXEC)
+            except Exception:
+                pass
+
+            # 8. Linux / 翼龙面板环境：通过系统级 os.execve 原地替换进程内存镜像并注入纯净环境变量
             # 彻底释放 Python 解释器全部内存，PID 保持不变，面板监控不报退出，常驻仅 ~18MB！
             try:
-                os.execv(str(sb_bin), args)
+                os.execve(resolved_sb_bin, args, sb_env)
             except OSError as e:
-                log.warning("os.execv 原地接管失败 (%s)，回退至常规单进程等待", e)
+                log.warning("os.execve 原地接管失败 (%s)，回退至常规单进程等待", e)
 
-        # Windows 或 execv 异常回退场景
-        core_proc = subprocess.Popen([str(sb_bin)] + args[1:], env=sb_env)
+        # Windows 或 execve 异常回退场景
+        core_proc = subprocess.Popen([resolved_sb_bin] + args[1:], env=sb_env)
         register_process(core_proc)
         exit_code = core_proc.wait()
         unregister_process(core_proc)

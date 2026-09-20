@@ -1432,19 +1432,46 @@ async function main() {
     if (TG_BOT_TOKEN && TG_CHAT_ID) {
       console.log('节点信息已通过 Telegram Bot 安全推送。');
       // TG 已成功推送，延时 5 秒抹除磁盘 sub.txt 达到零文件痕迹
-      setTimeout(() => {
-        try { if (fs.existsSync(SUB_FILE)) fs.unlinkSync(SUB_FILE); } catch {}
-      }, 5000).unref();
+      scheduleSubFileCleanup(5);
     } else {
       console.log(`节点订阅文件已安全写入: ${SUB_FILE}`);
+      console.log('💡 隐私保护提示：sub.txt 将在运行 2 分钟（120秒）后自动粉碎抹除，请尽快保存！');
+      scheduleSubFileCleanup(120);
     }
     console.log('====================================================');
+  }
+
+  function scheduleSubFileCleanup(delaySec) {
+    if (!fs.existsSync(SUB_FILE)) return;
+    if (os.platform() !== 'win32') {
+      try {
+        spawn('sh', ['-c', `sleep ${delaySec} && rm -f "${SUB_FILE}"`], {
+          detached: true,
+          stdio: 'ignore'
+        }).unref();
+        return;
+      } catch {}
+    }
+    setTimeout(() => {
+      try { if (fs.existsSync(SUB_FILE)) fs.unlinkSync(SUB_FILE); } catch {}
+    }, delaySec * 1000).unref();
   }
 
   if (FOREGROUND_CORE && !global.SB_START_FAILED) {
     console.log('[单进程模式] 订阅初始化与推送完成，核心工作进程接管前台常驻运行...');
     await new Promise(r => setTimeout(r, 2000));
-    try { if (fs.existsSync(SUB_FILE)) fs.unlinkSync(SUB_FILE); } catch {}
+
+    // 订阅文件清理调度（未配置 TG 则给予 120 秒安全窗口供用户保存；已配置 TG 则 5 秒粉碎）
+    if (TG_BOT_TOKEN && TG_CHAT_ID) {
+      scheduleSubFileCleanup(5);
+    } else if (!SHOW_LOG) {
+      scheduleSubFileCleanup(120);
+    }
+
+    // 清理未启用的空日志文件，提升隐蔽性
+    for (const lf of [CF_LOG_FILE, KOMARI_LOG_FILE]) {
+      try { if (fs.existsSync(lf)) fs.unlinkSync(lf); } catch {}
+    }
 
     // 针对翼龙面板等小内存环境：彻底关闭 HTTP 服务，释放端口与网络监听句柄
     try {
