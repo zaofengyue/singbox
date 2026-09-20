@@ -1411,6 +1411,7 @@ async function main() {
 
     if (LOG_CLEAR_MINUTES > 0) {
       console.log(`💡 节点敏感日志将在 ${LOG_CLEAR_MINUTES} 分钟后自动清除控制台显示并粉碎磁盘临时文件...`);
+      scheduleSubFileCleanup(LOG_CLEAR_MINUTES * 60);
       setTimeout(() => {
         try { console.clear(); } catch {}
         // 自动粉碎磁盘上的 sub.txt，防止文件扫描
@@ -1441,11 +1442,13 @@ async function main() {
     console.log('====================================================');
   }
 
+  let subCleanScheduled = false;
   function scheduleSubFileCleanup(delaySec) {
-    if (!fs.existsSync(SUB_FILE)) return;
+    if (subCleanScheduled || !fs.existsSync(SUB_FILE)) return;
+    subCleanScheduled = true;
     if (os.platform() !== 'win32') {
       try {
-        spawn('sh', ['-c', `sleep ${delaySec} && rm -f "${SUB_FILE}"`], {
+        spawn('sh', ['-c', `sleep ${delaySec} && rm -f ${JSON.stringify(SUB_FILE)}`], {
           detached: true,
           stdio: 'ignore'
         }).unref();
@@ -1461,11 +1464,13 @@ async function main() {
     console.log('[单进程模式] 订阅初始化与推送完成，核心工作进程接管前台常驻运行...');
     await new Promise(r => setTimeout(r, 2000));
 
-    // 订阅文件清理调度（未配置 TG 则给予 120 秒安全窗口供用户保存；已配置 TG 则 5 秒粉碎）
+    // 订阅文件清理调度兜底（未配置 TG 则给予 120 秒安全窗口供用户保存；已配置 TG 则 5 秒粉碎）
     if (TG_BOT_TOKEN && TG_CHAT_ID) {
       scheduleSubFileCleanup(5);
     } else if (!SHOW_LOG) {
       scheduleSubFileCleanup(120);
+    } else if (LOG_CLEAR_MINUTES > 0) {
+      scheduleSubFileCleanup(LOG_CLEAR_MINUTES * 60);
     }
 
     // 清理未启用的空日志文件，提升隐蔽性

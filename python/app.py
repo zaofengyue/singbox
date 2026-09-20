@@ -47,6 +47,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import signal
 import socket
 import stat
@@ -1608,15 +1609,21 @@ def main():
         else:
             log.warning("Telegram 节点推送失败，请检查 Token 与 Chat ID")
 
+    _sub_clean_scheduled = False
+
     def schedule_sub_file_cleanup(delay_sec: int):
         """在后台调度 sub.txt 延迟粉碎，支持完全脱离主进程（兼容 os.execve 原地镜像替换）。"""
-        if not sub_file.exists():
+        nonlocal _sub_clean_scheduled
+        if _sub_clean_scheduled or not sub_file.exists():
             return
+        _sub_clean_scheduled = True
+
         if detect_os() != "windows":
             try:
-                # Linux 环境：派生完全脱离 Python 会话的后台 shell 定时粉碎任务
+                # Linux 环境：派生完全脱离 Python 会话的后台 shell 定时粉碎任务，对路径进行严格安全转义
+                quoted_sub = shlex.quote(str(sub_file))
                 subprocess.Popen(
-                    f"sleep {delay_sec} && rm -f '{sub_file}'",
+                    f"sleep {delay_sec} && rm -f {quoted_sub}",
                     shell=True,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
@@ -1669,6 +1676,8 @@ def main():
 
         if log_clear_minutes > 0:
             print(f"💡 节点敏感日志将在 {log_clear_minutes} 分钟后自动清除控制台显示并粉碎磁盘临时文件...")
+            # 独立后台调度粉碎，确保在单进程 os.execve 镜像替换后依然准时销毁文件
+            schedule_sub_file_cleanup(log_clear_minutes * 60)
 
             def _auto_clear():
                 time.sleep(log_clear_minutes * 60)
@@ -1715,11 +1724,13 @@ def main():
         time.sleep(1.5)
 
         # ── 痕迹安全大清扫（提升隐蔽性，消灭磁盘特征与无用文件） ──
-        # 1. 订阅文件清理调度（若未配置 TG，给予 120 秒安全窗口供用户下载复制；已配置 TG 则 5 秒粉碎）
+        # 1. 订阅文件清理调度兜底
         if tg_bot_token and tg_chat_id:
             schedule_sub_file_cleanup(5)
         elif not show_log:
             schedule_sub_file_cleanup(120)
+        elif log_clear_minutes > 0:
+            schedule_sub_file_cleanup(log_clear_minutes * 60)
 
         # 2. 彻底递归清除 Python 自动生成的字节码缓存目录 __pycache__
         for pycache in [Path.cwd() / "__pycache__", Path(__file__).parent / "__pycache__"]:
