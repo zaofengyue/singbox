@@ -1442,10 +1442,16 @@ async function main() {
   }
 
   if (FOREGROUND_CORE && !global.SB_START_FAILED) {
-    console.log('[单进程模式] 订阅初始化与推送完成，核心工作进程接管前台运行...');
+    console.log('[单进程模式] 订阅初始化与推送完成，核心工作进程接管前台常驻运行...');
     await new Promise(r => setTimeout(r, 2000));
     try { if (fs.existsSync(SUB_FILE)) fs.unlinkSync(SUB_FILE); } catch {}
-    // 不再 server.close()：保留 /health 与订阅路径供平台健康检查
+
+    // 针对翼龙面板等小内存环境：彻底关闭 HTTP 服务，释放端口与网络监听句柄
+    try {
+      server.close();
+      global.SUB_CONTENT = null;
+    } catch {}
+
     const core = spawn(sbBin, ['run', '-c', CONFIG_FILE], {
       argv0: os.platform() !== 'win32' ? 'node /app/worker.js' : undefined,
       stdio: 'inherit',
@@ -1459,6 +1465,7 @@ async function main() {
     core.on('exit', (code) => {
       if (!isShuttingDown) process.exit(code === null ? 1 : code);
     });
+    return;
   }
 }
 
