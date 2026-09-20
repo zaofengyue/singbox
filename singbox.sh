@@ -64,14 +64,29 @@ CERT_DIR="$STATE_DIR/certs"
 DOMAIN_CERT_DIR="$STATE_DIR/domain-certs"
 ACME_HOME="$STATE_DIR/acme.sh"
 
-# 二进制存放目录（优先 /tmp/sb-bin 避开 noexec，备用 $HOME_DIR/sb-bin）
-BIN_DIR="/tmp/sb-bin"
+# 二进制存放目录（优先 /tmp/sb-bin-<uid> 避开 noexec，备用 $HOME_DIR/sb-bin）
+BIN_DIR="/tmp/sb-bin-$(id -u 2>/dev/null || echo 0)"
 SB_DIR="$BIN_DIR/singbox"
 SB_BIN="$SB_DIR/sing-box"
 CF_BIN="$BIN_DIR/cloudflared"
 KM_BIN="$BIN_DIR/komari-agent"
 
-USED_PORTS_FILE="/tmp/sb-used-ports.txt"
+USED_PORTS_FILE="$STATE_DIR/used-ports.txt"
+
+# 确保二进制目录安全创建、权限受限且属主正确（防止临时目录劫持与提权）
+_ensure_bin_dir_safe() {
+  local _dir="$1"
+  mkdir -p "$_dir" 2>/dev/null || return 1
+  local _owner
+  _owner="$(stat -c '%U' "$_dir" 2>/dev/null || stat -f '%Su' "$_dir" 2>/dev/null || true)"
+  local _cur_user
+  _cur_user="$(id -un 2>/dev/null || true)"
+  if [ -n "$_owner" ] && [ -n "$_cur_user" ] && [ "$_owner" != "$_cur_user" ]; then
+    return 1
+  fi
+  chmod 700 "$_dir" 2>/dev/null || true
+  return 0
+}
 
 # ── 配置文件读写工具 ──────────────────────────────────────────────────────────
 get_val() {
@@ -263,10 +278,11 @@ format_komari_endpoint() {
 
 download_komari() {
   detect_arch
-  if ! mkdir -p "$BIN_DIR" 2>/dev/null || [ ! -w "$BIN_DIR" ]; then
+  if ! _ensure_bin_dir_safe "$BIN_DIR" || [ ! -w "$BIN_DIR" ]; then
     BIN_DIR="$HOME_DIR/sb-bin"
     KM_BIN="$BIN_DIR/komari-agent"
     mkdir -p "$BIN_DIR"
+    chmod 700 "$BIN_DIR" 2>/dev/null || true
   fi
   if [ -x "$KM_BIN" ]; then
     return 0
@@ -1709,14 +1725,15 @@ do_run() {
   mkdir -p "$STATE_DIR" "$APP_DIR"
   chmod 700 "$STATE_DIR" 2>/dev/null || true
 
-  mkdir -p "$BIN_DIR" 2>/dev/null || {
+  if ! _ensure_bin_dir_safe "$BIN_DIR"; then
     BIN_DIR="$HOME_DIR/sb-bin"
     SB_DIR="$BIN_DIR/singbox"
     SB_BIN="$SB_DIR/sing-box"
     CF_BIN="$BIN_DIR/cloudflared"
     KM_BIN="$BIN_DIR/komari-agent"
     mkdir -p "$BIN_DIR"
-  }
+    chmod 700 "$BIN_DIR" 2>/dev/null || true
+  fi
 
   ensure_basic_deps
 
@@ -1768,15 +1785,16 @@ do_run() {
 
     _try_fetch_singbox() {
       local _v="$1" _vnum="${1#v}"
+      local _tmp_tar="$BIN_DIR/.sing-box.tar.gz"
       for _suffix in "-musl" ""; do
         local _asset="sing-box-${_vnum}-linux-${SB_ARCH}${_suffix}.tar.gz"
         log "下载 sing-box ${_v} (${SB_ARCH}${_suffix:+ 静态musl})..."
-        if dl "https://github.com/SagerNet/sing-box/releases/download/${_v}/${_asset}" /tmp/sing-box.tar.gz; then
-          if tar -tzf /tmp/sing-box.tar.gz >/dev/null 2>&1; then
+        if dl "https://github.com/SagerNet/sing-box/releases/download/${_v}/${_asset}" "$_tmp_tar"; then
+          if tar -tzf "$_tmp_tar" >/dev/null 2>&1; then
             rm -rf "$SB_DIR"; mkdir -p "$SB_DIR"
-            tar -xzf /tmp/sing-box.tar.gz -C "$SB_DIR" --strip-components=1
+            tar -xzf "$_tmp_tar" -C "$SB_DIR" --strip-components=1
             chmod +x "$SB_BIN"
-            rm -f /tmp/sing-box.tar.gz
+            rm -f "$_tmp_tar"
             if "$SB_BIN" version >/dev/null 2>&1; then return 0; fi
             warn "sing-box ${_v}${_suffix} 下载完整但无法执行"
           else
@@ -1951,6 +1969,10 @@ CERTEOF
     o_user="$(grep '^USER=' "$OUTBOUND_FILE" | cut -d'=' -f2-)"
     o_pass="$(grep '^PASS=' "$OUTBOUND_FILE" | cut -d'=' -f2-)"
     if [ -n "$o_addr" ] && [ -n "$o_port" ]; then
+      CUSTOM_OUT_TYPE="$(json_escape "$CUSTOM_OUT_TYPE")"
+      o_addr="$(json_escape "$o_addr")"
+      o_user="$(json_escape "$o_user")"
+      o_pass="$(json_escape "$o_pass")"
       if [ -n "$o_user" ]; then
         EXTRA_OUTBOUND_JSON=",
     {
