@@ -1115,7 +1115,12 @@ def run_public_server(srv: socket.socket, sub_path: str, index_html: str, sub_ho
             log.debug("public server error: %s", e)
             client_sock.close()
 
-    _serve_with_limit(srv, handle)
+    while not is_shutting_down:
+        try:
+            client, _ = srv.accept()
+        except OSError:
+            break
+        threading.Thread(target=handle, args=(client,), daemon=True).start()
 
 
 # ──────────────────────────────────────────────
