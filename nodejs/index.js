@@ -83,9 +83,45 @@ function gracefulExit(sig) {
 process.on('SIGTERM', () => gracefulExit('SIGTERM'));
 process.on('SIGINT', () => gracefulExit('SIGINT'));
 
+function resolveCoreDir() {
+  const homeEnv = process.env.HOME;
+  if (homeEnv) {
+    return `${homeEnv}/.cache/node-core`;
+  }
+  // HOME 缺失时退化到临时目录，必须按用户区分，不能用固定共享名字
+  const uid = (typeof os.userInfo === 'function' && os.platform() !== 'win32')
+    ? os.userInfo().uid
+    : 0;
+  const dir = `${os.tmpdir()}/node-core-${uid}`;
+  console.warn(`[警告] 未检测到 HOME 环境变量，数据目录退化至隔离目录 ${dir}，建议检查运行环境（systemd 服务、cron 任务等）是否正确设置了 HOME。`);
+  return dir;
+}
+
+function ensureCoreDirSafe(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+  if (os.platform() === 'win32') return;
+  try {
+    const st = fs.statSync(dir);
+    const curUid = typeof os.userInfo === 'function' ? os.userInfo().uid : 0;
+    if (st.uid !== curUid) {
+      throw new Error(`数据目录 ${dir} 属主异常（UID=${st.uid}，当前=${curUid}），可能已被其他用户预先创建，存在安全风险，请检查该路径或删除后重试。`);
+    }
+    fs.chmodSync(dir, 0o700);
+  } catch (e) {
+    if (e.code === 'ENOENT') return;
+    throw e;
+  }
+}
+
 const HOME            = process.env.HOME || os.tmpdir();
-const CORE_DIR        = `${HOME}/.cache/node-core`;
-try { fs.mkdirSync(CORE_DIR, { recursive: true }); } catch {}
+const CORE_DIR        = resolveCoreDir();
+
+try {
+  ensureCoreDirSafe(CORE_DIR);
+} catch (e) {
+  console.error(`[致命错误] 数据目录初始化失败: ${e.message}`);
+  process.exit(1);
+}
 const UUID_FILE       = fs.existsSync(`${HOME}/uuid.txt`) ? `${HOME}/uuid.txt` : `${CORE_DIR}/.session.key`;
 const CONFIG_FILE     = fs.existsSync(`${HOME}/sb-config.json`) ? `${HOME}/sb-config.json` : `${CORE_DIR}/.config.json`;
 const SB_BIN_NAME     = os.platform() === 'win32' ? 'node-worker.exe' : 'node-worker';

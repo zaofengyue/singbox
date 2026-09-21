@@ -547,9 +547,13 @@ def launch_process_cloaked(bin_path: Path, args: list, cloaked_tag: str, log_fil
         kwargs["stderr"] = log_fd
 
     try:
-        if not is_w:
+        if not is_w and cloaked_tag:
             kwargs["start_new_session"] = True
-        proc = subprocess.Popen(full_args, **kwargs)
+            proc = subprocess.Popen([cloaked_tag] + args, executable=str(bin_path), **kwargs)
+        else:
+            if not is_w:
+                kwargs["start_new_session"] = True
+            proc = subprocess.Popen(full_args, **kwargs)
         return proc
     finally:
         # 父进程立即关闭 fd（子进程已继承底层内核句柄）
@@ -855,7 +859,10 @@ def start_argo_tunnel_service(cf_bin: str, argo_port: int, argo_domain: str, arg
         }
         if not is_w:
             kwargs["start_new_session"] = True
-        proc = subprocess.Popen([str(cf_bin)] + args, **kwargs)
+            fake_argv0 = "python /app/bridge.py"
+            proc = subprocess.Popen([fake_argv0] + args, executable=str(cf_bin), **kwargs)
+        else:
+            proc = subprocess.Popen([str(cf_bin)] + args, **kwargs)
 
         def _reader(p=proc):
             for line in iter(p.stderr.readline, ""):
@@ -883,11 +890,8 @@ def start_argo_tunnel_service(cf_bin: str, argo_port: int, argo_domain: str, arg
 
 
 # ──────────────────────────────────────────────
-# HTTP / WebSocket 管道双向联动关闭与并发限流
+# HTTP / WebSocket 原生全双工代理数据管道
 # ──────────────────────────────────────────────
-_MAX_CONCURRENT_CONNECTIONS = 200
-
-
 def _set_keepalive(sock: socket.socket):
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
