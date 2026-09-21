@@ -715,6 +715,7 @@ TROJAN_PORT="${IN_TROJAN_PORT}"
 ANYTLS_PORT="${IN_ANYTLS_PORT}"
 KOMARI_DOMAIN="${IN_KOMARI_DOMAIN}"
 KOMARI_TOKEN="${IN_KOMARI_TOKEN}"
+WS_PATH="${WS_PATH:-/fengyue}"
 ARGO_PROTOCOL="${ARGO_PROTOCOL:-http2}"
 EOF
   chmod 600 "$ENV_FILE"
@@ -763,18 +764,36 @@ SVCEOF
     log "服务已通过用户级 systemd 启动并设置开机自启（证书自动续期已配置）"
   else
     do_restart
-    # 清理此前可能遗留的 .bashrc/.profile 进程注入（避免与 cron 叠加导致竞争或依赖登录触发）
-    for RC in "$HOME_DIR/.bashrc" "$HOME_DIR/.profile"; do
-      [ -f "$RC" ] && sed -i '/singbox.*run/d' "$RC" 2>/dev/null || true
+    # 针对容器/非 systemd 环境（如 SAP BAS / Docker / Codespaces），恢复终端入口唤醒保活守卫（带进程防重）
+    for RC in "$HOME_DIR/.bashrc" "$HOME_DIR/.profile" "$HOME_DIR/.bash_profile"; do
+      [ -e "$RC" ] || : > "$RC" 2>/dev/null || true
+      if [ -f "$RC" ]; then
+        sed -i '/singbox.*run/d' "$RC" 2>/dev/null || true
+        echo "[ -f \"$APP_DIR/config.env\" ] && ! pgrep -x \"sing-box\" >/dev/null 2>&1 && nohup bash \"$APP_DIR/singbox.sh\" run >> \"$LOG_FILE\" 2>&1 &" >> "$RC"
+      fi
     done
+
+    _cron_daemon_running() {
+      pgrep -x "cron" >/dev/null 2>&1 || pgrep -x "crond" >/dev/null 2>&1
+    }
+
     if command -v crontab >/dev/null 2>&1; then
+      if ! _cron_daemon_running; then
+        (service cron start >/dev/null 2>&1 || cron 2>/dev/null || crond 2>/dev/null || /etc/init.d/cron start >/dev/null 2>&1) &
+        sleep 1
+      fi
       (crontab -l 2>/dev/null | grep -v "singbox" ; \
        echo "@reboot sleep 20 && bash $APP_DIR/singbox.sh run >> $LOG_FILE 2>&1" ; \
        echo "0 3 * * * bash $APP_DIR/singbox.sh renew-cron >> $LOG_FILE 2>&1") | crontab - 2>/dev/null || true
-      echo ""
-      log "服务已通过 nohup 后台启动，开机自启（cron @reboot）与证书自动续期已配置"
+      if _cron_daemon_running; then
+        echo ""
+        log "服务已通过 nohup 后台启动；开机自启已注册 cron @reboot（守护进程确认运行）与 .bashrc 兜底唤醒"
+      else
+        echo ""
+        warn "crontab 已注册，但未检测到 cron 守护进程运行——在容器环境（如 SAP BAS）中 @reboot 通常不会触发，将由 .bashrc/.profile 兜底：下次在此空间打开终端时会自动拉起服务"
+      fi
     else
-      warn "未检测到 crontab，开机自启任务未注册，已启用常驻看门狗内的每日证书检查作为兜底"
+      warn "未检测到 crontab，开机自启将依赖 .bashrc/.profile 兜底守卫（打开终端时自动拉起）"
       echo ""
       log "服务已通过 nohup 后台启动"
     fi
@@ -789,6 +808,8 @@ SVCEOF
   echo -e "${GREEN}彻底卸载: sb-del${NC}"
   echo ""
   echo -e "${YELLOW}等待服务初始化完成，节点链接将写入 $SUB_FILE${NC}"
+  echo -e "${YELLOW}提示：如果你的开发空间平台支持\"启动后自动执行命令\"（如 devfile.yaml 的 postStart 钩子），${NC}"
+  echo -e "${YELLOW}建议把 'bash $APP_DIR/singbox.sh run' 加进去，以实现空间重启后的全自动无缝自启。${RESET}"
 }
 
 # ==============================================================================
@@ -1664,7 +1685,17 @@ do_run() {
   SERVER_DOMAIN="${SERVER_DOMAIN:-}"
   PUBLIC_IP="${PUBLIC_IP:-${IP:-}}"
   CF_PREFER_HOST="${CF_PREFER_HOST:-cdns.doon.eu.org}"
-  WS_PATH="${WS_PATH:-/fengyue-vm}"
+  WS_PATH="${WS_PATH:-/fengyue}"
+
+  # 如果是从未持久化 WS_PATH 的旧版本升级，补全历史默认值 /fengyue 并写回 config.env
+  if [ -z "$WS_PATH" ] || [ "$WS_PATH" = "/fengyue-vm" ]; then
+    # 若被误设置为 /fengyue-vm 且不是用户主动配置（比如之前脚本写死导致），或为空，统一恢复为历史默认值 /fengyue
+    if [ -z "$WS_PATH" ]; then
+      WS_PATH="/fengyue"
+      set_val WS_PATH "$WS_PATH"
+      warn "检测到配置文件缺少 WS_PATH（旧版配置），已固定为历史默认值 /fengyue 并写回，确保旧订阅链接不失效"
+    fi
+  fi
 
   setup_port_hop() {
     if [ "$(id -u)" != "0" ]; then
@@ -1741,8 +1772,6 @@ do_run() {
       return 1
     }
 
-    HY2_HOP_ACTIVE=0
-    TUIC_HOP_ACTIVE=0
     [ -n "$HY2_HOP_RANGE" ] && [ "$HY2_ACTIVE" = "1" ] && _hop_add_rule "Hysteria2" "$HY2_HOP_RANGE" "$HY2_PORT" && HY2_HOP_ACTIVE=1
     [ -n "$TUIC_HOP_RANGE" ] && [ "$TUIC_ACTIVE" = "1" ] && _hop_add_rule "TUIC" "$TUIC_HOP_RANGE" "$TUIC_PORT" && TUIC_HOP_ACTIVE=1
   }
