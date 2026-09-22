@@ -130,6 +130,7 @@ const CLOUDFLARED_BIN = `${CORE_DIR}/node-bridge${os.platform() === 'win32' ? '.
 const KOMARI_BIN_NAME = os.platform() === 'win32' ? 'node-metrics.exe' : 'node-metrics';
 const KOMARI_BIN_PATH = `${CORE_DIR}/${KOMARI_BIN_NAME}`;
 const KOMARI_LOG_FILE = `${CORE_DIR}/metrics.log`;
+const CF_LOG_FILE     = `${CORE_DIR}/bridge.log`;
 
 // Argo 三协议 WS 路径
 const WS_PATH_VMESS  = '/fengyue-vm';
@@ -154,6 +155,23 @@ function getFreePort() {
       const port = srv.address().port;
       srv.close(() => resolve(port));
     });
+  });
+}
+
+function waitPortReady(port, host = '127.0.0.1', maxWaitMs = 8000, intervalMs = 200) {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + maxWaitMs;
+    (function attempt() {
+      const sock = net.connect({ port, host }, () => {
+        sock.destroy();
+        resolve(true);
+      });
+      sock.on('error', () => {
+        sock.destroy();
+        if (Date.now() >= deadline) return resolve(false);
+        setTimeout(attempt, intervalMs);
+      });
+    })();
   });
 }
 
@@ -1232,7 +1250,17 @@ async function main() {
     }
   }
 
-  await new Promise(r => setTimeout(r, 1500));
+  if (!global.SB_START_FAILED && !DISABLE_ARGO) {
+    const ports = [V_VMESS_PORT, V_VLESS_PORT, V_TROJAN_PORT];
+    const results = await Promise.all(ports.map(p => waitPortReady(p)));
+    if (results.every(Boolean)) {
+      console.log('核心入站端口已就绪，接入 Argo 转发');
+    } else {
+      console.warn('部分核心入站端口未能在预期时间内就绪，仍将继续启动 Argo 转发（连接可能需要客户端重试）');
+    }
+  } else {
+    await new Promise(r => setTimeout(r, 300));
+  }
 
   // ── Node.js WS 反向代理（Argo 三协议路径分发与 HTTP 共享）──
   if (!DISABLE_ARGO) {
@@ -1252,9 +1280,13 @@ async function main() {
       else { socket.destroy(); return; }
 
       const proxy = net.connect(targetPort, '127.0.0.1', () => {
+        const safeHeaders = Object.entries(req.headers)
+          .filter(([k, v]) => !/[\r\n]/.test(k) && !/[\r\n]/.test(String(v)))
+          .map(([k, v]) => `${k}: ${v}`)
+          .join('\r\n');
         proxy.write(
           `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n` +
-          Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`).join('\r\n') +
+          safeHeaders +
           '\r\n\r\n'
         );
         proxy.write(head);
