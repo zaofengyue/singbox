@@ -248,9 +248,12 @@ http_get() {
 }
 
 dl() {
-  local _url="$1" _out="$2"
-  # 支持直链与多组主流 GitHub 加速镜像回退，保证 99.99% 下载成功率
-  local _mirrors=("" "https://ghfast.top/" "https://ghproxy.net/" "https://github.moeyy.xyz/" "https://mirror.ghproxy.com/")
+  local _url="$1" _out="$2" _allow_mirrors="${3:-true}"
+  # 默认直连官方源；若明确允许或配置环境变量 SB_ALLOW_MIRRORS=true 时才回退第三方加速镜像
+  local _mirrors=("")
+  if [ "$_allow_mirrors" = "true" ] || [ "${SB_ALLOW_MIRRORS:-}" = "true" ]; then
+    _mirrors+=("https://ghfast.top/" "https://ghproxy.net/" "https://github.moeyy.xyz/" "https://mirror.ghproxy.com/")
+  fi
   for _prefix in "${_mirrors[@]}"; do
     local _target="${_prefix}${_url}"
     rm -f "$_out"
@@ -309,9 +312,10 @@ download_komari() {
     mkdir -p "$BIN_DIR"
     chmod 700 "$BIN_DIR" 2>/dev/null || true
   fi
-  if [ -x "$KM_BIN" ]; then
+  if [ -x "$KM_BIN" ] && ("$KM_BIN" --version >/dev/null 2>&1 || "$KM_BIN" --help >/dev/null 2>&1); then
     return 0
   fi
+  [ -x "$KM_BIN" ] && { warn "已存在的 Komari 探针无法运行，重新下载"; rm -f "$KM_BIN"; }
   if [ "$KM_ARCH" != "linux-amd64" ] && [ "$KM_ARCH" != "linux-arm64" ]; then
     warn "Komari 官方探针暂不支持当前 CPU 架构 (${KM_ARCH:-未知})，仅支持 x86_64 与 aarch64"
     return 1
@@ -319,8 +323,12 @@ download_komari() {
   log "正在检查/下载 Komari 探针..."
   if dl "https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-${KM_ARCH}" "$KM_BIN"; then
     chmod +x "$KM_BIN" 2>/dev/null || true
-    log "Komari 探针下载完成"
-    return 0
+    if "$KM_BIN" --version >/dev/null 2>&1 || "$KM_BIN" --help >/dev/null 2>&1; then
+      log "Komari 探针下载完成"
+      return 0
+    fi
+    warn "Komari 探针下载完整但无法执行"
+    rm -f "$KM_BIN"
   fi
   warn "Komari 探针下载失败"
   return 1
@@ -569,10 +577,11 @@ do_install() {
   else
     log "检测到网络一键安装，正在保存脚本至本地..."
     local SCRIPT_RAW="https://raw.githubusercontent.com/zaofengyue/singbox/${BRANCH:-main}/singbox.sh"
-    dl "$SCRIPT_RAW" "$APP_DIR/singbox.sh" || {
+    # 脚本自身下载默认仅信任官方源，杜绝静默回退第三方镜像引入供应链风险；需镜像加速可配置 SB_ALLOW_MIRRORS=true
+    if ! dl "$SCRIPT_RAW" "$APP_DIR/singbox.sh" false; then
       curl -fsSL "$SCRIPT_RAW" -o "$APP_DIR/singbox.sh" 2>/dev/null || \
       wget -qO "$APP_DIR/singbox.sh" "$SCRIPT_RAW" 2>/dev/null || true
-    }
+    fi
   fi
   chmod +x "$APP_DIR/singbox.sh"
 
@@ -1892,6 +1901,7 @@ do_run() {
     [ -x "$CF_BIN" ] || download_cloudflared || true
   fi
   if [ -n "$KOMARI_DOMAIN" ] && [ -n "$KOMARI_TOKEN" ]; then
+    [ -x "$KM_BIN" ] && ! ("$KM_BIN" --version >/dev/null 2>&1 || "$KM_BIN" --help >/dev/null 2>&1) && { warn "已存在的 Komari 探针无法运行，重新下载"; rm -f "$KM_BIN"; }
     [ -x "$KM_BIN" ] || download_komari || true
   fi
 
@@ -2258,17 +2268,15 @@ CERTEOF
     [ -n "$KOMARI_DOMAIN" ] && [ -n "$KOMARI_TOKEN" ] || return 0
     local _endpoint
     _endpoint="$(format_komari_endpoint "$KOMARI_DOMAIN")"
-    if [ ! -x "$KM_BIN" ]; then
+    if [ ! -x "$KM_BIN" ] || ! ("$KM_BIN" --version >/dev/null 2>&1 || "$KM_BIN" --help >/dev/null 2>&1); then
       if ! download_komari; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 探针二进制下载失败，等待下次重试" >> "$KM_LOG"
         return 1
       fi
     fi
     pkill -x "komari-agent" 2>/dev/null || true
-    export AGENT_IGNORE_UNSAFE_CERT=true
-    export AGENT_ENDPOINT="$_endpoint"
-    export AGENT_TOKEN="$KOMARI_TOKEN"
-    nohup "$KM_BIN" -e "$_endpoint" -t "$KOMARI_TOKEN" >> "$KM_LOG" 2>&1 &
+    AGENT_IGNORE_UNSAFE_CERT=true AGENT_ENDPOINT="$_endpoint" AGENT_TOKEN="$KOMARI_TOKEN" \
+      nohup "$KM_BIN" -e "$_endpoint" -t "$KOMARI_TOKEN" >> "$KM_LOG" 2>&1 &
     KM_PID=$!
     KM_ACTIVE=1
     log "Komari 监控探针已启动 (PID: $KM_PID)"
