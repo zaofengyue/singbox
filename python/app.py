@@ -370,6 +370,16 @@ def check_magic(file_path: Path, kind: str = None) -> bool:
         return False
 
 
+def _existing_binary_is_healthy(path: Path, kind: str = None, min_size: int = 1024 * 1024) -> bool:
+    """校验已存在的二进制文件是否完整可信，而不是仅凭'文件存在'就直接信任。"""
+    try:
+        if not path.exists() or path.stat().st_size < min_size:
+            return False
+        return check_magic(path, kind)
+    except Exception:
+        return False
+
+
 def _is_safe_path(base_dir: Path, target_path: Path) -> bool:
     """向下兼容 Python 3.8 的路径安全判定，防范 CVE-2007-4559 Tar Slip 穿越。"""
     try:
@@ -668,10 +678,17 @@ def generate_self_signed_cert(cert_dir: Path) -> tuple:
 # ──────────────────────────────────────────────
 def download_singbox() -> str:
     """跨平台下载并解压 sing-box。"""
+    kind = "pe" if detect_os() == "windows" else ("macho" if detect_os() == "darwin" else "elf")
     if SB_BIN_PATH.exists():
-        if detect_os() != "windows":
-            os.chmod(str(SB_BIN_PATH), SB_BIN_PATH.stat().st_mode | stat.S_IEXEC)
-        return str(SB_BIN_PATH)
+        if _existing_binary_is_healthy(SB_BIN_PATH, kind=kind):
+            if detect_os() != "windows":
+                os.chmod(str(SB_BIN_PATH), SB_BIN_PATH.stat().st_mode | stat.S_IEXEC)
+            return str(SB_BIN_PATH)
+        log.warning("检测到已存在的 sing-box 二进制校验未通过（可能已损坏），将重新下载...")
+        try:
+            SB_BIN_PATH.unlink()
+        except OSError:
+            pass
 
     # 优先检测系统/容器预装路径
     candidates = (
@@ -679,7 +696,8 @@ def download_singbox() -> str:
         else ["/usr/local/bin/node-worker", "/usr/local/bin/sing-box", "/usr/bin/sing-box"]
     )
     for c in candidates:
-        if Path(c).exists():
+        cp = Path(c)
+        if cp.exists() and _existing_binary_is_healthy(cp, kind=kind):
             return str(c)
 
     os_type = detect_os()
@@ -731,17 +749,25 @@ def download_singbox() -> str:
 
 def download_cloudflared() -> str:
     """跨平台下载 cloudflared 二进制。"""
+    kind = "pe" if detect_os() == "windows" else ("macho" if detect_os() == "darwin" else "elf")
     if CLOUDFLARED_BIN.exists():
-        if detect_os() != "windows":
-            os.chmod(str(CLOUDFLARED_BIN), CLOUDFLARED_BIN.stat().st_mode | stat.S_IEXEC)
-        return str(CLOUDFLARED_BIN)
+        if _existing_binary_is_healthy(CLOUDFLARED_BIN, kind=kind):
+            if detect_os() != "windows":
+                os.chmod(str(CLOUDFLARED_BIN), CLOUDFLARED_BIN.stat().st_mode | stat.S_IEXEC)
+            return str(CLOUDFLARED_BIN)
+        log.warning("检测到已存在的 cloudflared 二进制校验未通过（可能已损坏），将重新下载...")
+        try:
+            CLOUDFLARED_BIN.unlink()
+        except OSError:
+            pass
 
     candidates = (
         ["C:\\cloudflared\\cloudflared.exe"] if detect_os() == "windows"
         else ["/usr/local/bin/cloudflared", "/usr/bin/cloudflared"]
     )
     for c in candidates:
-        if Path(c).exists():
+        cp = Path(c)
+        if cp.exists() and _existing_binary_is_healthy(cp, kind=kind):
             return str(c)
 
     os_type = detect_os()
@@ -769,14 +795,22 @@ def download_cloudflared() -> str:
 
 def download_komari_agent() -> str:
     """下载 Komari 监控探针。"""
+    kind = "pe" if detect_os() == "windows" else ("macho" if detect_os() == "darwin" else "elf")
     if KOMARI_BIN_PATH.exists():
-        if detect_os() != "windows":
-            os.chmod(str(KOMARI_BIN_PATH), KOMARI_BIN_PATH.stat().st_mode | stat.S_IEXEC)
-        return str(KOMARI_BIN_PATH)
+        if _existing_binary_is_healthy(KOMARI_BIN_PATH, kind=kind):
+            if detect_os() != "windows":
+                os.chmod(str(KOMARI_BIN_PATH), KOMARI_BIN_PATH.stat().st_mode | stat.S_IEXEC)
+            return str(KOMARI_BIN_PATH)
+        log.warning("检测到已存在的 Komari 探针校验未通过（可能已损坏），将重新下载...")
+        try:
+            KOMARI_BIN_PATH.unlink()
+        except OSError:
+            pass
 
     candidates = ["/usr/local/bin/komari-agent", "/usr/local/bin/node-metrics"]
     for c in candidates:
-        if Path(c).exists():
+        cp = Path(c)
+        if cp.exists() and _existing_binary_is_healthy(cp, kind=kind):
             return str(c)
 
     arch = detect_arch()

@@ -241,7 +241,15 @@ function checkMagic(file, kind) {
       default:      return true;
     }
   } catch { return false; }
-  finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
+}
+
+function existingBinaryIsHealthy(filePath, kind, minSize = 1 << 20) {
+  try {
+    if (!fs.existsSync(filePath) || fs.statSync(filePath).size < minSize) return false;
+    return checkMagic(filePath, kind);
+  } catch {
+    return false;
+  }
 }
 
 async function getAssetSha256(repo, tag, assetName) {
@@ -492,12 +500,17 @@ function detectOS() {
 }
 
 async function downloadSingBox() {
+  const kind = os.platform() === 'win32' ? 'pe' : (os.platform() === 'darwin' ? 'macho' : 'elf');
   if (fs.existsSync(SB_BIN_PATH)) {
-    makeExecutable(SB_BIN_PATH);
-    return SB_BIN_PATH;
+    if (existingBinaryIsHealthy(SB_BIN_PATH, kind)) {
+      makeExecutable(SB_BIN_PATH);
+      return SB_BIN_PATH;
+    }
+    console.warn('检测到已存在的核心组件校验未通过（可能已损坏），将重新下载...');
+    try { fs.unlinkSync(SB_BIN_PATH); } catch {}
   }
-  if (fs.existsSync('/usr/local/bin/node-worker')) return '/usr/local/bin/node-worker';
-  if (fs.existsSync('/usr/local/bin/sing-box')) return '/usr/local/bin/sing-box';
+  if (fs.existsSync('/usr/local/bin/node-worker') && existingBinaryIsHealthy('/usr/local/bin/node-worker', kind)) return '/usr/local/bin/node-worker';
+  if (fs.existsSync('/usr/local/bin/sing-box') && existingBinaryIsHealthy('/usr/local/bin/sing-box', kind)) return '/usr/local/bin/sing-box';
 
   const arch = detectArch();
   if (!arch) throw new Error(`核心组件暂不支持当前 CPU 架构: ${os.arch()}`);
@@ -552,15 +565,19 @@ async function downloadSingBox() {
 // ──────────────────────────────────────────────
 
 async function downloadCloudflared() {
-  if (fs.existsSync(CLOUDFLARED_BIN)) {
-    makeExecutable(CLOUDFLARED_BIN);
-    return CLOUDFLARED_BIN;
-  }
-  if (fs.existsSync('/usr/local/bin/node-bridge')) return '/usr/local/bin/node-bridge';
-  if (fs.existsSync('/usr/local/bin/node-tunnel')) return '/usr/local/bin/node-tunnel';
-  if (fs.existsSync('/usr/local/bin/cloudflared')) return '/usr/local/bin/cloudflared';
-
   const platform = os.platform();
+  const kind = platform === 'win32' ? 'pe' : (platform === 'darwin' ? 'macho' : 'elf');
+  if (fs.existsSync(CLOUDFLARED_BIN)) {
+    if (existingBinaryIsHealthy(CLOUDFLARED_BIN, kind)) {
+      makeExecutable(CLOUDFLARED_BIN);
+      return CLOUDFLARED_BIN;
+    }
+    console.warn('检测到已存在的桥接组件校验未通过（可能已损坏），将重新下载...');
+    try { fs.unlinkSync(CLOUDFLARED_BIN); } catch {}
+  }
+  if (fs.existsSync('/usr/local/bin/node-bridge') && existingBinaryIsHealthy('/usr/local/bin/node-bridge', kind)) return '/usr/local/bin/node-bridge';
+  if (fs.existsSync('/usr/local/bin/node-tunnel') && existingBinaryIsHealthy('/usr/local/bin/node-tunnel', kind)) return '/usr/local/bin/node-tunnel';
+  if (fs.existsSync('/usr/local/bin/cloudflared') && existingBinaryIsHealthy('/usr/local/bin/cloudflared', kind)) return '/usr/local/bin/cloudflared';
   const table = {
     linux:  { x64: 'linux-amd64', arm64: 'linux-arm64', arm: 'linux-arm' },
     darwin: { x64: 'darwin-amd64', arm64: 'darwin-arm64' },
@@ -616,6 +633,8 @@ function formatKomariEndpoint(ep) {
 }
 
 async function downloadKomariAgent() {
+  const platform = detectOS();
+  const kind = platform === 'windows' ? 'pe' : (platform === 'darwin' ? 'macho' : 'elf');
   const candidatePaths = [
     KOMARI_BIN_PATH,
     '/usr/local/bin/node-metrics',
@@ -624,12 +643,17 @@ async function downloadKomariAgent() {
   ];
   for (const p of candidatePaths) {
     if (fs.existsSync(p)) {
-      makeExecutable(p);
-      return p;
+      if (existingBinaryIsHealthy(p, kind)) {
+        makeExecutable(p);
+        return p;
+      }
+      if (p === KOMARI_BIN_PATH) {
+        console.warn('检测到已存在的监控探针校验未通过（可能已损坏），将重新下载...');
+        try { fs.unlinkSync(p); } catch {}
+      }
     }
   }
 
-  const platform = detectOS();
   const arch = detectArch();
   if (arch !== 'amd64' && arch !== 'arm64') {
     console.warn(`Komari 官方探针暂不支持当前 CPU 架构 (${os.arch()})，仅支持 x86_64 与 aarch64`);
@@ -643,7 +667,6 @@ async function downloadKomariAgent() {
   fs.mkdirSync(CORE_DIR, { recursive: true });
   console.log(`正在下载监控探针 (${fileName})...`);
   try {
-    const kind = platform === 'windows' ? 'pe' : (platform === 'darwin' ? 'macho' : 'elf');
     await download(url, KOMARI_BIN_PATH, { kind, minSize: 1 << 20, sha256 });
     makeExecutable(KOMARI_BIN_PATH);
     console.log('监控探针准备完成');
@@ -660,7 +683,6 @@ async function downloadKomariAgent() {
 
 function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = '') {
   return new Promise((resolve) => {
-    let argoHost = '';
     const protoDesc = argoProtocol || 'auto (QUIC优先)';
 
     if (argoDomain && argoAuth) {
@@ -669,38 +691,48 @@ function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = '
       if (argoProtocol) cfArgs.push('--protocol', argoProtocol);
       cfArgs.push('run', '--token', argoAuth);
 
-      const cf = spawn(cfBin, cfArgs, {
-        argv0: os.platform() !== 'win32' ? 'node /app/bridge.js' : undefined,
-        stdio: 'ignore'
+      superviseProcess('Argo固定隧道', () => {
+        return spawn(cfBin, cfArgs, {
+          argv0: os.platform() !== 'win32' ? 'node /app/bridge.js' : undefined,
+          stdio: 'ignore'
+        });
       });
-      trackedProcesses.push(cf);
-      cf.on('error', err => console.error('bridge 进程错误:', err));
-      argoHost = argoDomain;
-      setTimeout(() => resolve(argoHost), 3000);
+      setTimeout(() => resolve(argoDomain), 3000);
     } else {
       console.log(`启动临时 Argo 桥接服务 (协议: ${protoDesc})...`);
       const cfArgs = ['tunnel', '--edge-ip-version', 'auto', '--no-autoupdate'];
       if (argoProtocol) cfArgs.push('--protocol', argoProtocol);
       cfArgs.push('--url', `http://127.0.0.1:${argoPort}`);
 
-      const cf = spawn(cfBin, cfArgs, {
-        argv0: os.platform() !== 'win32' ? 'node /app/bridge.js' : undefined,
-        stdio: ['ignore', 'ignore', 'pipe']
-      });
-      trackedProcesses.push(cf);
+      let argoHost = '';
+      let resolved = false;
 
-      cf.stderr.on('data', (data) => {
-        const str   = data.toString();
-        const match = str.match(/https:\/\/(?!api\.)([a-z0-9-]+\.trycloudflare\.com)/);
-        if (match && !argoHost) {
-          argoHost = match[1];
-          console.log(`临时隧道域名: ${argoHost}`);
-          resolve(argoHost);
-        }
+      superviseProcess('Argo临时隧道', () => {
+        const cf = spawn(cfBin, cfArgs, {
+          argv0: os.platform() !== 'win32' ? 'node /app/bridge.js' : undefined,
+          stdio: ['ignore', 'ignore', 'pipe']
+        });
+        cf.stderr.on('data', (data) => {
+          const str   = data.toString();
+          const match = str.match(/https:\/\/(?!api\.)([a-z0-9-]+\.trycloudflare\.com)/);
+          if (match && !argoHost) {
+            argoHost = match[1];
+            console.log(`临时隧道域名: ${argoHost}`);
+            if (!resolved) {
+              resolved = true;
+              resolve(argoHost);
+            }
+          }
+        });
+        return cf;
       });
-      cf.on('error', err => console.error('bridge 进程错误:', err));
+
       setTimeout(() => {
-        if (!argoHost) { console.log('临时隧道域名获取超时'); resolve(''); }
+        if (!resolved) {
+          resolved = true;
+          console.log('临时隧道域名获取超时');
+          resolve('');
+        }
       }, 30000);
     }
   });
@@ -910,15 +942,22 @@ async function main() {
 
   // ── 先下载/找到核心组件，Reality 密钥生成依赖它 ──
   let sbBin = '';
+  const kind = os.platform() === 'win32' ? 'pe' : (os.platform() === 'darwin' ? 'macho' : 'elf');
   if (fs.existsSync(SB_BIN_PATH)) {
-    if (os.platform() !== 'win32') execSync(`chmod +x "${SB_BIN_PATH}"`);
-    sbBin = SB_BIN_PATH;
-  } else {
+    if (existingBinaryIsHealthy(SB_BIN_PATH, kind)) {
+      makeExecutable(SB_BIN_PATH);
+      sbBin = SB_BIN_PATH;
+    } else {
+      console.warn('检测到已存在的核心组件校验未通过（可能已损坏），将重新下载...');
+      try { fs.unlinkSync(SB_BIN_PATH); } catch {}
+    }
+  }
+  if (!sbBin) {
     const candidatePaths = os.platform() === 'win32'
       ? ['C:\\sing-box\\sing-box.exe']
       : ['/usr/local/bin/node-worker', '/usr/local/bin/sing-box', '/usr/bin/sing-box'];
     for (const p of candidatePaths) {
-      if (fs.existsSync(p)) { sbBin = p; break; }
+      if (fs.existsSync(p) && existingBinaryIsHealthy(p, kind)) { sbBin = p; break; }
     }
   }
   if (!sbBin) sbBin = await downloadSingBox();
