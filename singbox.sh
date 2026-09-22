@@ -1517,7 +1517,17 @@ menu_domain_cert() {
       3)
         read -p "要续期的域名: " domain
         domain="$(echo "$domain" | tr -d '[:space:]')"
-        if [ -d "$DOMAIN_CERT_DIR/$domain" ] && [ -x "$ACME_HOME/acme.sh" ]; then
+        if [ -z "$domain" ]; then
+          warn "未输入域名，已取消操作"
+          press_any_key
+          continue
+        fi
+        if [ ! -d "$DOMAIN_CERT_DIR/$domain" ]; then
+          warn "未找到域名 ${domain} 的本地证书目录"
+          press_any_key
+          continue
+        fi
+        if [ -x "$ACME_HOME/acme.sh" ]; then
           echo -e "${YELLOW}正在续期证书...${RESET}"
           if "$ACME_HOME/acme.sh" --home "$ACME_HOME" --renew -d "$domain" --force --standalone --httpport 80; then
             "$ACME_HOME/acme.sh" --home "$ACME_HOME" --install-cert -d "$domain" \
@@ -1530,12 +1540,24 @@ menu_domain_cert() {
           else
             echo -e "${RED}续期失败，请确认 80 端口未被其他服务占用${RESET}"
           fi
+        else
+          warn "未检测到 acme.sh 工具，无法续期"
         fi
         press_any_key
         ;;
       4)
         read -p "要删除的域名: " domain
         domain="$(echo "$domain" | tr -d '[:space:]')"
+        if [ -z "$domain" ]; then
+          warn "未输入域名，已取消删除"
+          press_any_key
+          continue
+        fi
+        if [ ! -d "$DOMAIN_CERT_DIR/$domain" ]; then
+          warn "未找到域名 ${domain} 的本地证书目录"
+          press_any_key
+          continue
+        fi
         rm -rf "$DOMAIN_CERT_DIR/$domain"
         [ -x "$ACME_HOME/acme.sh" ] && "$ACME_HOME/acme.sh" --home "$ACME_HOME" --remove -d "$domain" >/dev/null 2>&1 || true
         [ "$(get_val SERVER_DOMAIN)" = "$domain" ] && set_val SERVER_DOMAIN ""
