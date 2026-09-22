@@ -215,6 +215,23 @@ try_install_pkg() {
   fi
 }
 
+ensure_cron() {
+  command -v crontab >/dev/null 2>&1 && return 0
+  [ "$(id -u)" = "0" ] || return 1
+  log "检测到未安装 cron 定时服务，正在自动安装并启动..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq cron >/dev/null 2>&1 || true
+    (systemctl enable --now cron 2>/dev/null || service cron start 2>/dev/null || /etc/init.d/cron start 2>/dev/null) &
+    sleep 1
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache cronie >/dev/null 2>&1 || true
+    (crond 2>/dev/null || rc-service cronie start 2>/dev/null || true) &
+    sleep 1
+  fi
+  command -v crontab >/dev/null 2>&1 && return 0
+  return 1
+}
+
 ensure_basic_deps() {
   local _missing=""
   command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || _missing="$_missing curl"
@@ -222,16 +239,17 @@ ensure_basic_deps() {
   command -v openssl >/dev/null 2>&1 || _missing="$_missing openssl"
   # ca-certificates 没有对应的可执行命令，用证书目录探测大致是否已装
   [ -d /etc/ssl/certs ] || _missing="$_missing ca-certificates"
-  [ -z "$_missing" ] && return 0
-
-  warn "检测到缺少基础工具:${_missing}，尝试自动安装..."
-  try_install_pkg "$_missing"
-  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-    die "缺少 curl/wget 且自动安装失败。Alpine: apk add --no-cache curl；Debian/Ubuntu: apt-get install -y curl"
+  if [ -n "$_missing" ]; then
+    warn "检测到缺少基础工具:${_missing}，尝试自动安装..."
+    try_install_pkg "$_missing"
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+      die "缺少 curl/wget 且自动安装失败。Alpine: apk add --no-cache curl；Debian/Ubuntu: apt-get install -y curl"
+    fi
+    if ! command -v tar >/dev/null 2>&1; then
+      die "缺少 tar 且自动安装失败。Alpine: apk add --no-cache tar"
+    fi
   fi
-  if ! command -v tar >/dev/null 2>&1; then
-    die "缺少 tar 且自动安装失败。Alpine: apk add --no-cache tar"
-  fi
+  ensure_cron || true
 }
 
 # ── 通用工具函数 ──────────────────────────────────────────────────────────────
@@ -1434,6 +1452,7 @@ ensure_acme() {
     wget -q https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh -O "$tmp_acme/acme.sh"
   fi
   chmod +x "$tmp_acme/acme.sh"
+  ensure_cron || true
   local _has_cron=1
   command -v crontab >/dev/null 2>&1 || _has_cron=0
   if [ "$_has_cron" = "1" ]; then
