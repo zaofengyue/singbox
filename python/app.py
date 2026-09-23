@@ -179,35 +179,64 @@ sys.excepthook = _uncaught_exception_handler
 # 目录解析与安全防护（消除 /tmp 固定路径提权风险）
 # ──────────────────────────────────────────────
 def _resolve_data_dir() -> Path:
-    home_env = os.environ.get("HOME")
-    if home_env:
-        base = Path(home_env)
-        # 对标 Node 版隐蔽目录
-        return base / ".cache" / "py-core"
-
-    # HOME 缺失时退化到临时目录，按 UID 区分，杜绝共享路径提权风险
-    base = Path(tempfile.gettempdir())
     uid = os.getuid() if hasattr(os, "getuid") else 0
-    dirname = f"py-core-{uid}"
-    log.warning("未检测到 HOME 环境变量，数据目录退化至隔离目录 %s", base / dirname)
-    return base / dirname
+    candidates = []
+
+    # 1. 用户真实 HOME 目录（排除根目录 / 以及非目录环境）
+    home_env = os.environ.get("HOME")
+    if home_env and home_env != "/":
+        candidates.append(Path(home_env) / ".cache" / "py-core")
+
+    # 2. 当前工作目录下的 .cache/py-core（适配容器/PaaS 平台如 Pterodactyl，其 / 为只读而当前目录可写）
+    try:
+        candidates.append(Path.cwd() / ".cache" / "py-core")
+    except Exception:
+        pass
+
+    # 3. 系统临时目录 /tmp
+    try:
+        candidates.append(Path(tempfile.gettempdir()) / f"py-core-{uid}")
+    except Exception:
+        pass
+
+    for target in candidates:
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            # 真实写探测，确保文件系统非 Read-Only 且有写权限
+            probe = target / ".write_probe"
+            probe.touch()
+            probe.unlink(missing_ok=True)
+            return target
+        except (OSError, PermissionError):
+            continue
+
+    # 极端兜底：当前工作目录下的隐藏文件夹
+    fallback = Path.cwd() / f".py-core-{uid}"
+    try:
+        fallback.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return fallback
 
 
 DATA_DIR = _resolve_data_dir()
 
 
 def _ensure_data_dir_safe(path: Path) -> None:
-    """确保数据目录安全创建：权限受限且属主正确。"""
-    path.mkdir(parents=True, exist_ok=True)
+    """确保数据目录安全创建：权限受限且属主尽量正确。"""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning("创建数据目录失败 %s: %s", path, e)
+        return
+
     if detect_os() == "windows":
         return
     try:
         cur_uid = os.getuid()
         st = path.stat()
         if st.st_uid != cur_uid:
-            raise RuntimeError(
-                f"数据目录 {path} 属主异常（UID={st.st_uid}，当前={cur_uid}），可能已被恶意占位！"
-            )
+            log.warning("数据目录 %s 属主非当前进程 UID (UID=%s, 当前=%s)", path, st.st_uid, cur_uid)
         os.chmod(str(path), 0o700)
     except OSError as e:
         log.warning("收紧数据目录权限失败 %s: %s", path, e)
