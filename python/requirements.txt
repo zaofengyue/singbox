@@ -1,3 +1,4 @@
 # py-sb single-file deployment
-# Zero external pip dependencies required.
-# All modules are built into standard Python (3.8+).
+# Zero external pip dependencies required (all modules built into Python 3.8+ stdlib).
+# Added certifi to satisfy PaaS buildpacks that require at least one package in requirements.txt
+certifi>=2024.2.2
