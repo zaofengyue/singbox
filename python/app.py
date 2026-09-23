@@ -249,7 +249,7 @@ CF_PREFER_HOST_CANDIDATES = [
     "www.visa.com.tw",       # 知名 Cloudflare 优选，覆盖广、延迟低
     "www.visa.com.sg",       # 新加坡 CF 边缘
     "www.visa.com.hk",       # 香港 CF 边缘
-    "icook.hk",              # 香港 CF 节点，长期稳定
+    "ip.sb",                 # CF 边缘节点
     "cf.877774.xyz",         # 社区优选
     "cf.zhetengsha.eu.org",  # 社区优选
     "cf.090227.xyz",         # 社区优选
@@ -278,7 +278,7 @@ def resolve_prefer_host(argo_host: str) -> str:
     # 2. 自动从候选池探活，选第一个能 DNS 解析的
     for candidate in CF_PREFER_HOST_CANDIDATES:
         try:
-            socket.getaddrinfo(candidate, 443, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_ADDRCONFIG)
+            socket.getaddrinfo(candidate, 443, socket.AF_UNSPEC, socket.SOCK_STREAM)
             return candidate  # 解析成功，采用此候选
         except OSError:
             log.warning("[优选域名] %s DNS 解析失败，尝试下一个候选...", candidate)

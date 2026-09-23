@@ -148,7 +148,7 @@ const CF_PREFER_HOST_CANDIDATES = [
   'www.visa.com.tw',       // 知名 Cloudflare 优选，覆盖广、延迟低
   'www.visa.com.sg',       // 新加坡 CF 边缘
   'www.visa.com.hk',       // 香港 CF 边缘
-  'icook.hk',              // 香港 CF 节点，长期稳定
+  'ip.sb',                 // CF 边缘节点
   'cf.877774.xyz',         // 社区优选
   'cf.zhetengsha.eu.org',  // 社区优选
   'cf.090227.xyz',         // 社区优选
@@ -171,13 +171,16 @@ async function resolvePreferHost(argoHost) {
   const userDefined = (PRESET_CF_PREFER_HOST || process.env.CF_PREFER_HOST || process.env.CF_IP || '').trim();
   if (userDefined) return userDefined;
 
-  // 2. 自动从候选池探活，选第一个能 DNS 解析的
+  // 2. 自动从候选池探活，选第一个能 DNS 解析的（带 3 秒超时熔断）
   for (const candidate of CF_PREFER_HOST_CANDIDATES) {
     try {
-      await dns.lookup(candidate, { family: 0, timeout: 3000 });
+      await Promise.race([
+        dns.lookup(candidate, { family: 0 }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('DNS timeout')), 3000))
+      ]);
       return candidate; // 解析成功，采用此候选
     } catch {
-      console.warn(`[优选域名] ${candidate} DNS 解析失败，尝试下一个候选...`);
+      console.warn(`[优选域名] ${candidate} DNS 解析失败或超时，尝试下一个候选...`);
     }
   }
 

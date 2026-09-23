@@ -1124,12 +1124,13 @@ config_argo() {
   while true; do
     clear
     echo -e "${GREEN}======= Argo 隧道模式 =======${RESET}"
-    local cur_domain cur_auth cur_port cur_disable cur_protocol
+    local cur_domain cur_auth cur_port cur_disable cur_protocol cur_cf
     cur_domain=$(get_val ARGO_DOMAIN)
     cur_auth=$(get_val ARGO_AUTH)
     cur_port=$(get_val ARGO_PORT)
     cur_disable=$(get_val DISABLE_ARGO)
     cur_protocol=$(get_val ARGO_PROTOCOL)
+    cur_cf=$(get_val CF_PREFER_HOST)
 
     if [ "$cur_disable" = "true" ]; then
       echo -e "${GRAY}当前: ${RED}已禁用${RESET}"
@@ -1139,11 +1140,13 @@ config_argo() {
       echo -e "${GRAY}当前: ${CYAN}临时隧道${RESET}"
     fi
     echo -e "${GRAY}连接协议: ${CYAN}${cur_protocol:-http2(默认)}${RESET}"
+    echo -e "${GRAY}CF 优选:  ${CYAN}${cur_cf:-www.visa.com.tw(默认)}${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -e "${WHITE}1. 切换为临时隧道${RESET}"
     echo -e "${WHITE}2. 配置固定隧道${RESET}"
     echo -e "${WHITE}3. 禁用 Argo${RESET}"
     echo -e "${WHITE}4. 切换连接协议 (http2/quic/auto)${RESET}"
+    echo -e "${WHITE}5. 修改 CF 优选域名/IP (输入 0 恢复默认)${RESET}"
     echo -e "${WHITE}0. 返回${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -ne "${GRAY}请输入选项: ${RESET}"
@@ -1185,6 +1188,15 @@ config_argo() {
           2) set_val ARGO_PROTOCOL "quic" ;;
           3) set_val ARGO_PROTOCOL "auto" ;;
         esac
+        do_restart
+        press_any_key
+        ;;
+      5)
+        echo -ne "${WHITE}CF 优选域名/IP [当前: ${CYAN}${cur_cf:-www.visa.com.tw}${WHITE}] (输入 0 恢复默认): ${RESET}"
+        read -r new_cf
+        new_cf="$(echo "$new_cf" | tr -d '[:space:]')"
+        [ "$new_cf" = "0" ] && new_cf=""
+        set_val CF_PREFER_HOST "$new_cf"
         do_restart
         press_any_key
         ;;
@@ -1808,6 +1820,8 @@ do_run() {
     _CF_CANDIDATES="cf.877774.xyz cf.zhetengsha.eu.org cf.090227.xyz ip.sb www.visa.com.tw www.visa.com.sg time.is cdns.doon.eu.org skk.moe www.visa.com.hk"
     _cf_probe_ok() {
       local _h="$1"
+      # 若本身已是合法 IP，直接视为有效，无需 DNS 解析
+      valid_ip "$_h" && return 0
       if command -v host >/dev/null 2>&1; then
         host -t A "$_h" >/dev/null 2>&1 && return 0
         host -t AAAA "$_h" >/dev/null 2>&1 && return 0
@@ -1815,6 +1829,11 @@ do_run() {
         dig +short +timeout=3 "$_h" 2>/dev/null | grep -qE '^[0-9a-fA-F.:]+$' && return 0
       elif command -v nslookup >/dev/null 2>&1; then
         nslookup "$_h" >/dev/null 2>&1 && return 0
+      elif command -v getent >/dev/null 2>&1; then
+        getent hosts "$_h" >/dev/null 2>&1 && return 0
+      else
+        # 系统缺少任何 DNS 探测命令行工具时静默放行，避免误报导致优选域名被清空
+        return 0
       fi
       return 1
     }
