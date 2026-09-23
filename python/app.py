@@ -48,6 +48,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -1786,6 +1787,40 @@ def main():
         else:
             log.warning("Telegram 配置推送失败，请检查 Token 与 Chat ID")
 
+    _sub_clean_scheduled = False
+
+    def schedule_sub_file_cleanup(delay_sec: int):
+        """在后台调度 sub.txt 延迟清理，支持完全脱离主进程（兼容 os.execve 原地镜像替换）。"""
+        nonlocal _sub_clean_scheduled
+        if _sub_clean_scheduled or not sub_file.exists():
+            return
+        _sub_clean_scheduled = True
+
+        if detect_os() != "windows":
+            try:
+                # Linux 环境：派生完全脱离 Python 会话的后台 shell 定时清理任务，对路径进行严格安全转义
+                quoted_sub = shlex.quote(str(sub_file))
+                subprocess.Popen(
+                    f"sleep {delay_sec} && rm -f {quoted_sub}",
+                    shell=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                    start_new_session=True,
+                )
+                return
+            except Exception:
+                pass
+        # Windows 或降级模式：使用后台守护线程
+        def _delayed_rm():
+            time.sleep(delay_sec)
+            try:
+                sub_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+        threading.Thread(target=_delayed_rm, daemon=True, name="SubFileCleaner").start()
+
     # 17. 控制台输出与日志维护
     if show_log:
         print("================= 订阅内容 =================")
@@ -1820,6 +1855,8 @@ def main():
 
         if log_clear_minutes > 0:
             print(f"💡 初始启动日志将在 {log_clear_minutes} 分钟后自动清空，临时缓存文件将按策略释放...")
+            # 独立后台调度清理，确保在单进程 os.execve 镜像替换后依然准时销毁文件
+            schedule_sub_file_cleanup(log_clear_minutes * 60)
 
             def _auto_clear():
                 time.sleep(log_clear_minutes * 60)
@@ -1853,32 +1890,72 @@ def main():
         print("[系统提示] SHOW_LOG 已关闭，控制台保持静默运行。")
         if tg_bot_token and tg_chat_id:
             print("服务配置已通过 Telegram Bot 安全推送。")
-            def _shred_fast():
-                time.sleep(5)
-                try:
-                    sub_file.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            threading.Thread(target=_shred_fast, daemon=True).start()
+            schedule_sub_file_cleanup(5)
         else:
             print(f"服务订阅文件已写入: {sub_file}")
+            print("💡 系统提示：sub.txt 将在运行 2 分钟（120秒）后自动释放清理，请妥善保存！")
+            schedule_sub_file_cleanup(120)
         print("====================================================")
 
-    # 18. 单进程独占模式或主循环常驻
+    # 18. 单进程独占模式（翼手龙面板等小内存环境极致常驻优化）或主循环常驻
     if foreground_core and not sb_start_failed:
-        log.info("[单进程模式] 核心工作进程接管前台常驻运行...")
+        log.info("[单进程模式] 订阅初始化与推送完成，核心工作进程原地接管前台（释放 Python 解释器内存）...")
         time.sleep(1.5)
+
+        # ── 痕迹安全大清扫（提升隐蔽性，消灭磁盘特征与无用文件） ──
+        # 1. 订阅文件清理调度兜底
+        if tg_bot_token and tg_chat_id:
+            schedule_sub_file_cleanup(5)
+        elif not show_log:
+            schedule_sub_file_cleanup(120)
+        elif log_clear_minutes > 0:
+            schedule_sub_file_cleanup(log_clear_minutes * 60)
+
+        # 2. 彻底递归清除 Python 自动生成的字节码缓存目录 __pycache__
+        for pycache in [Path.cwd() / "__pycache__", Path(__file__).parent / "__pycache__"]:
+            try:
+                if pycache.exists():
+                    shutil.rmtree(pycache, ignore_errors=True)
+            except Exception:
+                pass
+
+        # 3. 清除未启用的多余空日志文件，减少磁盘扫描特征
+        for unused_lf in [CF_LOG_FILE, KOMARI_LOG_FILE]:
+            try:
+                unused_lf.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        # 4. 彻底显式关闭前置 HTTP 监听，防止套接字句柄泄漏继承给 sing-box 导致端口锁死
         try:
-            sub_file.unlink(missing_ok=True)
+            public_srv.close()
         except Exception:
             pass
 
-        args = ["run", "-c", str(CONFIG_FILE)]
-        if detect_os() != "windows":
-            core_proc = subprocess.Popen(["python /app/worker.py"] + args, executable=str(sb_bin), env=sb_env)
-        else:
-            core_proc = subprocess.Popen([str(sb_bin)] + args, env=sb_env)
+        # 5. 刷新所有标准流输出缓冲区，确保控制台信息完整落盘
+        sys.stdout.flush()
+        sys.stderr.flush()
 
+        cloaked_tag = "python /app/worker.py"
+        args = [cloaked_tag, "run", "-c", str(CONFIG_FILE)]
+        resolved_sb_bin = str(Path(sb_bin).resolve())
+
+        if detect_os() != "windows":
+            # 6. 确保二进制具有绝对执行权限
+            try:
+                os.chmod(resolved_sb_bin, os.stat(resolved_sb_bin).st_mode | stat.S_IEXEC)
+            except Exception:
+                pass
+
+            # 7. Linux / 翼手龙面板环境：通过系统级 os.execve 原地替换进程内存镜像并注入纯净环境变量
+            # 彻底释放 Python 解释器全部内存，PID 保持不变，面板监控不报退出，常驻仅 ~18MB！
+            try:
+                os.execve(resolved_sb_bin, args, sb_env)
+            except OSError as e:
+                log.warning("os.execve 原地接管失败 (%s)，回退至常规单进程等待", e)
+
+        # Windows 或 execve 异常回退场景
+        core_proc = subprocess.Popen([resolved_sb_bin] + args[1:], env=sb_env)
         register_process(core_proc)
         exit_code = core_proc.wait()
         unregister_process(core_proc)
