@@ -1066,7 +1066,14 @@ config_ip_domain() {
   case "$opt" in
     1)
       if [ -n "$cur_dom" ]; then
-        echo -e "${YELLOW}注意: 当前已设置全局连接域名 (${cur_dom})，节点地址由该域名接管。此设置仅影响本机访问外网的出栈偏好。如需节点直接显示 IP，请在选项 2 中输入 0 清除域名。${RESET}"
+        echo -e "${YELLOW}检测到当前已绑定全局连接域名: ${CYAN}${cur_dom}${RESET}"
+        echo -e "${YELLOW}（注意: 域名优先级高于 IP 设置。若保留域名，生成的直连节点地址将继续使用域名，选定的 IP 仅作为本机出栈使用）${RESET}"
+        read -p "是否一并清空全局域名，以便直连节点直接使用并生效选定的 IP？[y/N]: " rm_dom
+        if [ "$rm_dom" = "y" ] || [ "$rm_dom" = "Y" ]; then
+          set_val SERVER_DOMAIN ""
+          cur_dom=""
+          echo -e "${GREEN}已清空全局域名，节点地址将由 IP 接管生效。${RESET}"
+        fi
       fi
       read -p "请输入 IP 栈偏好 [4/6/auto]: " v
       case "$v" in
@@ -1082,6 +1089,16 @@ config_ip_domain() {
       set_val SERVER_DOMAIN "$d"
       do_restart; press_any_key ;;
     3)
+      if [ -n "$cur_dom" ]; then
+        echo -e "${YELLOW}检测到当前已绑定全局连接域名: ${CYAN}${cur_dom}${RESET}"
+        echo -e "${YELLOW}（注意: 域名优先级高于手动指定的 IP。若保留域名，直连节点仍会优先显示域名）${RESET}"
+        read -p "是否一并清空全局域名，以便节点直接显示并使用手动指定的 IP？[y/N]: " rm_dom3
+        if [ "$rm_dom3" = "y" ] || [ "$rm_dom3" = "Y" ]; then
+          set_val SERVER_DOMAIN ""
+          cur_dom=""
+          echo -e "${GREEN}已清空全局域名，节点地址将由手动指定的 IP 接管生效。${RESET}"
+        fi
+      fi
       read -p "手动指定公网 IP（如 1.2.3.4，输入 0 清除）: " ip
       ip="$(echo "$ip" | tr -d '[:space:]')"
       [ "$ip" = "0" ] && ip=""
