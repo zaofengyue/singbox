@@ -478,6 +478,59 @@ valid_ip() {
   return 0
 }
 
+valid_ipv4() {
+  local _v="$1"
+  [ -z "$_v" ] && return 1
+  case "$_v" in
+    *:*) return 1 ;;
+    *.*.*.*)
+      local _o1 _o2 _o3 _o4
+      IFS='.' read -r _o1 _o2 _o3 _o4 << EOF
+$_v
+EOF
+      case "$_o1" in ''|*[!0-9]*) return 1 ;; esac
+      case "$_o2" in ''|*[!0-9]*) return 1 ;; esac
+      case "$_o3" in ''|*[!0-9]*) return 1 ;; esac
+      case "$_o4" in ''|*[!0-9]*) return 1 ;; esac
+      [ "$_o1" -le 255 ] && [ "$_o2" -le 255 ] && [ "$_o3" -le 255 ] && [ "$_o4" -le 255 ]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+valid_ipv6() {
+  local _v="$1"
+  [ -z "$_v" ] && return 1
+  case "$_v" in
+    *:*) return 0 ;;
+    *)   return 1 ;;
+  esac
+}
+
+_is_private_ip() {
+  local ip="$1"
+  case "$ip" in
+    10.*|192.168.*|127.*) return 0 ;;
+    # 覆盖 172.16.0.0/12，同时有意保留对 Cloudflare WARP (wgcf) 默认 172.16.0.2 虚拟接口的过滤
+    172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) return 0 ;;
+    # 运营商级 CGNAT 100.64.0.0/10
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[0-1][0-9].*|100.12[0-7].*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_domain_has_aaaa() {
+  local _dom="$1"
+  [ -z "$_dom" ] && return 0
+  if command -v dig >/dev/null 2>&1; then
+    dig +short AAAA "$_dom" 2>/dev/null | grep -qE '^[0-9a-fA-F:]+$'
+  elif command -v host >/dev/null 2>&1; then
+    host -t AAAA "$_dom" 2>/dev/null | grep -qi "has IPv6"
+  else
+    return 0  # 缺少探测工具时静默跳过，避免误报
+  fi
+}
+
 # ── 服务控制与状态 ────────────────────────────────────────────────────────────
 check_status() {
   local sb_s cf_s km_s cur_km_dom
@@ -783,7 +836,7 @@ SVCEOF
     systemctl --user restart singbox
     loginctl enable-linger "$USER" 2>/dev/null || true
     if command -v crontab >/dev/null 2>&1; then
-      (crontab -l 2>/dev/null | grep -v "singbox" ; echo "0 3 * * * bash $APP_DIR/singbox.sh renew-cron >> $LOG_FILE 2>&1") | crontab - 2>/dev/null || true
+      (crontab -l 2>/dev/null | grep -v "${APP_DIR}/singbox.sh" ; echo "0 3 * * * bash $APP_DIR/singbox.sh renew-cron >> $LOG_FILE 2>&1") | crontab - 2>/dev/null || true
     else
       warn "未检测到 crontab，系统级续期任务未注册，已启用常驻进程内的每日检查作为兜底"
     fi
@@ -809,7 +862,7 @@ SVCEOF
         (service cron start >/dev/null 2>&1 || cron 2>/dev/null || crond 2>/dev/null || /etc/init.d/cron start >/dev/null 2>&1) &
         sleep 1
       fi
-      (crontab -l 2>/dev/null | grep -v "singbox" ; \
+      (crontab -l 2>/dev/null | grep -v "${APP_DIR}/singbox.sh" ; \
        echo "@reboot sleep 20 && bash $APP_DIR/singbox.sh run >> $LOG_FILE 2>&1" ; \
        echo "0 3 * * * bash $APP_DIR/singbox.sh renew-cron >> $LOG_FILE 2>&1") | crontab - 2>/dev/null || true
       if _cron_daemon_running; then
@@ -971,7 +1024,7 @@ menu_config() {
     echo -e "${WHITE}5. 添加多端口${RESET}"
     echo -e "${WHITE}6. 端口跳跃${RESET}"
     echo -e "${WHITE}7. Komari探针${RESET}"
-    echo -e "${WHITE}8. IP出栈设置${RESET}"
+    echo -e "${WHITE}8. 网络与IP设置 (出入站)${RESET}"
     echo -e "${WHITE}0. 返回${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -ne "${GRAY}请输入选项: ${RESET}"
@@ -993,22 +1046,28 @@ menu_config() {
 
 config_ip_domain() {
   clear
-  echo -e "${GREEN}======= IP出栈设置 =======${RESET}"
+  echo -e "${GREEN}======= 网络与IP设置 (出入站) =======${RESET}"
   local cur_v cur_dom cur_pip
   cur_v=$(get_val IP_VERSION)
   cur_dom=$(get_val SERVER_DOMAIN)
   cur_pip=$(get_val PUBLIC_IP)
-  echo -e "${GRAY}当前 IP 栈偏好: ${CYAN}${cur_v:-4 (IPv4优先)}${RESET}"
-  echo -e "${GRAY}当前连接域名:   ${CYAN}${cur_dom:-未设置 (使用IP)}${RESET}"
-  echo -e "${GRAY}自定义公网 IP:  ${CYAN}${cur_pip:-自动探测}${RESET}"
+  echo -e "${GRAY}当前出栈 IP 栈偏好: ${CYAN}${cur_v:-4 (IPv4优先)}${RESET}"
+  echo -e "${GRAY}当前全局连接域名:   ${CYAN}${cur_dom:-未设置 (使用节点IP)}${RESET}"
+  echo -e "${GRAY}自定义入站公网 IP:  ${CYAN}${cur_pip:-自动探测}${RESET}"
+  if [ -n "$cur_dom" ]; then
+    echo -e "${YELLOW}提示: 当前已配置全局连接域名，直连节点地址优先由该域名接管。${RESET}"
+  fi
   echo -e "${GRAY}--------------------------------${RESET}"
-  echo -e "${WHITE}1. 设置 IP 栈偏好 (4: IPv4优先 | 6: IPv6优先 | auto: 自动)${RESET}"
-  echo -e "${WHITE}2. 修改全局连接域名 (输入 0 或留空恢复使用 IP)${RESET}"
-  echo -e "${WHITE}3. 手动指定公网 IP (输入 0 或留空恢复自动探测)${RESET}"
+  echo -e "${WHITE}1. 设置 IP 栈出栈偏好 (4: IPv4优先 | 6: IPv6优先 | auto: 自动)${RESET}"
+  echo -e "${WHITE}2. 修改全局连接域名 (最高优先级，输入 0 清除恢复使用 IP)${RESET}"
+  echo -e "${WHITE}3. 手动指定入站公网 IP (输入 0 清除恢复自动探测)${RESET}"
   echo -e "${WHITE}0. 返回${RESET}"
   read -p "选项: " opt
   case "$opt" in
     1)
+      if [ -n "$cur_dom" ]; then
+        echo -e "${YELLOW}注意: 当前已设置全局连接域名 (${cur_dom})，节点地址由该域名接管。此设置仅影响本机访问外网的出栈偏好。如需节点直接显示 IP，请在选项 2 中输入 0 清除域名。${RESET}"
+      fi
       read -p "请输入 IP 栈偏好 [4/6/auto]: " v
       case "$v" in
         6) set_val IP_VERSION "6" ;;
@@ -1026,6 +1085,11 @@ config_ip_domain() {
       read -p "手动指定公网 IP（如 1.2.3.4，输入 0 清除）: " ip
       ip="$(echo "$ip" | tr -d '[:space:]')"
       [ "$ip" = "0" ] && ip=""
+      if [ -n "$ip" ] && ! valid_ip "$ip"; then
+        warn "输入的 IP 格式无效，未进行修改"
+        press_any_key
+        return
+      fi
       set_val PUBLIC_IP "$ip"
       do_restart; press_any_key ;;
     *) return ;;
@@ -1650,7 +1714,7 @@ do_uninstall() {
   systemctl --user daemon-reload 2>/dev/null || true
 
   do_stop
-  (crontab -l 2>/dev/null | grep -v "singbox") | crontab - 2>/dev/null || true
+  (crontab -l 2>/dev/null | grep -v "${APP_DIR}/singbox.sh") | crontab - 2>/dev/null || true
 
   for RC in "$HOME_DIR/.bashrc" "$HOME_DIR/.profile" "$HOME_DIR/.bash_profile" "$HOME_DIR/.zshrc"; do
     sed -i '/singbox/d' "$RC" 2>/dev/null || true
@@ -1694,6 +1758,8 @@ do_cron_renew() {
         --fullchain-file "$DOMAIN_CERT_DIR/$dom/cert.pem" >/dev/null 2>&1
       chmod 600 "$DOMAIN_CERT_DIR/$dom/key.pem" 2>/dev/null || true
       renewed=1
+    else
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] 域名 ${dom} 证书续期失败，请手动检查（Token是否过期、80端口是否被占用）" >> "$LOG_FILE"
     fi
   done
   [ "$renewed" = "1" ] && do_restart
@@ -1970,17 +2036,84 @@ do_run() {
   fi
   NAME_ENCODED="$(url_encode "$NAME")"
 
-  if [ -z "$PUBLIC_IP" ] && { [ -n "$HY2_PORT" ] || [ -n "$TUIC_PORT" ] || [ -n "$REALITY_PORT" ] || [ -n "$SS_PORT" ] || [ -n "$SOCKS5_PORT" ] || [ -n "$TROJAN_PORT" ] || [ -n "$ANYTLS_PORT" ]; }; then
-    local _sources=()
-    if [ "$IP_VERSION" = "6" ]; then
-      _sources=('https://api6.ipify.org' 'https://api64.ipify.org' 'https://ifconfig.co/ip')
-    else
-      _sources=('https://api.ipify.org' 'https://ipinfo.io/ip' 'https://ifconfig.co/ip' 'https://icanhazip.com' 'https://api64.ipify.org')
+  # ── 网络拓扑探测与入站直连 IP 判定 ──
+  local _has_local_v4=0 _local_v4=""
+  if command -v ip >/dev/null 2>&1; then
+    _local_v4="$(ip -4 addr show scope global 2>/dev/null | grep -oE 'inet [0-9.]+' | head -1 | awk '{print $2}')"
+  elif command -v ifconfig >/dev/null 2>&1; then
+    _local_v4="$(ifconfig 2>/dev/null | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | head -1 | awk '{print $NF}' | tr -d 'addr:')"
+  fi
+  [ -n "$_local_v4" ] && _has_local_v4=1
+
+  local _is_pure_ipv6=0
+  [ "$_has_local_v4" = "0" ] && _is_pure_ipv6=1
+
+  local _is_nat_v4=0
+  if [ "$_has_local_v4" = "1" ] && _is_private_ip "$_local_v4"; then
+    _is_nat_v4=1
+  fi
+
+  local _has_warp=0
+  if command -v ip >/dev/null 2>&1; then
+    ip link show 2>/dev/null | grep -qiE "warp|wgcf|cloudflare" && _has_warp=1
+  elif command -v ifconfig >/dev/null 2>&1; then
+    ifconfig 2>/dev/null | grep -qiE "warp|wgcf|cloudflare" && _has_warp=1
+  fi
+
+  if [ "$_is_pure_ipv6" = "1" ] && [ "$_has_warp" = "0" ]; then
+    warn "检测到当前为纯 IPv6 环境且未安装 WARP，本机可能无法直连访问仅支持 IPv4 的外网目标；如需访问 IPv4 网络，建议为系统安装 Cloudflare WARP 补齐 IPv4 出栈能力"
+  fi
+
+  if [ -n "$SERVER_DOMAIN" ]; then
+    log "节点直连地址由全局连接域名接管: ${SERVER_DOMAIN}"
+    if [ "$_is_pure_ipv6" = "1" ] && ! _domain_has_aaaa "$SERVER_DOMAIN"; then
+      warn "当前为纯 IPv6 环境，但未检测到全局域名 ${SERVER_DOMAIN} 的 AAAA (IPv6) 解析记录，IPv6 环境下客户端可能无法连接！"
     fi
-    for _ipsrc in "${_sources[@]}"; do
-      _cand="$(http_get "$_ipsrc" | tr -d '[:space:]')"
-      if valid_ip "$_cand"; then PUBLIC_IP="$_cand"; break; fi
+  fi
+
+  if [ -n "$PUBLIC_IP" ]; then
+    log "使用用户指定的入站公网 IP: ${PUBLIC_IP}"
+  elif [ -n "$HY2_PORT" ] || [ -n "$TUIC_PORT" ] || [ -n "$REALITY_PORT" ] || [ -n "$SS_PORT" ] || [ -n "$SOCKS5_PORT" ] || [ -n "$TROJAN_PORT" ] || [ -n "$ANYTLS_PORT" ]; then
+    local _detected_v4="" _detected_v6=""
+    if [ "$_is_pure_ipv6" = "0" ]; then
+      local _v4_sources=('https://api.ipify.org' 'https://ipinfo.io/ip' 'https://ifconfig.co/ip' 'https://icanhazip.com')
+      for _ipsrc in "${_v4_sources[@]}"; do
+        local _cand
+        _cand="$(http_get -4 "$_ipsrc" | tr -d '[:space:]')"
+        if valid_ipv4 "$_cand" && ! _is_private_ip "$_cand"; then
+          _detected_v4="$_cand"
+          break
+        fi
+      done
+    fi
+
+    local _v6_sources=('https://api6.ipify.org' 'https://api64.ipify.org' 'https://ifconfig.co/ip' 'https://icanhazip.com')
+    for _ipsrc in "${_v6_sources[@]}"; do
+      local _cand
+      _cand="$(http_get -6 "$_ipsrc" | tr -d '[:space:]')"
+      if valid_ipv6 "$_cand"; then
+        _detected_v6="$_cand"
+        break
+      fi
     done
+
+    # 统一公理：存在有效公网 IPv4（非私网段）优先使用 IPv4；无独立公网 IPv4 则使用公网 IPv6
+    if [ "$_is_nat_v4" = "0" ] && [ -n "$_detected_v4" ]; then
+      PUBLIC_IP="$_detected_v4"
+      log "自动选择入站直连 IP: IPv4 ($PUBLIC_IP)"
+    elif [ -n "$_detected_v6" ]; then
+      PUBLIC_IP="$_detected_v6"
+      log "自动选择入站直连 IP: IPv6 ($PUBLIC_IP)"
+      if [ "$_is_nat_v4" = "1" ]; then
+        warn "检测到本机 IPv4 为内网/NAT 地址 (${_local_v4})，节点已自动切换为公网 IPv6 (${PUBLIC_IP})。若该 NAT 网关已为本机配置了公网端口映射，可通过管理面板选项 8【手动指定公网 IP】填入映射后的公网地址；否则将默认使用已探测到的公网 IPv6"
+      fi
+    elif [ -n "$_detected_v4" ]; then
+      PUBLIC_IP="$_detected_v4"
+      log "自动选择入站直连 IP: NAT 出口 IPv4 ($PUBLIC_IP)"
+      warn "本机 IPv4 为内网地址 (${_local_v4})，已使用探测到的公网出口 IPv4 (${PUBLIC_IP})。若外部无法直连，请在网关配置端口映射或在管理面板中手动指定公网 IP"
+    else
+      warn "未能自动探测到有效公网 IP，直连节点可能无法外部连接，建议在管理面板中手动指定公网 IP 或配置全局连接域名"
+    fi
   fi
 
   CERT_PATH=""
@@ -2281,12 +2414,19 @@ CERTEOF
 
   [ -z "$_inbounds" ] && die "所有协议均校验失败，无法启动"
 
+  local DIRECT_STRAT=""
+  case "$IP_VERSION" in
+    6) DIRECT_STRAT=', "domain_strategy": "prefer_ipv6"' ;;
+    4) DIRECT_STRAT=', "domain_strategy": "prefer_ipv4"' ;;
+    *) DIRECT_STRAT="" ;;
+  esac
+
   local ROUTE_JSON=""
   [ -n "$EXTRA_OUTBOUND_JSON" ] && ROUTE_JSON=',
   "route": { "final": "custom-out" }'
 
-  printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct" }%s]%s\n}\n' \
-    "$_inbounds" "$EXTRA_OUTBOUND_JSON" "$ROUTE_JSON" > "$CONFIG_FILE"
+  printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct"%s}%s]%s\n}\n' \
+    "$_inbounds" "$DIRECT_STRAT" "$EXTRA_OUTBOUND_JSON" "$ROUTE_JSON" > "$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
 
   start_singbox() {
