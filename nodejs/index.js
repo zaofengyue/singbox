@@ -7,11 +7,12 @@ const PRESET_IP             = ''; // 自定义公网 IP（留空自动探测，�
 const PRESET_SUB            = ''; // 订阅路径后缀（默认 'sub'，即 /sub）
 
 // ── 2. Argo 隧道配置 ──
-const PRESET_DISABLE_ARGO   = ''; // 填 'true' 禁用 Argo，留空则启用
-const PRESET_ARGO_DOMAIN    = ''; // 固定隧道域名（留空使用临时隧道）
-const PRESET_ARGO_AUTH      = ''; // 固定隧道 Token / 凭证
-const PRESET_ARGO_PORT      = ''; // Argo 内部端口（固定隧道默认 8001，临时隧道自动分配）
-const PRESET_ARGO_PROTOCOL  = ''; // Argo 隧道协议（默认留空走高速 QUIC 链路，可选 'http2'、'quic'）
+const PRESET_DISABLE_ARGO      = ''; // 填 'true' 禁用 Argo，留空则启用
+const PRESET_ARGO_DOMAIN       = ''; // 固定隧道域名（留空使用临时隧道）
+const PRESET_ARGO_AUTH         = ''; // 固定隧道 Token / 凭证
+const PRESET_ARGO_PORT         = ''; // Argo 内部端口（固定隧道默认 8001，临时隧道自动分配）
+const PRESET_ARGO_PROTOCOL     = ''; // Argo 隧道协议（默认留空走高速 QUIC 链路，可选 'http2'、'quic'）
+const PRESET_CF_PREFER_HOST    = ''; // Cloudflare 优选域名/IP（留空自动探活后从内置候选池选择，支持环境变量 CF_PREFER_HOST 或 CF_IP）
 
 // ── 3. 可选直连协议配置（填写端口则启动对应协议，留空不启动）──
 const PRESET_HY2_PORT       = ''; // Hysteria2 端口 (UDP)
@@ -142,7 +143,41 @@ const V_VMESS_PORT  = 10000;
 const V_VLESS_PORT  = 10001;
 const V_TROJAN_PORT = 10002;
 
-const CF_PREFER_HOST = 'cdns.doon.eu.org';
+// Cloudflare 优选 Fallback 候选池（按优先级排列，探活失败后依次降级，最终兜底到 Argo HOST）
+const CF_PREFER_HOST_CANDIDATES = [
+  'www.visa.com.tw',   // Cloudflare 知名优选节点，覆盖广、延迟低
+  'icook.hk',          // 香港 CF 边缘，长期稳定
+  'cf.090227.xyz',     // 社区高可用优选
+];
+
+// dns 模块仅在需要时 require，避免影响 Windows 无 dns 场景
+const dns = require('dns').promises;
+
+/**
+ * 解析最终生效的 CF 优选域名/IP。
+ * 优先级：PRESET_CF_PREFER_HOST > 环境变量 CF_PREFER_HOST / CF_IP > 候选池探活 > argoHost 兜底
+ * @param {string} argoHost - Argo 隧道域名，作为最终兜底保障
+ * @returns {Promise<string>} 可用的优选域名或 IP
+ */
+async function resolvePreferHost(argoHost) {
+  // 1. 用户显式指定（预留配置或环境变量），直接信任，不做探活
+  const userDefined = (PRESET_CF_PREFER_HOST || process.env.CF_PREFER_HOST || process.env.CF_IP || '').trim();
+  if (userDefined) return userDefined;
+
+  // 2. 自动从候选池探活，选第一个能 DNS 解析的
+  for (const candidate of CF_PREFER_HOST_CANDIDATES) {
+    try {
+      await dns.lookup(candidate, { family: 0, timeout: 3000 });
+      return candidate; // 解析成功，采用此候选
+    } catch {
+      console.warn(`[优选域名] ${candidate} DNS 解析失败，尝试下一个候选...`);
+    }
+  }
+
+  // 3. 全部候选池均不可达，兜底使用 Argo 隧道域名本身（只要隧道在线必然可达）
+  console.warn(`[优选域名] 所有候选域名 DNS 解析均失败，已自动兜底至 Argo 隧道域名: ${argoHost}`);
+  return argoHost;
+}
 
 // ──────────────────────────────────────────────
 // 工具函数
@@ -1383,24 +1418,28 @@ async function main() {
   }
 
   // ── 生成订阅链接 ───────────────────────────
+  // 在 HOST 确定后进行 CF 优选域名探活（非阻塞轻量，失败自动降级）
+  const preferHost = await resolvePreferHost(HOST);
+  console.log(`[优选域名] 最终使用: ${preferHost}`);
+
   const links = [];
 
   if (!DISABLE_ARGO) {
     const VMESS_OBJ = {
-      v: '2', ps: NAME, add: CF_PREFER_HOST, port: '443',
+      v: '2', ps: NAME, add: preferHost, port: '443',
       id: UUID, aid: '0', scy: 'auto', net: 'ws', type: 'none',
       host: HOST, path: WS_PATH_VMESS, tls: 'tls', sni: HOST
     };
     links.push('vmess://' + Buffer.from(JSON.stringify(VMESS_OBJ)).toString('base64'));
 
     links.push(
-      `vless://${UUID}@${CF_PREFER_HOST}:443` +
+      `vless://${UUID}@${preferHost}:443` +
       `?encryption=none&security=tls&sni=${HOST}&type=ws&host=${HOST}` +
       `&path=${encodeURIComponent(WS_PATH_VLESS)}#${encodeURIComponent(NAME)}`
     );
 
     links.push(
-      `trojan://${TROJAN_PASS}@${CF_PREFER_HOST}:443` +
+      `trojan://${TROJAN_PASS}@${preferHost}:443` +
       `?security=tls&sni=${HOST}&type=ws&host=${HOST}` +
       `&path=${encodeURIComponent(WS_PATH_TROJAN)}#${encodeURIComponent(NAME)}`
     );

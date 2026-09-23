@@ -12,11 +12,12 @@ CONF_IP             = ""  # 自定义公网 IP（留空自动探测）
 CONF_SUB            = ""  # 订阅路径后缀（默认 "sub"，即 /sub）
 
 # ── 2. Argo 隧道配置 ──
-CONF_DISABLE_ARGO   = ""  # 填 "true" 禁用 Argo，留空则启用
-CONF_ARGO_DOMAIN    = ""  # 固定隧道域名（留空使用临时隧道）
-CONF_ARGO_AUTH      = ""  # 固定隧道 Token / 凭证
-CONF_ARGO_PORT      = ""  # Argo 内部端口（固定隧道默认 8001，临时隧道自动分配）
-CONF_ARGO_PROTOCOL  = ""  # Argo 隧道协议（默认留空走高速 QUIC 链路，可选 "http2"、"quic"）
+CONF_DISABLE_ARGO      = ""  # 填 "true" 禁用 Argo，留空则启用
+CONF_ARGO_DOMAIN       = ""  # 固定隧道域名（留空使用临时隧道）
+CONF_ARGO_AUTH         = ""  # 固定隧道 Token / 凭证
+CONF_ARGO_PORT         = ""  # Argo 内部端口（固定隧道默认 8001，临时隧道自动分配）
+CONF_ARGO_PROTOCOL     = ""  # Argo 隧道协议（默认留空走高速 QUIC 链路，可选 "http2"、"quic"）
+CONF_CF_PREFER_HOST    = ""  # Cloudflare 优选域名/IP（留空自动探活后从内置候选池选择，支持环境变量 CF_PREFER_HOST 或 CF_IP）
 
 # ── 3. 可选直连协议配置（填写端口则启动对应协议，留空不启动）──
 CONF_HY2_PORT       = ""  # Hysteria2 端口 (UDP)
@@ -243,7 +244,41 @@ PATH_TO_PORT = {
     WS_PATH_TROJAN: V_TROJAN_PORT,
 }
 
-CF_PREFER_HOST = "cdns.doon.eu.org"
+# Cloudflare 优选 Fallback 候选池（按优先级排列，探活失败后依次降级，最终兜底到 Argo HOST）
+CF_PREFER_HOST_CANDIDATES = [
+    "www.visa.com.tw",   # Cloudflare 知名优选节点，覆盖广、延迟低
+    "icook.hk",          # 香港 CF 边缘，长期稳定
+    "cf.090227.xyz",     # 社区高可用优选
+]
+
+
+def resolve_prefer_host(argo_host: str) -> str:
+    """解析最终生效的 CF 优选域名/IP。
+
+    优先级：CONF_CF_PREFER_HOST > 环境变量 CF_PREFER_HOST / CF_IP > 候选池探活 > argo_host 兜底
+
+    Args:
+        argo_host: Argo 隧道域名，作为最终兜底保障
+
+    Returns:
+        可用的优选域名或 IP 字符串
+    """
+    # 1. 用户显式指定（预留配置或环境变量），直接信任，不做探活
+    user_defined = (CONF_CF_PREFER_HOST or os.environ.get("CF_PREFER_HOST") or os.environ.get("CF_IP") or "").strip()
+    if user_defined:
+        return user_defined
+
+    # 2. 自动从候选池探活，选第一个能 DNS 解析的
+    for candidate in CF_PREFER_HOST_CANDIDATES:
+        try:
+            socket.getaddrinfo(candidate, 443, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_ADDRCONFIG)
+            return candidate  # 解析成功，采用此候选
+        except OSError:
+            log.warning("[优选域名] %s DNS 解析失败，尝试下一个候选...", candidate)
+
+    # 3. 全部候选池均不可达，兜底使用 Argo 隧道域名本身
+    log.warning("[优选域名] 所有候选域名 DNS 解析均失败，已自动兜底至 Argo 隧道域名: %s", argo_host)
+    return argo_host
 
 # ──────────────────────────────────────────────
 # 安全与工具函数
@@ -1529,25 +1564,29 @@ def main():
             log.warning("启动 Komari 探针失败: %s", e)
 
     # 15. 生成订阅链接
+    # 在 host 确定后进行 CF 优选域名探活（同步轻量，失败自动降级）
+    prefer_host = resolve_prefer_host(host)
+    log.info("[优选域名] 最终使用: %s", prefer_host)
+
     links = []
     formatted_ip = format_ip(public_ip)
 
     if not disable_argo:
         vmess_obj = {
-            "v": "2", "ps": name, "add": CF_PREFER_HOST, "port": "443",
+            "v": "2", "ps": name, "add": prefer_host, "port": "443",
             "id": node_uuid, "aid": "0", "scy": "auto", "net": "ws", "type": "none",
             "host": host, "path": WS_PATH_VMESS, "tls": "tls", "sni": host,
         }
         links.append("vmess://" + base64.b64encode(json.dumps(vmess_obj).encode()).decode())
 
         links.append(
-            f"vless://{node_uuid}@{CF_PREFER_HOST}:443"
+            f"vless://{node_uuid}@{prefer_host}:443"
             f"?encryption=none&security=tls&sni={host}&type=ws&host={host}"
             f"&path={urllib.parse.quote(WS_PATH_VLESS)}#{urllib.parse.quote(name)}"
         )
 
         links.append(
-            f"trojan://{trojan_pass}@{CF_PREFER_HOST}:443"
+            f"trojan://{trojan_pass}@{prefer_host}:443"
             f"?security=tls&sni={host}&type=ws&host={host}"
             f"&path={urllib.parse.quote(WS_PATH_TROJAN)}#{urllib.parse.quote(name)}"
         )
