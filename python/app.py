@@ -48,6 +48,7 @@ import logging
 import os
 import platform
 import re
+import shutil
 import signal
 import socket
 import stat
@@ -88,6 +89,20 @@ ARCH_MAP = {
 
 def detect_arch() -> str:
     return ARCH_MAP.get(platform.machine().lower(), "amd64")
+
+
+def is_musl_linux() -> bool:
+    """检测当前环境是否为基于 musl libc 的 Linux (如 Alpine)。"""
+    if detect_os() != "linux":
+        return False
+    if Path("/etc/alpine-release").exists():
+        return True
+    try:
+        if any(Path("/lib").glob("ld-musl-*.so*")) or any(Path("/usr/lib").glob("ld-musl-*.so*")):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 # ──────────────────────────────────────────────
@@ -441,12 +456,26 @@ def check_magic(file_path: Path, kind: str = None) -> bool:
         return False
 
 
-def _existing_binary_is_healthy(path: Path, kind: str = None, min_size: int = 1024 * 1024) -> bool:
-    """校验已存在的二进制文件是否完整可信，而不是仅凭'文件存在'就直接信任。"""
+def _existing_binary_is_healthy(path: Path, kind: str = None, min_size: int = 1024 * 1024, test_args: list = None) -> bool:
+    """校验已存在的二进制文件是否完整且具备真实可执行性，防止坏文件或架构/libc不匹配导致崩溃。"""
     try:
         if not path.exists() or path.stat().st_size < min_size:
             return False
-        return check_magic(path, kind)
+        if not check_magic(path, kind):
+            return False
+        if detect_os() != "windows":
+            try:
+                os.chmod(str(path), path.stat().st_mode | stat.S_IEXEC)
+            except OSError:
+                pass
+        args = [str(path)] + (test_args if test_args is not None else ["version"])
+        res = subprocess.run(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        return res.returncode in (0, 1, 2)
     except Exception:
         return False
 
@@ -748,14 +777,17 @@ def generate_self_signed_cert(cert_dir: Path) -> tuple:
 # 核心组件下载（优先检测容器与系统预装路径）
 # ──────────────────────────────────────────────
 def download_singbox() -> str:
-    """跨平台下载并解压 sing-box。"""
+    """跨平台下载并解压 sing-box，完整适配 Linux(glibc/musl)、Alpine、Windows 与 macOS。"""
     kind = "pe" if detect_os() == "windows" else ("macho" if detect_os() == "darwin" else "elf")
     if SB_BIN_PATH.exists():
-        if _existing_binary_is_healthy(SB_BIN_PATH, kind=kind):
+        if _existing_binary_is_healthy(SB_BIN_PATH, kind=kind, test_args=["version"]):
             if detect_os() != "windows":
-                os.chmod(str(SB_BIN_PATH), SB_BIN_PATH.stat().st_mode | stat.S_IEXEC)
+                try:
+                    os.chmod(str(SB_BIN_PATH), SB_BIN_PATH.stat().st_mode | stat.S_IEXEC)
+                except OSError:
+                    pass
             return str(SB_BIN_PATH)
-        log.warning("检测到已存在的 sing-box 二进制校验未通过（可能已损坏），将重新下载...")
+        log.warning("检测到已存在的 sing-box 二进制校验未通过（可能已损坏或架构/libc不兼容），将重新下载...")
         try:
             SB_BIN_PATH.unlink()
         except OSError:
@@ -768,12 +800,13 @@ def download_singbox() -> str:
     )
     for c in candidates:
         cp = Path(c)
-        if cp.exists() and _existing_binary_is_healthy(cp, kind=kind):
+        if cp.exists() and _existing_binary_is_healthy(cp, kind=kind, test_args=["version"]):
             return str(c)
 
     os_type = detect_os()
     arch = detect_arch()
-    version = "v1.12.0"
+    fallback_version = "v1.12.0"
+    version = fallback_version
     try:
         data = _http_get_text("https://api.github.com/repos/SagerNet/sing-box/releases")
         if data:
@@ -784,47 +817,80 @@ def download_singbox() -> str:
     except Exception:
         pass
 
-    ver_num = version.lstrip("v")
     is_zip = (os_type == "windows")
     pkg_ext = "zip" if is_zip else "tar.gz"
-    asset_name = f"sing-box-{ver_num}-{os_type}-{arch}.{pkg_ext}"
-    url = f"https://github.com/SagerNet/sing-box/releases/download/{version}/{asset_name}"
 
-    archive_tmp = DATA_DIR / f"sb_archive.{pkg_ext}"
-    log.info("正在下载 sing-box (%s)...", asset_name)
-    kind = "zip" if is_zip else "gzip"
-    download(url, archive_tmp, kind=kind)
+    # 构建后缀列表：Linux 下根据是否为 musl 决定优先次序（对标 singbox.sh）
+    if os_type == "linux":
+        suffixes = ["-musl", ""] if is_musl_linux() else ["", "-musl"]
+    else:
+        suffixes = [""]
 
-    # 安全解压并剥离首层
-    _extract_archive_stripped(archive_tmp, DATA_DIR, is_zip=is_zip)
+    def _try_fetch(ver: str) -> bool:
+        ver_num = ver.lstrip("v")
+        for suffix in suffixes:
+            asset_name = f"sing-box-{ver_num}-{os_type}-{arch}{suffix}.{pkg_ext}"
+            url = f"https://github.com/SagerNet/sing-box/releases/download/{ver}/{asset_name}"
+            archive_tmp = DATA_DIR / f"sb_archive_{int(time.time()*1000)}.{pkg_ext}"
+            extract_tmp = DATA_DIR / f".extract_{int(time.time()*1000)}"
+            log.info("正在尝试下载 sing-box (%s)...", asset_name)
+            try:
+                download(url, archive_tmp, kind="zip" if is_zip else "gzip")
+                _extract_archive_stripped(archive_tmp, extract_tmp, is_zip=is_zip)
 
-    # 在解压后的目录中寻找二进制并标准化重命名为 py-worker
-    extracted_bin_name = "sing-box.exe" if is_zip else "sing-box"
-    found_bin = None
-    for p in DATA_DIR.rglob(extracted_bin_name):
-        found_bin = p
-        break
+                extracted_bin_name = "sing-box.exe" if is_zip else "sing-box"
+                found_bin = None
+                for p in extract_tmp.rglob(extracted_bin_name):
+                    found_bin = p
+                    break
 
-    if found_bin and found_bin != SB_BIN_PATH:
-        if SB_BIN_PATH.exists():
-            SB_BIN_PATH.unlink()
-        found_bin.rename(SB_BIN_PATH)
+                if found_bin and found_bin.is_file():
+                    if SB_BIN_PATH.exists():
+                        SB_BIN_PATH.unlink()
+                    shutil.move(str(found_bin), str(SB_BIN_PATH))
+                    if detect_os() != "windows":
+                        try:
+                            os.chmod(str(SB_BIN_PATH), SB_BIN_PATH.stat().st_mode | stat.S_IEXEC)
+                        except OSError:
+                            pass
 
-    if detect_os() != "windows" and SB_BIN_PATH.exists():
-        os.chmod(str(SB_BIN_PATH), SB_BIN_PATH.stat().st_mode | stat.S_IEXEC)
+                    if _existing_binary_is_healthy(SB_BIN_PATH, kind=kind, test_args=["version"]):
+                        log.info("sing-box 部署并验证成功: %s", SB_BIN_PATH)
+                        return True
+                    else:
+                        log.warning("sing-box (%s) 下载完成但无法在当前内核执行，尝试备选版本...", asset_name)
+                        try:
+                            SB_BIN_PATH.unlink()
+                        except OSError:
+                            pass
+            except Exception as e:
+                log.warning("sing-box (%s) 获取失败: %s", asset_name, e)
+            finally:
+                archive_tmp.unlink(missing_ok=True)
+                shutil.rmtree(extract_tmp, ignore_errors=True)
+        return False
 
-    archive_tmp.unlink(missing_ok=True)
-    log.info("sing-box 部署完成: %s", SB_BIN_PATH)
-    return str(SB_BIN_PATH)
+    if _try_fetch(version):
+        return str(SB_BIN_PATH)
+
+    if version != fallback_version:
+        log.warning("最新版本 %s 不可用，回退尝试保底版本 %s...", version, fallback_version)
+        if _try_fetch(fallback_version):
+            return str(SB_BIN_PATH)
+
+    raise RuntimeError("无法获取并执行兼容当前系统环境的 sing-box 二进制文件")
 
 
 def download_cloudflared() -> str:
     """跨平台下载 cloudflared 二进制。"""
     kind = "pe" if detect_os() == "windows" else ("macho" if detect_os() == "darwin" else "elf")
     if CLOUDFLARED_BIN.exists():
-        if _existing_binary_is_healthy(CLOUDFLARED_BIN, kind=kind):
+        if _existing_binary_is_healthy(CLOUDFLARED_BIN, kind=kind, test_args=["version"]):
             if detect_os() != "windows":
-                os.chmod(str(CLOUDFLARED_BIN), CLOUDFLARED_BIN.stat().st_mode | stat.S_IEXEC)
+                try:
+                    os.chmod(str(CLOUDFLARED_BIN), CLOUDFLARED_BIN.stat().st_mode | stat.S_IEXEC)
+                except OSError:
+                    pass
             return str(CLOUDFLARED_BIN)
         log.warning("检测到已存在的 cloudflared 二进制校验未通过（可能已损坏），将重新下载...")
         try:
@@ -838,7 +904,7 @@ def download_cloudflared() -> str:
     )
     for c in candidates:
         cp = Path(c)
-        if cp.exists() and _existing_binary_is_healthy(cp, kind=kind):
+        if cp.exists() and _existing_binary_is_healthy(cp, kind=kind, test_args=["version"]):
             return str(c)
 
     os_type = detect_os()
@@ -859,7 +925,10 @@ def download_cloudflared() -> str:
     download(url, CLOUDFLARED_BIN, kind=kind)
 
     if detect_os() != "windows":
-        os.chmod(str(CLOUDFLARED_BIN), CLOUDFLARED_BIN.stat().st_mode | stat.S_IEXEC)
+        try:
+            os.chmod(str(CLOUDFLARED_BIN), CLOUDFLARED_BIN.stat().st_mode | stat.S_IEXEC)
+        except OSError:
+            pass
     log.info("cloudflared 部署完成")
     return str(CLOUDFLARED_BIN)
 
@@ -868,9 +937,12 @@ def download_komari_agent() -> str:
     """下载 Komari 监控探针。"""
     kind = "pe" if detect_os() == "windows" else ("macho" if detect_os() == "darwin" else "elf")
     if KOMARI_BIN_PATH.exists():
-        if _existing_binary_is_healthy(KOMARI_BIN_PATH, kind=kind):
+        if _existing_binary_is_healthy(KOMARI_BIN_PATH, kind=kind, test_args=["--help"]):
             if detect_os() != "windows":
-                os.chmod(str(KOMARI_BIN_PATH), KOMARI_BIN_PATH.stat().st_mode | stat.S_IEXEC)
+                try:
+                    os.chmod(str(KOMARI_BIN_PATH), KOMARI_BIN_PATH.stat().st_mode | stat.S_IEXEC)
+                except OSError:
+                    pass
             return str(KOMARI_BIN_PATH)
         log.warning("检测到已存在的 Komari 探针校验未通过（可能已损坏），将重新下载...")
         try:
@@ -881,7 +953,7 @@ def download_komari_agent() -> str:
     candidates = ["/usr/local/bin/komari-agent", "/usr/local/bin/node-metrics"]
     for c in candidates:
         cp = Path(c)
-        if cp.exists() and _existing_binary_is_healthy(cp, kind=kind):
+        if cp.exists() and _existing_binary_is_healthy(cp, kind=kind, test_args=["--help"]):
             return str(c)
 
     arch = detect_arch()
@@ -895,7 +967,10 @@ def download_komari_agent() -> str:
     try:
         download(url, KOMARI_BIN_PATH, kind="elf")
         if detect_os() != "windows":
-            os.chmod(str(KOMARI_BIN_PATH), KOMARI_BIN_PATH.stat().st_mode | stat.S_IEXEC)
+            try:
+                os.chmod(str(KOMARI_BIN_PATH), KOMARI_BIN_PATH.stat().st_mode | stat.S_IEXEC)
+            except OSError:
+                pass
         log.info("Komari 探针部署完成")
         return str(KOMARI_BIN_PATH)
     except Exception as e:
@@ -1542,6 +1617,12 @@ def main():
         log.error(detail.strip())
         log.error("========================================================")
         atomic_write_secure(SB_LOG_FILE, f"[CONFIG CHECK FAILED]\n{detail}\n")
+        sb_start_failed = True
+    except (FileNotFoundError, PermissionError, OSError) as e:
+        log.error("================ sing-box 二进制执行失败 ================")
+        log.error("二进制路径不可执行: %s, 原因: %s", sb_bin, e)
+        log.error("========================================================")
+        atomic_write_secure(SB_LOG_FILE, f"[EXEC FAILED] {sb_bin}: {e}\n")
         sb_start_failed = True
 
     # 12. 启动核心工作进程（自愈守护）
