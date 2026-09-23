@@ -85,32 +85,64 @@ process.on('SIGTERM', () => gracefulExit('SIGTERM'));
 process.on('SIGINT', () => gracefulExit('SIGINT'));
 
 function resolveCoreDir() {
+  let uid = 0;
+  try {
+    if (typeof os.userInfo === 'function' && os.platform() !== 'win32') {
+      uid = os.userInfo().uid;
+    }
+  } catch {}
+
+  const candidates = [];
   const homeEnv = process.env.HOME;
-  if (homeEnv) {
-    return `${homeEnv}/.cache/node-core`;
+  // 1. 用户真实 HOME 目录（排除根目录 / 以及非目录环境）
+  if (homeEnv && homeEnv !== '/') {
+    candidates.push(`${homeEnv}/.cache/node-core`);
   }
-  // HOME 缺失时退化到临时目录，必须按用户区分，不能用固定共享名字
-  const uid = (typeof os.userInfo === 'function' && os.platform() !== 'win32')
-    ? os.userInfo().uid
-    : 0;
-  const dir = `${os.tmpdir()}/node-core-${uid}`;
-  console.warn(`[警告] 未检测到 HOME 环境变量，数据目录退化至隔离目录 ${dir}，建议检查运行环境（systemd 服务、cron 任务等）是否正确设置了 HOME。`);
-  return dir;
+  // 2. 当前工作目录下的 .cache/node-core（适配容器/PaaS 平台如 Pterodactyl，其 / 为只读而当前目录可写）
+  try {
+    candidates.push(`${process.cwd()}/.cache/node-core`);
+  } catch {}
+  // 3. 系统临时目录 /tmp
+  try {
+    candidates.push(`${os.tmpdir()}/node-core-${uid}`);
+  } catch {}
+
+  for (const target of candidates) {
+    try {
+      fs.mkdirSync(target, { recursive: true });
+      const probe = `${target}/.write_probe_${Date.now()}`;
+      fs.writeFileSync(probe, 'ok');
+      fs.unlinkSync(probe);
+      return target;
+    } catch {}
+  }
+
+  // 极端兜底：当前工作目录下的隐藏文件夹
+  const fallback = `${process.cwd()}/.node-core-${uid}`;
+  try { fs.mkdirSync(fallback, { recursive: true }); } catch {}
+  return fallback;
 }
 
 function ensureCoreDirSafe(dir) {
-  fs.mkdirSync(dir, { recursive: true });
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (e) {
+    console.warn(`[警告] 创建数据目录失败 ${dir}: ${e.message}`);
+    return;
+  }
   if (os.platform() === 'win32') return;
   try {
     const st = fs.statSync(dir);
-    const curUid = typeof os.userInfo === 'function' ? os.userInfo().uid : 0;
+    let curUid = 0;
+    try {
+      if (typeof os.userInfo === 'function') curUid = os.userInfo().uid;
+    } catch {}
     if (st.uid !== curUid) {
-      throw new Error(`数据目录 ${dir} 属主异常（UID=${st.uid}，当前=${curUid}），可能已被其他用户预先创建，存在安全风险，请检查该路径或删除后重试。`);
+      console.warn(`[警告] 数据目录 ${dir} 属主非当前进程 UID (UID=${st.uid}，当前=${curUid})`);
     }
     fs.chmodSync(dir, 0o700);
   } catch (e) {
-    if (e.code === 'ENOENT') return;
-    throw e;
+    console.warn(`[警告] 收紧数据目录权限失败 ${dir}: ${e.message}`);
   }
 }
 
@@ -120,8 +152,7 @@ const CORE_DIR        = resolveCoreDir();
 try {
   ensureCoreDirSafe(CORE_DIR);
 } catch (e) {
-  console.error(`[致命错误] 数据目录初始化失败: ${e.message}`);
-  process.exit(1);
+  console.warn(`[警告] 数据目录安全初始化异常: ${e.message}`);
 }
 const UUID_FILE       = fs.existsSync(`${HOME}/uuid.txt`) ? `${HOME}/uuid.txt` : `${CORE_DIR}/.session.key`;
 const CONFIG_FILE     = fs.existsSync(`${HOME}/sb-config.json`) ? `${HOME}/sb-config.json` : `${CORE_DIR}/.config.json`;
@@ -306,10 +337,24 @@ function checkMagic(file, kind) {
   } catch { return false; }
 }
 
-function existingBinaryIsHealthy(filePath, kind, minSize = 1 << 20) {
+function existingBinaryIsHealthy(filePath, kind, minSize = 1 << 20, testArgs = null) {
   try {
     if (!fs.existsSync(filePath) || fs.statSync(filePath).size < minSize) return false;
-    return checkMagic(filePath, kind);
+    if (!checkMagic(filePath, kind)) return false;
+    if (testArgs && Array.isArray(testArgs)) {
+      if (os.platform() !== 'win32') {
+        try { fs.chmodSync(filePath, 0o755); } catch {}
+      }
+      try {
+        const res = spawnSync(filePath, testArgs, { timeout: 5000, stdio: 'ignore' });
+        if (res.error || (typeof res.status === 'number' && res.status !== 0)) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+    }
+    return true;
   } catch {
     return false;
   }
@@ -562,18 +607,33 @@ function detectOS() {
   return 'linux';
 }
 
+function isMuslLinux() {
+  if (detectOS() !== 'linux') return false;
+  if (fs.existsSync('/etc/alpine-release')) return true;
+  try {
+    const checkDirs = ['/lib', '/usr/lib'];
+    for (const d of checkDirs) {
+      if (fs.existsSync(d)) {
+        const files = fs.readdirSync(d);
+        if (files.some(f => f.startsWith('ld-musl-'))) return true;
+      }
+    }
+  } catch {}
+  return false;
+}
+
 async function downloadSingBox() {
   const kind = os.platform() === 'win32' ? 'pe' : (os.platform() === 'darwin' ? 'macho' : 'elf');
   if (fs.existsSync(SB_BIN_PATH)) {
-    if (existingBinaryIsHealthy(SB_BIN_PATH, kind)) {
+    if (existingBinaryIsHealthy(SB_BIN_PATH, kind, 1 << 20, ['version'])) {
       makeExecutable(SB_BIN_PATH);
       return SB_BIN_PATH;
     }
     console.warn('检测到已存在的核心组件校验未通过（可能已损坏），将重新下载...');
     try { fs.unlinkSync(SB_BIN_PATH); } catch {}
   }
-  if (fs.existsSync('/usr/local/bin/node-worker') && existingBinaryIsHealthy('/usr/local/bin/node-worker', kind)) return '/usr/local/bin/node-worker';
-  if (fs.existsSync('/usr/local/bin/sing-box') && existingBinaryIsHealthy('/usr/local/bin/sing-box', kind)) return '/usr/local/bin/sing-box';
+  if (fs.existsSync('/usr/local/bin/node-worker') && existingBinaryIsHealthy('/usr/local/bin/node-worker', kind, 1 << 20, ['version'])) return '/usr/local/bin/node-worker';
+  if (fs.existsSync('/usr/local/bin/sing-box') && existingBinaryIsHealthy('/usr/local/bin/sing-box', kind, 1 << 20, ['version'])) return '/usr/local/bin/sing-box';
 
   const arch = detectArch();
   if (!arch) throw new Error(`核心组件暂不支持当前 CPU 架构: ${os.arch()}`);
@@ -581,6 +641,7 @@ async function downloadSingBox() {
 
   console.log(`正在获取核心组件最新版本 (${platform}-${arch})...`);
   let version = 'v1.12.0';
+  const fallbackVersion = 'v1.12.0';
   try {
     const data = await httpGet('https://api.github.com/repos/SagerNet/sing-box/releases', 10000);
     if (data) {
@@ -593,34 +654,64 @@ async function downloadSingBox() {
   }
 
   console.log(`核心组件版本: ${version}`);
-  const verNum = version.replace(/^v/, '');
   const ext = platform === 'windows' ? 'zip' : 'tar.gz';
-  const tarName = `sing-box-${verNum}-${platform}-${arch}.${ext}`;
-  const url = `https://github.com/SagerNet/sing-box/releases/download/${version}/${tarName}`;
-  const sha256 = await getAssetSha256('SagerNet/sing-box', version, tarName);
+  const suffixes = platform === 'linux'
+    ? (isMuslLinux() ? ['-musl', ''] : ['', '-musl'])
+    : [''];
 
   fs.mkdirSync(CORE_DIR, { recursive: true });
-  const tmpArchive = `${CORE_DIR}/.worker_${Date.now()}.${ext}`;
-  const workDir    = `${CORE_DIR}/.extract_${Date.now()}`;
-  console.log('正在下载核心组件...');
-  try {
-    await download(url, tmpArchive, { kind: ext === 'zip' ? 'zip' : 'gzip', minSize: 1 << 20, sha256 });
-    fs.mkdirSync(workDir, { recursive: true });
-    if (ext === 'zip') {
-      await runCmd('powershell', ['-Command', `Expand-Archive -Path '${tmpArchive}' -DestinationPath '${workDir}' -Force`]);
-    } else {
-      await runCmd('tar', ['-xzf', tmpArchive, '-C', workDir]);
+
+  async function tryFetch(ver) {
+    const verNum = ver.replace(/^v/, '');
+    for (const suffix of suffixes) {
+      const tarName = `sing-box-${verNum}-${platform}-${arch}${suffix}.${ext}`;
+      const url = `https://github.com/SagerNet/sing-box/releases/download/${ver}/${tarName}`;
+      const sha256 = await getAssetSha256('SagerNet/sing-box', ver, tarName);
+      const tmpArchive = `${CORE_DIR}/.worker_${Date.now()}.${ext}`;
+      const workDir    = `${CORE_DIR}/.extract_${Date.now()}`;
+      console.log(`正在尝试下载核心组件 (${tarName})...`);
+      try {
+        await download(url, tmpArchive, { kind: ext === 'zip' ? 'zip' : 'gzip', minSize: 1 << 20, sha256 });
+        fs.mkdirSync(workDir, { recursive: true });
+        if (ext === 'zip') {
+          await runCmd('powershell', ['-Command', `Expand-Archive -Path '${tmpArchive}' -DestinationPath '${workDir}' -Force`]);
+        } else {
+          await runCmd('tar', ['-xzf', tmpArchive, '-C', workDir]);
+        }
+        const bin = findFile(workDir, ['sing-box', 'sing-box.exe', 'node-worker', 'node-worker.exe']);
+        if (!bin) throw new Error('压缩包内未找到核心可执行文件');
+        try { if (fs.existsSync(SB_BIN_PATH)) fs.unlinkSync(SB_BIN_PATH); } catch {}
+        fs.copyFileSync(bin, SB_BIN_PATH);
+        makeExecutable(SB_BIN_PATH);
+        if (existingBinaryIsHealthy(SB_BIN_PATH, kind, 1 << 20, ['version'])) {
+          console.log(`核心组件部署并验证成功: ${tarName}`);
+          return true;
+        } else {
+          console.warn(`核心组件 (${tarName}) 下载完成但无法在当前环境执行，尝试备选版本...`);
+          try { fs.unlinkSync(SB_BIN_PATH); } catch {}
+        }
+      } catch (err) {
+        console.warn(`核心组件 (${tarName}) 获取失败: ${err.message}`);
+      } finally {
+        try { fs.rmSync(tmpArchive, { force: true }); } catch {}
+        try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+      }
     }
-    const bin = findFile(workDir, ['sing-box', 'sing-box.exe', 'node-worker', 'node-worker.exe']);
-    if (!bin) throw new Error('压缩包内未找到核心可执行文件');
-    fs.copyFileSync(bin, SB_BIN_PATH);
-    makeExecutable(SB_BIN_PATH);
-  } finally {
-    try { fs.rmSync(tmpArchive, { force: true }); } catch {}
-    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+    return false;
   }
-  console.log('核心组件准备完成');
-  return SB_BIN_PATH;
+
+  if (await tryFetch(version)) {
+    return SB_BIN_PATH;
+  }
+
+  if (version !== fallbackVersion) {
+    console.warn(`最新版本 ${version} 不可用，回退尝试保底版本 ${fallbackVersion}...`);
+    if (await tryFetch(fallbackVersion)) {
+      return SB_BIN_PATH;
+    }
+  }
+
+  throw new Error('无法获取并执行兼容当前系统环境的核心组件');
 }
 
 // ──────────────────────────────────────────────
@@ -631,16 +722,16 @@ async function downloadCloudflared() {
   const platform = os.platform();
   const kind = platform === 'win32' ? 'pe' : (platform === 'darwin' ? 'macho' : 'elf');
   if (fs.existsSync(CLOUDFLARED_BIN)) {
-    if (existingBinaryIsHealthy(CLOUDFLARED_BIN, kind)) {
+    if (existingBinaryIsHealthy(CLOUDFLARED_BIN, kind, 1 << 20, ['version'])) {
       makeExecutable(CLOUDFLARED_BIN);
       return CLOUDFLARED_BIN;
     }
     console.warn('检测到已存在的桥接组件校验未通过（可能已损坏），将重新下载...');
     try { fs.unlinkSync(CLOUDFLARED_BIN); } catch {}
   }
-  if (fs.existsSync('/usr/local/bin/node-bridge') && existingBinaryIsHealthy('/usr/local/bin/node-bridge', kind)) return '/usr/local/bin/node-bridge';
-  if (fs.existsSync('/usr/local/bin/node-tunnel') && existingBinaryIsHealthy('/usr/local/bin/node-tunnel', kind)) return '/usr/local/bin/node-tunnel';
-  if (fs.existsSync('/usr/local/bin/cloudflared') && existingBinaryIsHealthy('/usr/local/bin/cloudflared', kind)) return '/usr/local/bin/cloudflared';
+  if (fs.existsSync('/usr/local/bin/node-bridge') && existingBinaryIsHealthy('/usr/local/bin/node-bridge', kind, 1 << 20, ['version'])) return '/usr/local/bin/node-bridge';
+  if (fs.existsSync('/usr/local/bin/node-tunnel') && existingBinaryIsHealthy('/usr/local/bin/node-tunnel', kind, 1 << 20, ['version'])) return '/usr/local/bin/node-tunnel';
+  if (fs.existsSync('/usr/local/bin/cloudflared') && existingBinaryIsHealthy('/usr/local/bin/cloudflared', kind, 1 << 20, ['version'])) return '/usr/local/bin/cloudflared';
   const table = {
     linux:  { x64: 'linux-amd64', arm64: 'linux-arm64', arm: 'linux-arm' },
     darwin: { x64: 'darwin-amd64', arm64: 'darwin-arm64' },
@@ -706,7 +797,7 @@ async function downloadKomariAgent() {
   ];
   for (const p of candidatePaths) {
     if (fs.existsSync(p)) {
-      if (existingBinaryIsHealthy(p, kind)) {
+      if (existingBinaryIsHealthy(p, kind, 1 << 20, ['--help'])) {
         makeExecutable(p);
         return p;
       }
@@ -1260,17 +1351,24 @@ async function main() {
     console.log('核心配置校验通过');
   } catch (e) {
     const detail = (e.stdout || '') + (e.stderr || '') + e.message;
-    console.error('================ 核心配置校验失败 ================');
-    console.error(detail.trim());
-    console.error('==================================================');
-    console.error(
-      '常见原因：当前核心版本过旧，不支持某个已启用的协议类型' +
-      '（例如 AnyTLS 需要核心版本 >= 1.12.0）。' +
-      '请清理缓存目录后重新运行脚本，或关闭对应协议端口变量后重试。'
-    );
-    fs.writeFileSync(SB_LOG_FILE, `[CONFIG CHECK FAILED]\n${detail}\n`);
+    if (e.code === 'ENOENT' || e.code === 'EACCES' || e.status === null) {
+      console.error('================ 核心组件执行失败 ================');
+      console.error(`二进制路径不可执行: ${sbBin}, 原因: ${e.message}`);
+      console.error('==================================================');
+      fs.writeFileSync(SB_LOG_FILE, `[EXEC FAILED] ${sbBin}: ${e.message}\n`);
+    } else {
+      console.error('================ 核心配置校验失败 ================');
+      console.error(detail.trim());
+      console.error('==================================================');
+      console.error(
+        '常见原因：当前核心版本过旧，不支持某个已启用的协议类型' +
+        '（例如 AnyTLS 需要核心版本 >= 1.12.0）。' +
+        '请清理缓存目录后重新运行脚本，或关闭对应协议端口变量后重试。'
+      );
+      fs.writeFileSync(SB_LOG_FILE, `[CONFIG CHECK FAILED]\n${detail}\n`);
+    }
     console.log(`详细日志已写入: ${SB_LOG_FILE}`);
-    console.log('配置校验未通过，跳过启动核心工作进程（Argo/HTTP订阅服务仍会继续运行）。');
+    console.log('校验未通过，跳过启动核心工作进程（Argo/HTTP订阅服务仍会继续运行）。');
     global.SB_START_FAILED = true;
   }
 
@@ -1279,6 +1377,8 @@ async function main() {
 
   const sbEnv = { ...process.env };
   delete sbEnv.PORT;
+  if (!sbEnv.GOMEMLIMIT) sbEnv.GOMEMLIMIT = '15MiB';
+  if (!sbEnv.GOGC) sbEnv.GOGC = '50';
 
   if (!global.SB_START_FAILED) {
     if (!FOREGROUND_CORE) {
@@ -1570,6 +1670,7 @@ async function main() {
 
     if (LOG_CLEAR_MINUTES > 0) {
       console.log(`💡 初始启动日志将在 ${LOG_CLEAR_MINUTES} 分钟后自动清空，临时缓存文件将按策略释放...`);
+      scheduleSubFileCleanup(LOG_CLEAR_MINUTES * 60);
       setTimeout(() => {
         try { console.clear(); } catch {}
         // 自动清理磁盘上的临时 sub.txt
@@ -1591,20 +1692,51 @@ async function main() {
     if (TG_BOT_TOKEN && TG_CHAT_ID) {
       console.log('服务配置已通过 Telegram Bot 安全推送。');
       // TG 已成功推送，延时 5 秒释放磁盘临时 sub.txt
-      setTimeout(() => {
-        try { if (fs.existsSync(SUB_FILE)) fs.unlinkSync(SUB_FILE); } catch {}
-      }, 5000).unref();
+      scheduleSubFileCleanup(5);
     } else {
       console.log(`服务订阅文件已写入: ${SUB_FILE}`);
+      console.log('💡 系统提示：sub.txt 将在运行 2 分钟（120秒）后自动释放清理，请妥善保存！');
+      scheduleSubFileCleanup(120);
     }
     console.log('====================================================');
+  }
+
+  let subCleanScheduled = false;
+  function scheduleSubFileCleanup(delaySec) {
+    if (subCleanScheduled || !fs.existsSync(SUB_FILE)) return;
+    subCleanScheduled = true;
+    if (os.platform() !== 'win32') {
+      try {
+        spawn('sh', ['-c', `sleep ${delaySec} && rm -f ${JSON.stringify(SUB_FILE)}`], {
+          detached: true,
+          stdio: 'ignore'
+        }).unref();
+        return;
+      } catch {}
+    }
+    setTimeout(() => {
+      try { if (fs.existsSync(SUB_FILE)) fs.unlinkSync(SUB_FILE); } catch {}
+    }, delaySec * 1000).unref();
   }
 
   if (FOREGROUND_CORE && !global.SB_START_FAILED) {
     console.log('[单进程模式] 订阅初始化与推送完成，核心工作进程接管前台运行...');
     await new Promise(r => setTimeout(r, 2000));
-    try { if (fs.existsSync(SUB_FILE)) fs.unlinkSync(SUB_FILE); } catch {}
-    // 不再 server.close()：保留 /health 与订阅路径供平台健康检查
+
+    // 订阅文件清理调度兜底
+    if (TG_BOT_TOKEN && TG_CHAT_ID) {
+      scheduleSubFileCleanup(5);
+    } else if (!SHOW_LOG) {
+      scheduleSubFileCleanup(120);
+    } else if (LOG_CLEAR_MINUTES > 0) {
+      scheduleSubFileCleanup(LOG_CLEAR_MINUTES * 60);
+    }
+
+    // 清理未启用的空日志文件，提升隐蔽性
+    for (const lf of [CF_LOG_FILE, KOMARI_LOG_FILE]) {
+      try { if (fs.existsSync(lf)) fs.unlinkSync(lf); } catch {}
+    }
+
     const core = spawn(sbBin, ['run', '-c', CONFIG_FILE], {
       argv0: os.platform() !== 'win32' ? 'node /app/worker.js' : undefined,
       stdio: 'inherit',
