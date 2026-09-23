@@ -199,6 +199,17 @@
             </div>
           </div>
         </div>
+        <div style="margin-top:16px;">
+          <div class="field">
+            <label for="field-cf-prefer">CF 优选域名/IP</label>
+            <div class="field-input-row">
+              <input type="text" id="field-cf-prefer" placeholder="默认自动探活选择（留空推荐）">
+              <button type="button" class="btn-mini" id="gen-cf-prefer">随机</button>
+            </div>
+            <span class="desc">CF_PREFER_HOST</span>
+            <span class="field-hint">Argo 节点的连接地址，留空脚本自动从候选池探活选择最优节点</span>
+          </div>
+        </div>
       </div>
 
       <div class="section">
@@ -348,8 +359,195 @@
     'addons.mozilla.org','azure.microsoft.com','aws.amazon.com',
     'apps.apple.com','ftp.jaist.ac.jp','www.visa.com'
   ];
+  const CF_PREFER_HOST_POOL = [
+    'cf.877774.xyz','cf.zhetengsha.eu.org','cf.090227.xyz',
+    'ip.sb','www.visa.com.tw','www.visa.com.sg',
+    'time.is','cdns.doon.eu.org','skk.moe','www.visa.com.hk'
+  ];
 
   const state = {
+    uuid:'', port:'', name:'', sub:'',
+    argoPort:'', argoDomain:'', argoAuth:'', disableArgo:false, cfPrefer:'',
+    hy2:'', tuic:'', ss:'', trojan:'', anytls:'', s5:'', reality:'', realityDomain:'',
+    komariDomain:'', komariToken:'',
+    cmdType:'curl'
+  };
+
+  function randPort(){ return String(10000 + Math.floor(Math.random() * 55535)); }
+
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  function buildPairs(){
+    const p=[];
+    if(state.uuid)          p.push(['UUID',           state.uuid,         false]);
+    if(state.port)          p.push(['PORT',           state.port,         false]);
+    if(state.name)          p.push(['NAME',           state.name,         false]);
+    if(state.sub)           p.push(['SUB',            state.sub,          false]);
+    if(state.argoPort)      p.push(['ARGO_PORT',      state.argoPort,     false]);
+    if(state.argoDomain)    p.push(['ARGO_DOMAIN',    state.argoDomain,   false]);
+    if(state.argoAuth)      p.push(['ARGO_AUTH',      state.argoAuth,     true]);
+    if(state.disableArgo)   p.push(['DISABLE_ARGO',   'true',             false]);
+    if(state.cfPrefer)      p.push(['CF_PREFER_HOST', state.cfPrefer,     false]);
+    if(state.hy2)           p.push(['HY2_PORT',       state.hy2,          false]);
+    if(state.tuic)          p.push(['TUIC_PORT',      state.tuic,         false]);
+    if(state.ss)            p.push(['SS_PORT',        state.ss,           false]);
+    if(state.trojan)        p.push(['TROJAN_PORT',    state.trojan,       false]);
+    if(state.anytls)        p.push(['ANYTLS_PORT',    state.anytls,       false]);
+    if(state.s5)            p.push(['SOCKS5_PORT',    state.s5,           false]);
+    if(state.reality)       p.push(['REALITY_PORT',   state.reality,      false]);
+    if(state.realityDomain) p.push(['REALITY_DOMAIN', state.realityDomain,false]);
+    if(state.komariDomain)  p.push(['KOMARI_DOMAIN',  state.komariDomain, false]);
+    if(state.komariToken)   p.push(['KOMARI_TOKEN',   state.komariToken,  false]);
+    return p;
+  }
+
+  function formatVal(v, forceQuote){
+    if(forceQuote || /[\s"'\\`$|&;()<>]/.test(v)) return `"${v}"`;
+    return v;
+  }
+  function formatValHtml(v, forceQuote){
+    if(forceQuote || /[\s"'\\`$|&;()<>]/.test(v)) return `"${escapeHtml(v)}"`;
+    return escapeHtml(v);
+  }
+
+  function fetcherPlain(){
+    return state.cmdType === 'curl'
+      ? `bash <(curl -sL ${SCRIPT_URL})`
+      : `bash <(wget -qO- ${SCRIPT_URL})`;
+  }
+  function fetcherHtml(){
+    const lt = '&lt;';
+    return state.cmdType === 'curl'
+      ? `bash ${lt}(curl -sL ${escapeHtml(SCRIPT_URL)})`
+      : `bash ${lt}(wget -qO- ${escapeHtml(SCRIPT_URL)})`;
+  }
+
+  function plainCommand(){
+    const pairs = buildPairs();
+    const v = pairs.map(([k,v,q]) => `${k}=${formatVal(v,q)}`).join(' ');
+    return (v ? v + ' ' : '') + fetcherPlain();
+  }
+
+  function render(){
+    const pairs = buildPairs();
+    const html = pairs.map(([k,v,q]) =>
+      `<span class="var">${escapeHtml(k)}</span>=${formatValHtml(v,q)}`
+    ).join(' ');
+    document.getElementById('command-output').innerHTML =
+      (html ? html + ' ' : '') + fetcherHtml();
+  }
+
+  const protoKeys = ['hy2','tuic','ss','trojan','anytls','s5','reality'];
+  function updateProtoCard(key){
+    document.getElementById('card-'+key).classList.toggle('active', !!state[key]);
+  }
+
+  document.querySelectorAll('.btn-proto-rand').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const key = btn.dataset.key;
+      const p = randPort();
+      state[key] = p;
+      document.getElementById('input-'+key).value = p;
+      updateProtoCard(key); render();
+    });
+  });
+
+  protoKeys.forEach(key => {
+    document.getElementById('input-'+key).addEventListener('input', e => {
+      state[key] = e.target.value.trim();
+      updateProtoCard(key); render();
+    });
+  });
+
+  document.getElementById('gen-port').addEventListener('click', () => {
+    const p = randPort(); document.getElementById('field-port').value = p; state.port = p; render();
+  });
+  document.getElementById('gen-argo-port').addEventListener('click', () => {
+    const p = randPort(); document.getElementById('field-argo-port').value = p; state.argoPort = p; render();
+  });
+  document.getElementById('gen-reality-domain').addEventListener('click', () => {
+    let pool = REALITY_DOMAIN_POOL;
+    if(state.realityDomain){
+      const filtered = pool.filter(d => d !== state.realityDomain);
+      if(filtered.length) pool = filtered;
+    }
+    const d = pool[Math.floor(Math.random() * pool.length)];
+    document.getElementById('field-reality-domain').value = d;
+    state.realityDomain = d; render();
+  });
+  document.getElementById('gen-cf-prefer').addEventListener('click', () => {
+    let pool = CF_PREFER_HOST_POOL;
+    if(state.cfPrefer){
+      const filtered = pool.filter(d => d !== state.cfPrefer);
+      if(filtered.length) pool = filtered;
+    }
+    const d = pool[Math.floor(Math.random() * pool.length)];
+    document.getElementById('field-cf-prefer').value = d;
+    state.cfPrefer = d; render();
+  });
+
+  document.getElementById('gen-uuid').addEventListener('click', () => {
+    const b = new Uint8Array(16); crypto.getRandomValues(b);
+    b[6]=(b[6]&0x0f)|0x40; b[8]=(b[8]&0x3f)|0x80;
+    const h = Array.from(b, x => x.toString(16).padStart(2,'0'));
+    const uuid = `${h.slice(0,4).join('')}-${h.slice(4,6).join('')}-${h.slice(6,8).join('')}-${h.slice(8,10).join('')}-${h.slice(10).join('')}`;
+    document.getElementById('field-uuid').value = uuid; state.uuid = uuid; render();
+  });
+
+  [
+    ['field-uuid','uuid'],['field-port','port'],['field-name','name'],['field-sub','sub'],
+    ['field-argo-port','argoPort'],['field-argo-domain','argoDomain'],['field-argo-auth','argoAuth'],
+    ['field-cf-prefer','cfPrefer'],
+    ['field-reality-domain','realityDomain'],
+    ['field-komari-domain','komariDomain'],['field-komari-token','komariToken'],
+  ].forEach(([id,key]) => {
+    document.getElementById(id).addEventListener('input', e => { state[key] = e.target.value.trim(); render(); });
+  });
+
+  // 开关：监听 change 事件
+  document.getElementById('toggle-disable-argo').addEventListener('change', e => {
+    state.disableArgo = e.target.checked; render();
+  });
+
+  document.querySelectorAll('.seg-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.cmdType = btn.dataset.type;
+      document.querySelectorAll('.seg-btn').forEach(b => b.classList.toggle('active', b===btn));
+      render();
+    });
+  });
+
+  document.getElementById('copy-btn').addEventListener('click', async () => {
+    const text = plainCommand();
+    try { await navigator.clipboard.writeText(text); }
+    catch(e) {
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.style.cssText = 'position:fixed;opacity:0';
+      document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+    }
+    const btn = document.getElementById('copy-btn');
+    btn.textContent = '✓ 已复制'; btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = '复制命令'; btn.classList.remove('copied'); }, 1600);
+  });
+
+  document.getElementById('reset-btn').addEventListener('click', () => {
+    Object.keys(state).forEach(k => { state[k] = k==='cmdType'?'curl': k==='disableArgo'?false:''; });
+    ['field-uuid','field-port','field-name','field-sub','field-argo-port','field-argo-domain','field-argo-auth','field-cf-prefer','field-reality-domain']
+      .forEach(id => { document.getElementById(id).value = ''; });
+    document.getElementById('toggle-disable-argo').checked = false;
+    protoKeys.forEach(k => { document.getElementById('input-'+k).value = ''; updateProtoCard(k); });
+    document.querySelectorAll('.seg-btn').forEach((b,i) => b.classList.toggle('active', i===0));
+    render();
+  });
+
+  render();
+})();
+</script>
+</body>
+</html>
+
     uuid:'', port:'', name:'', sub:'',
     argoPort:'', argoDomain:'', argoAuth:'', disableArgo:false,
     hy2:'', tuic:'', ss:'', trojan:'', anytls:'', s5:'', reality:'', realityDomain:'',
@@ -520,3 +718,4 @@
 </script>
 </body>
 </html>
+

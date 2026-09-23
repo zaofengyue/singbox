@@ -246,9 +246,16 @@ PATH_TO_PORT = {
 
 # Cloudflare 优选 Fallback 候选池（按优先级排列，探活失败后依次降级，最终兜底到 Argo HOST）
 CF_PREFER_HOST_CANDIDATES = [
-    "www.visa.com.tw",   # Cloudflare 知名优选节点，覆盖广、延迟低
-    "icook.hk",          # 香港 CF 边缘，长期稳定
-    "cf.090227.xyz",     # 社区高可用优选
+    "www.visa.com.tw",       # 知名 Cloudflare 优选，覆盖广、延迟低
+    "www.visa.com.sg",       # 新加坡 CF 边缘
+    "www.visa.com.hk",       # 香港 CF 边缘
+    "icook.hk",              # 香港 CF 节点，长期稳定
+    "cf.877774.xyz",         # 社区优选
+    "cf.zhetengsha.eu.org",  # 社区优选
+    "cf.090227.xyz",         # 社区优选
+    "skk.moe",               # 社区优选
+    "time.is",               # CF 知名优选
+    "cdns.doon.eu.org",      # 备用优选
 ]
 
 

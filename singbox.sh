@@ -1800,8 +1800,43 @@ do_run() {
   IP_VERSION="${IP_VERSION:-4}"
   SERVER_DOMAIN="${SERVER_DOMAIN:-}"
   PUBLIC_IP="${PUBLIC_IP:-${IP:-}}"
-  CF_PREFER_HOST="${CF_PREFER_HOST:-cdns.doon.eu.org}"
+  CF_PREFER_HOST="${CF_PREFER_HOST:-www.visa.com.tw}"
   WS_PATH="${WS_PATH:-/fengyue}"
+
+  # ── CF 优选域名探活降级（仅当未禁用 Argo 时执行，非阻塞轻量检测）──
+  if [ "${DISABLE_ARGO:-}" != "true" ]; then
+    _CF_CANDIDATES="cf.877774.xyz cf.zhetengsha.eu.org cf.090227.xyz ip.sb www.visa.com.tw www.visa.com.sg time.is cdns.doon.eu.org skk.moe www.visa.com.hk"
+    _cf_probe_ok() {
+      local _h="$1"
+      if command -v host >/dev/null 2>&1; then
+        host -t A "$_h" >/dev/null 2>&1 && return 0
+        host -t AAAA "$_h" >/dev/null 2>&1 && return 0
+      elif command -v dig >/dev/null 2>&1; then
+        dig +short +timeout=3 "$_h" 2>/dev/null | grep -qE '^[0-9a-fA-F.:]+$' && return 0
+      elif command -v nslookup >/dev/null 2>&1; then
+        nslookup "$_h" >/dev/null 2>&1 && return 0
+      fi
+      return 1
+    }
+    if ! _cf_probe_ok "$CF_PREFER_HOST"; then
+      warn "CF 优选域名 ${CF_PREFER_HOST} DNS 解析失败，自动从候选池中选择..."
+      _cf_found=""
+      for _cand in $_CF_CANDIDATES; do
+        [ "$_cand" = "$CF_PREFER_HOST" ] && continue
+        if _cf_probe_ok "$_cand"; then
+          _cf_found="$_cand"
+          break
+        fi
+      done
+      if [ -n "$_cf_found" ]; then
+        CF_PREFER_HOST="$_cf_found"
+        log "CF 优选域名已降级至备用: ${CF_PREFER_HOST}"
+      else
+        log "CF 候选池全部探活失败，已兜底至 Argo 隧道域名（将在隧道启动后生效）"
+        CF_PREFER_HOST=""  # 空值：generate_sub 中将使用 ARGO_HOST 兜底
+      fi
+    fi
+  fi
 
   # 如果是从未持久化 WS_PATH 的旧版本升级，补全历史默认值 /fengyue 并写回 config.env
   if [ -z "$WS_PATH" ] || [ "$WS_PATH" = "/fengyue-vm" ]; then
@@ -2496,7 +2531,9 @@ CERTEOF
   generate_sub() {
     local ALL_LINKS=""
     if [ "${DISABLE_ARGO:-}" != "true" ]; then
-      local VMESS_JSON="{\"v\":\"2\",\"ps\":\"$(json_escape "$NAME")\",\"add\":\"cdns.doon.eu.org\",\"port\":\"443\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${ARGO_HOST}\",\"path\":\"$(json_escape "$WS_PATH")\",\"tls\":\"tls\",\"sni\":\"${ARGO_HOST}\"}"
+      # CF 优选域名：优先用探活后的 CF_PREFER_HOST，为空（全部候选均不可达）时兜底 Argo 隧道域名
+      local _cf_add="${CF_PREFER_HOST:-${ARGO_HOST}}"
+      local VMESS_JSON="{\"v\":\"2\",\"ps\":\"$(json_escape "$NAME")\",\"add\":\"${_cf_add}\",\"port\":\"443\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${ARGO_HOST}\",\"path\":\"$(json_escape "$WS_PATH")\",\"tls\":\"tls\",\"sni\":\"${ARGO_HOST}\"}"
       ALL_LINKS="vmess://$(b64 "$VMESS_JSON")"
     fi
 
