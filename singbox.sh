@@ -2019,7 +2019,7 @@ do_run() {
   download_singbox() {
     mkdir -p "$SB_DIR"
     log "正在检查/获取 sing-box..."
-    local SB_VER SB_FALLBACK_VER="v1.12.0"
+    local SB_VER SB_FALLBACK_VER="v1.14.1"
     SB_VER="$(http_get 'https://api.github.com/repos/SagerNet/sing-box/releases/latest' \
       | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
     [ -z "$SB_VER" ] && { warn "获取最新版本号失败，直接使用保底版本 ${SB_FALLBACK_VER}"; SB_VER="$SB_FALLBACK_VER"; }
@@ -2485,19 +2485,12 @@ CERTEOF
 
   [ -z "$_inbounds" ] && die "所有协议均校验失败，无法启动"
 
-  local DIRECT_STRAT=""
-  case "$IP_VERSION" in
-    6) DIRECT_STRAT=', "domain_strategy": "prefer_ipv6"' ;;
-    4) DIRECT_STRAT=', "domain_strategy": "prefer_ipv4"' ;;
-    *) DIRECT_STRAT="" ;;
-  esac
-
   local ROUTE_JSON=""
   [ -n "$EXTRA_OUTBOUND_JSON" ] && ROUTE_JSON=',
   "route": { "final": "custom-out" }'
 
-  printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct"%s}%s]%s\n}\n' \
-    "$_inbounds" "$DIRECT_STRAT" "$EXTRA_OUTBOUND_JSON" "$ROUTE_JSON" > "$CONFIG_FILE"
+  printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct"}%s]%s\n}\n' \
+    "$_inbounds" "$EXTRA_OUTBOUND_JSON" "$ROUTE_JSON" > "$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
 
   start_singbox() {
