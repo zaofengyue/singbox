@@ -49,14 +49,22 @@ const path   = require('path');
 // ──────────────────────────────────────────────
 const trackedProcesses = [];
 let isShuttingDown = false;
+let uptimeTimer = null;
 
 // 与各处 spawn 的 argv0 保持一致
 const PROC_TAGS = ['node /app/worker.js', 'node /app/bridge.js', 'node /app/metrics.js'];
 
 function killStaleByTag(tags = PROC_TAGS) {
   if (os.platform() === 'win32') return;
+  let uidArgs = [];
+  try {
+    if (typeof os.userInfo === 'function') {
+      const uid = os.userInfo().uid;
+      if (typeof uid === 'number') uidArgs = ['-u', String(uid)];
+    }
+  } catch {}
   for (const tag of tags) {
-    try { spawnSync('pkill', ['-f', tag], { stdio: 'ignore' }); } catch {}
+    try { spawnSync('pkill', [...uidArgs, '-f', tag], { stdio: 'ignore' }); } catch {}
   }
 }
 
@@ -339,7 +347,13 @@ function checkMagic(file, kind) {
       case 'macho': return ['cffaedfe', 'cefaedfe', 'cafebabe'].includes(hex);
       default:      return true;
     }
-  } catch { return false; }
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
 }
 
 function existingBinaryIsHealthy(filePath, kind, minSize = 1 << 20, testArgs = null) {
@@ -352,7 +366,7 @@ function existingBinaryIsHealthy(filePath, kind, minSize = 1 << 20, testArgs = n
       }
       try {
         const res = spawnSync(filePath, testArgs, { timeout: 5000, stdio: 'ignore' });
-        if (res.error) return false;
+        if (res.error || res.signal) return false;
         if (typeof res.status === 'number' && ![0, 1, 2].includes(res.status)) {
           return false;
         }
@@ -628,18 +642,30 @@ function isMuslLinux() {
   return false;
 }
 
+function findUsableBinary(candidates, kind, testArgs = ['version']) {
+  for (const p of candidates) {
+    if (fs.existsSync(p) && existingBinaryIsHealthy(p, kind, 1 << 20, testArgs)) {
+      makeExecutable(p);
+      return p;
+    }
+  }
+  return '';
+}
+
+function getSbCandidatePaths() {
+  return os.platform() === 'win32'
+    ? [SB_BIN_PATH, 'C:\\sing-box\\sing-box.exe']
+    : [SB_BIN_PATH, '/usr/local/bin/node-worker', '/usr/local/bin/sing-box', '/usr/bin/sing-box'];
+}
+
 async function downloadSingBox() {
   const kind = os.platform() === 'win32' ? 'pe' : (os.platform() === 'darwin' ? 'macho' : 'elf');
+  const existing = findUsableBinary(getSbCandidatePaths(), kind);
+  if (existing) return existing;
   if (fs.existsSync(SB_BIN_PATH)) {
-    if (existingBinaryIsHealthy(SB_BIN_PATH, kind, 1 << 20, ['version'])) {
-      makeExecutable(SB_BIN_PATH);
-      return SB_BIN_PATH;
-    }
     console.warn('检测到已存在的核心组件校验未通过（可能已损坏），将重新下载...');
     try { fs.unlinkSync(SB_BIN_PATH); } catch {}
   }
-  if (fs.existsSync('/usr/local/bin/node-worker') && existingBinaryIsHealthy('/usr/local/bin/node-worker', kind, 1 << 20, ['version'])) return '/usr/local/bin/node-worker';
-  if (fs.existsSync('/usr/local/bin/sing-box') && existingBinaryIsHealthy('/usr/local/bin/sing-box', kind, 1 << 20, ['version'])) return '/usr/local/bin/sing-box';
 
   const arch = detectArch();
   if (!arch) throw new Error(`核心组件暂不支持当前 CPU 架构: ${os.arch()}`);
@@ -841,10 +867,8 @@ async function downloadKomariAgent() {
 // 容器内 Uptime 独立虚拟化（对标容器部署时间）
 // ──────────────────────────────────────────────
 
-let uptimeTimer = null;
-
 function setupContainerUptime() {
-  if (os.platform() !== 'linux') return;
+  if (os.platform() !== 'linux' || uptimeTimer) return;
   const fakeFile = '/tmp/.fake_uptime';
   const startTime = Math.floor(Date.now() / 1000);
   try {
@@ -868,7 +892,7 @@ function setupContainerUptime() {
 // Argo 桥接
 // ──────────────────────────────────────────────
 
-function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = '') {
+function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = '', onHostUpdate = null) {
   return new Promise((resolve) => {
     const protoDesc = argoProtocol || 'auto (QUIC优先)';
 
@@ -876,12 +900,14 @@ function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = '
       console.log(`启动固定 Argo 桥接服务 (协议: ${protoDesc})...`);
       const cfArgs = ['tunnel', '--edge-ip-version', 'auto', '--no-autoupdate'];
       if (argoProtocol) cfArgs.push('--protocol', argoProtocol);
-      cfArgs.push('run', '--token', argoAuth);
+      cfArgs.push('run');
 
+      const cfEnv = { ...process.env, TUNNEL_TOKEN: argoAuth };
       superviseProcess('Argo固定隧道', () => {
         return spawn(cfBin, cfArgs, {
           argv0: os.platform() !== 'win32' ? 'node /app/bridge.js' : undefined,
-          stdio: 'ignore'
+          stdio: 'ignore',
+          env: cfEnv
         });
       });
       setTimeout(() => resolve(argoDomain), 3000);
@@ -902,12 +928,17 @@ function startArgoTunnel(cfBin, argoPort, argoDomain, argoAuth, argoProtocol = '
         cf.stderr.on('data', (data) => {
           const str   = data.toString();
           const match = str.match(/https:\/\/(?!api\.)([a-z0-9-]+\.trycloudflare\.com)/);
-          if (match && !argoHost) {
-            argoHost = match[1];
-            console.log(`临时隧道域名: ${argoHost}`);
-            if (!resolved) {
-              resolved = true;
-              resolve(argoHost);
+          if (match) {
+            const newHost = match[1];
+            if (newHost !== argoHost) {
+              argoHost = newHost;
+              console.log(`临时隧道域名: ${argoHost}`);
+              if (!resolved) {
+                resolved = true;
+                resolve(argoHost);
+              } else if (typeof onHostUpdate === 'function') {
+                try { onHostUpdate(argoHost); } catch {}
+              }
             }
           }
         });
@@ -951,6 +982,7 @@ async function getPublicIP() {
 // ──────────────────────────────────────────────
 
 async function main() {
+  killStaleByTag();
   const DISABLE_ARGO = (PRESET_DISABLE_ARGO || process.env.DISABLE_ARGO || '').toLowerCase() === 'true';
 
   // UUID
@@ -974,11 +1006,11 @@ async function main() {
   const SS_PASS     = deriveSSPassword(UUID);
 
   // 对外端口（伪装页 + 订阅）
-  const INBOUND_PORT = PRESET_PORT
-    ? parseInt(PRESET_PORT)
-    : process.env.PORT
-      ? parseInt(process.env.PORT)
-      : await getFreePort();
+  const rawPort = PRESET_PORT || process.env.PORT;
+  const parsedPort = rawPort ? parseInt(rawPort, 10) : NaN;
+  const INBOUND_PORT = (!isNaN(parsedPort) && parsedPort > 0 && parsedPort <= 65535)
+    ? parsedPort
+    : await getFreePort();
 
   const SUB_RAW  = PRESET_SUB || process.env.SUB || 'sub';
   const SUB_PATH = '/' + SUB_RAW.replace(/^\//, '');
@@ -1128,29 +1160,19 @@ async function main() {
   ];
 
   // ── 先下载/找到核心组件，Reality 密钥生成依赖它 ──
-  let sbBin = '';
   const kind = os.platform() === 'win32' ? 'pe' : (os.platform() === 'darwin' ? 'macho' : 'elf');
-  if (fs.existsSync(SB_BIN_PATH)) {
-    if (existingBinaryIsHealthy(SB_BIN_PATH, kind)) {
-      makeExecutable(SB_BIN_PATH);
-      sbBin = SB_BIN_PATH;
-    } else {
-      console.warn('检测到已存在的核心组件校验未通过（可能已损坏），将重新下载...');
-      try { fs.unlinkSync(SB_BIN_PATH); } catch {}
-    }
-  }
-  if (!sbBin) {
-    const candidatePaths = os.platform() === 'win32'
-      ? ['C:\\sing-box\\sing-box.exe']
-      : ['/usr/local/bin/node-worker', '/usr/local/bin/sing-box', '/usr/bin/sing-box'];
-    for (const p of candidatePaths) {
-      if (fs.existsSync(p) && existingBinaryIsHealthy(p, kind)) { sbBin = p; break; }
-    }
-  }
+  let sbBin = findUsableBinary(getSbCandidatePaths(), kind);
   if (!sbBin) sbBin = await downloadSingBox();
 
   // ── 端口唯一性检测 ──────────────────────────────────────────────────────
   const usedPorts = new Set();
+  usedPorts.add(`tcp:${INBOUND_PORT}`);
+  usedPorts.add(`tcp:${ARGO_PORT}`);
+  if (!DISABLE_ARGO) {
+    usedPorts.add(`tcp:${V_VMESS_PORT}`);
+    usedPorts.add(`tcp:${V_VLESS_PORT}`);
+    usedPorts.add(`tcp:${V_TROJAN_PORT}`);
+  }
   function portOk(p, proto) {
     if (!p || isNaN(p)) return false;
     const n = parseInt(p);
@@ -1479,13 +1501,115 @@ async function main() {
     });
   }
 
+  const formattedIp = (net.isIPv6 && net.isIPv6(PUBLIC_IP)) ? `[${PUBLIC_IP}]` : PUBLIC_IP;
+  const SUB_FILE = `${process.cwd()}/sub.txt`;
+
+  function buildNodeLinks(currentHost, currentPrefer) {
+    const list = [];
+    if (!DISABLE_ARGO) {
+      const VMESS_OBJ = {
+        v: '2', ps: NAME, add: currentPrefer, port: '443',
+        id: UUID, aid: '0', scy: 'auto', net: 'ws', type: 'none',
+        host: currentHost, path: WS_PATH_VMESS, tls: 'tls', sni: currentHost
+      };
+      list.push('vmess://' + Buffer.from(JSON.stringify(VMESS_OBJ)).toString('base64'));
+
+      list.push(
+        `vless://${UUID}@${currentPrefer}:443` +
+        `?encryption=none&security=tls&sni=${currentHost}&type=ws&host=${currentHost}` +
+        `&path=${encodeURIComponent(WS_PATH_VLESS)}#${encodeURIComponent(NAME)}`
+      );
+
+      list.push(
+        `trojan://${TROJAN_PASS}@${currentPrefer}:443` +
+        `?security=tls&sni=${currentHost}&type=ws&host=${currentHost}` +
+        `&path=${encodeURIComponent(WS_PATH_TROJAN)}#${encodeURIComponent(NAME)}`
+      );
+    }
+
+    if (hy2Final && PUBLIC_IP) {
+      list.push(
+        `hysteria2://${UUID}@${formattedIp}:${HY2_PORT}` +
+        `?sni=www.bing.com&insecure=1&alpn=h3&obfs=none` +
+        `#${encodeURIComponent(NAME)}`
+      );
+    }
+
+    if (tuicFinal && PUBLIC_IP) {
+      list.push(
+        `tuic://${UUID}:${UUID}@${formattedIp}:${TUIC_PORT}` +
+        `?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1` +
+        `#${encodeURIComponent(NAME)}`
+      );
+    }
+
+    if (realityFinal && PUBLIC_IP && global.REALITY_PUB_KEY) {
+      list.push(
+        `vless://${UUID}@${formattedIp}:${REALITY_PORT}` +
+        `?encryption=none&flow=xtls-rprx-vision&security=reality` +
+        `&sni=${REALITY_DOMAIN}&fp=firefox&pbk=${global.REALITY_PUB_KEY}` +
+        `&type=tcp&headerType=none` +
+        `#${encodeURIComponent(NAME)}`
+      );
+    }
+
+    if (ssActive && PUBLIC_IP) {
+      const ssUserInfo = Buffer.from(`2022-blake3-aes-128-gcm:${SS_PASS}`).toString('base64');
+      list.push(
+        `ss://${ssUserInfo}@${formattedIp}:${SS_PORT}` +
+        `#${encodeURIComponent(NAME)}`
+      );
+    }
+
+    if (s5Active && PUBLIC_IP) {
+      const s5UserInfo = Buffer.from(`${UUID.substring(0, 8)}:${UUID.slice(-12)}`).toString('base64');
+      list.push(
+        `socks://${s5UserInfo}@${formattedIp}:${S5_PORT}` +
+        `#${encodeURIComponent(NAME)}`
+      );
+    }
+
+    if (anytlsFinal && PUBLIC_IP) {
+      list.push(
+        `anytls://${UUID}@${formattedIp}:${ANYTLS_PORT}` +
+        `?security=tls&sni=www.bing.com&fp=chrome&insecure=1&allowInsecure=1` +
+        `#${encodeURIComponent(NAME)}`
+      );
+    }
+
+    return list;
+  }
+
+  function writeSubContent(allLinks) {
+    const b64 = Buffer.from(allLinks.join('\n')).toString('base64');
+    global.SUB_CONTENT = b64;
+    try {
+      fs.writeFileSync(SUB_FILE, b64, { mode: 0o600 });
+      secureFilePermissions(SUB_FILE);
+    } catch {}
+    return b64;
+  }
+
+  let preferHost = 'your-domain.com';
+  let links = [];
+  let SUB_BASE64 = '';
+
+  const onHostUpdate = async (newHost) => {
+    if (!newHost || newHost === HOST) return;
+    HOST = newHost;
+    preferHost = await resolvePreferHost(newHost);
+    links = buildNodeLinks(HOST, preferHost);
+    SUB_BASE64 = writeSubContent(links);
+    console.log(`[Argo] 临时隧道域名已动态更新: ${newHost}，节点订阅已自动重构刷新。`);
+  };
+
   // ── 启动 cloudflared ───────────────────────
   let HOST = 'your-domain.com';
   if (!DISABLE_ARGO) {
     try {
       const cfBin    = await downloadCloudflared();
       if (cfBin) {
-        const argoHost = await startArgoTunnel(cfBin, ARGO_PORT, ARGO_DOMAIN, ARGO_AUTH, ARGO_PROTOCOL);
+        const argoHost = await startArgoTunnel(cfBin, ARGO_PORT, ARGO_DOMAIN, ARGO_AUTH, ARGO_PROTOCOL, onHostUpdate);
         HOST = argoHost || 'your-domain.com';
       }
     } catch (err) {
@@ -1562,104 +1686,27 @@ async function main() {
 
   // ── 生成订阅链接 ───────────────────────────
   // 在 HOST 确定后进行 CF 优选域名探活（非阻塞轻量，失败自动降级）
-  const preferHost = await resolvePreferHost(HOST);
+  preferHost = await resolvePreferHost(HOST);
   console.log(`[优选域名] 最终使用: ${preferHost}`);
 
-  const links = [];
+  links = buildNodeLinks(HOST, preferHost);
+  SUB_BASE64 = writeSubContent(links);
 
-  if (!DISABLE_ARGO) {
-    const VMESS_OBJ = {
-      v: '2', ps: NAME, add: preferHost, port: '443',
-      id: UUID, aid: '0', scy: 'auto', net: 'ws', type: 'none',
-      host: HOST, path: WS_PATH_VMESS, tls: 'tls', sni: HOST
-    };
-    links.push('vmess://' + Buffer.from(JSON.stringify(VMESS_OBJ)).toString('base64'));
-
-    links.push(
-      `vless://${UUID}@${preferHost}:443` +
-      `?encryption=none&security=tls&sni=${HOST}&type=ws&host=${HOST}` +
-      `&path=${encodeURIComponent(WS_PATH_VLESS)}#${encodeURIComponent(NAME)}`
-    );
-
-    links.push(
-      `trojan://${TROJAN_PASS}@${preferHost}:443` +
-      `?security=tls&sni=${HOST}&type=ws&host=${HOST}` +
-      `&path=${encodeURIComponent(WS_PATH_TROJAN)}#${encodeURIComponent(NAME)}`
-    );
-  }
-
-  const formattedIp = (net.isIPv6 && net.isIPv6(PUBLIC_IP)) ? `[${PUBLIC_IP}]` : PUBLIC_IP;
-
-  if (hy2Final && PUBLIC_IP) {
-    links.push(
-      `hysteria2://${UUID}@${formattedIp}:${HY2_PORT}` +
-      `?sni=www.bing.com&insecure=1&alpn=h3&obfs=none` +
-      `#${encodeURIComponent(NAME)}`
-    );
-  }
-
-  if (tuicFinal && PUBLIC_IP) {
-    links.push(
-      `tuic://${UUID}:${UUID}@${formattedIp}:${TUIC_PORT}` +
-      `?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1` +
-      `#${encodeURIComponent(NAME)}`
-    );
-  }
-
-  if (realityFinal && PUBLIC_IP && global.REALITY_PUB_KEY) {
-    links.push(
-      `vless://${UUID}@${formattedIp}:${REALITY_PORT}` +
-      `?encryption=none&flow=xtls-rprx-vision&security=reality` +
-      `&sni=${REALITY_DOMAIN}&fp=firefox&pbk=${global.REALITY_PUB_KEY}` +
-      `&type=tcp&headerType=none` +
-      `#${encodeURIComponent(NAME)}`
-    );
-  }
-
-  if (ssActive && PUBLIC_IP) {
-    const ssUserInfo = Buffer.from(`2022-blake3-aes-128-gcm:${SS_PASS}`).toString('base64');
-    links.push(
-      `ss://${ssUserInfo}@${formattedIp}:${SS_PORT}` +
-      `#${encodeURIComponent(NAME)}`
-    );
-  }
-
-  // ───── 新增：Socks5 订阅链接 ─────
-  if (s5Active && PUBLIC_IP) {
-    const s5UserInfo = Buffer.from(`${UUID.substring(0, 8)}:${UUID.slice(-12)}`).toString('base64');
-    links.push(
-      `socks://${s5UserInfo}@${formattedIp}:${S5_PORT}` +
-      `#${encodeURIComponent(NAME)}`
-    );
-  }
-
-  // ───── 新增：AnyTLS 订阅链接 ─────
-  if (anytlsFinal && PUBLIC_IP) {
-    links.push(
-      `anytls://${UUID}@${formattedIp}:${ANYTLS_PORT}` +
-      `?security=tls&sni=www.bing.com&fp=chrome&insecure=1&allowInsecure=1` +
-      `#${encodeURIComponent(NAME)}`
-    );
-  }
-
-  const SUB_BASE64 = Buffer.from(links.join('\n')).toString('base64');
-  global.SUB_CONTENT = SUB_BASE64;
-
-  const SUB_FILE = `${process.cwd()}/sub.txt`;
-  try {
-    fs.writeFileSync(SUB_FILE, SUB_BASE64, { mode: 0o600 });
-    secureFilePermissions(SUB_FILE);
-  } catch {}
+  const isPlaceholderHost = !HOST || HOST === 'your-domain.com';
+  const subDisplayUrl = (DISABLE_ARGO && PUBLIC_IP)
+    ? `http://${formattedIp}:${INBOUND_PORT}${SUB_PATH}`
+    : (!isPlaceholderHost
+      ? `https://${HOST}${SUB_PATH}`
+      : (PUBLIC_IP ? `http://${formattedIp}:${INBOUND_PORT}${SUB_PATH}` : `http://127.0.0.1:${INBOUND_PORT}${SUB_PATH}`));
 
   // ── Telegram Bot 配置推送 ──────────────────
   if (TG_BOT_TOKEN && TG_CHAT_ID) {
     const escapedName  = escapeHtml(NAME);
-    const escapedHost  = escapeHtml(HOST);
-    const escapedSub   = escapeHtml(SUB_PATH);
+    const escapedSub   = escapeHtml(subDisplayUrl);
     const escapedLinks = escapeHtml(links.join('\n\n'));
     let tgText = `🚀 <b>Singbox 服务部署成功</b>\n\n` +
       `📌 <b>服务标识:</b> <code>${escapedName}</code>\n` +
-      `🌐 <b>订阅地址:</b> <code>https://${escapedHost}${escapedSub}</code>\n` +
+      `🌐 <b>订阅地址:</b> <code>${escapedSub}</code>\n` +
       `🕒 <b>更新时间:</b> ${new Date().toLocaleString()}\n\n` +
       `📋 <b>连接链接:</b>\n<pre>${escapedLinks}</pre>`;
 
@@ -1698,7 +1745,7 @@ async function main() {
     console.log('================= 订阅内容 =================');
     console.log(SUB_BASE64);
     console.log('============================================');
-    console.log(`订阅地址: https://${HOST}${SUB_PATH}`);
+    console.log(`订阅地址: ${subDisplayUrl}`);
     console.log(`配置文件: ${SUB_FILE}`);
 
     // 输出已启用协议汇总
@@ -1733,7 +1780,7 @@ async function main() {
         console.log('====================================================');
         console.log(`[系统提示] 初始化阶段已完成（已运行 ${LOG_CLEAR_MINUTES} 分钟），控制台已转入静默模式。`);
         console.log(`启动临时缓存已释放完毕，服务在后台持续稳定运行。`);
-        console.log(`若需获取订阅链接，可访问订阅路径 https://${HOST}${SUB_PATH}。`);
+        console.log(`若需获取订阅链接，可访问订阅路径 ${subDisplayUrl}。`);
         console.log('====================================================');
       }, LOG_CLEAR_MINUTES * 60 * 1000).unref();
     }
