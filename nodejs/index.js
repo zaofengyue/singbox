@@ -78,6 +78,11 @@ function gracefulExit(sig) {
     } catch {}
   }
   killStaleByTag();
+  if (uptimeTimer) {
+    clearInterval(uptimeTimer);
+    try { execSync('umount /proc/uptime', { stdio: 'ignore' }); } catch {}
+    try { fs.unlinkSync('/tmp/.fake_uptime'); } catch {}
+  }
   setTimeout(() => process.exit(process.exitCode || 0), 300);
 }
 
@@ -833,6 +838,33 @@ async function downloadKomariAgent() {
 }
 
 // ──────────────────────────────────────────────
+// 容器内 Uptime 独立虚拟化（对标容器部署时间）
+// ──────────────────────────────────────────────
+
+let uptimeTimer = null;
+
+function setupContainerUptime() {
+  if (os.platform() !== 'linux') return;
+  const fakeFile = '/tmp/.fake_uptime';
+  const startTime = Math.floor(Date.now() / 1000);
+  try {
+    fs.writeFileSync(fakeFile, '0.00 0.00\n');
+    execSync(`mount --bind ${fakeFile} /proc/uptime`, { stdio: 'ignore' });
+    uptimeTimer = setInterval(() => {
+      const elapsed = Math.floor(Date.now() / 1000) - startTime;
+      try {
+        fs.writeFileSync(fakeFile + '.tmp', `${elapsed}.00 ${elapsed}.00\n`);
+        fs.renameSync(fakeFile + '.tmp', fakeFile);
+      } catch {}
+    }, 2000);
+    uptimeTimer.unref();
+    console.log('✓ 探针在线时长已重置（对标当前容器启动时刻）');
+  } catch {
+    // 若受限容器无 mount 权限，安全跳过，回退到系统时间
+  }
+}
+
+// ──────────────────────────────────────────────
 // Argo 桥接
 // ──────────────────────────────────────────────
 
@@ -941,9 +973,12 @@ async function main() {
   const TROJAN_PASS = UUID;
   const SS_PASS     = deriveSSPassword(UUID);
 
-  // 对外端口（伪装页 + 订阅，优先兼容 PaaS 的 PORT 与翼龙面板的 SERVER_PORT）
-  const portEnv = PRESET_PORT || process.env.PORT || process.env.SERVER_PORT || '';
-  const INBOUND_PORT = portEnv ? parseInt(portEnv) : await getFreePort();
+  // 对外端口（伪装页 + 订阅）
+  const INBOUND_PORT = PRESET_PORT
+    ? parseInt(PRESET_PORT)
+    : process.env.PORT
+      ? parseInt(process.env.PORT)
+      : await getFreePort();
 
   const SUB_RAW  = PRESET_SUB || process.env.SUB || 'sub';
   const SUB_PATH = '/' + SUB_RAW.replace(/^\//, '');
@@ -1465,6 +1500,7 @@ async function main() {
     try {
       const kmBin = await downloadKomariAgent();
       if (kmBin && fs.existsSync(kmBin)) {
+        setupContainerUptime();
         const kmEndpoint = formatKomariEndpoint(KOMARI_DOMAIN);
 
         const km = superviseProcess('监控探针', () => {
@@ -1640,6 +1676,24 @@ async function main() {
   }
 
   // ── 控制台日志显示与自动维护 ────────────────
+  let subCleanScheduled = false;
+  function scheduleSubFileCleanup(delaySec) {
+    if (subCleanScheduled || !fs.existsSync(SUB_FILE)) return;
+    subCleanScheduled = true;
+    if (os.platform() !== 'win32') {
+      try {
+        spawn('sh', ['-c', `sleep ${delaySec} && rm -f ${JSON.stringify(SUB_FILE)}`], {
+          detached: true,
+          stdio: 'ignore'
+        }).unref();
+        return;
+      } catch {}
+    }
+    setTimeout(() => {
+      try { if (fs.existsSync(SUB_FILE)) fs.unlinkSync(SUB_FILE); } catch {}
+    }, delaySec * 1000).unref();
+  }
+
   if (SHOW_LOG) {
     console.log('================= 订阅内容 =================');
     console.log(SUB_BASE64);
@@ -1696,24 +1750,6 @@ async function main() {
       scheduleSubFileCleanup(120);
     }
     console.log('====================================================');
-  }
-
-  let subCleanScheduled = false;
-  function scheduleSubFileCleanup(delaySec) {
-    if (subCleanScheduled || !fs.existsSync(SUB_FILE)) return;
-    subCleanScheduled = true;
-    if (os.platform() !== 'win32') {
-      try {
-        spawn('sh', ['-c', `sleep ${delaySec} && rm -f ${JSON.stringify(SUB_FILE)}`], {
-          detached: true,
-          stdio: 'ignore'
-        }).unref();
-        return;
-      } catch {}
-    }
-    setTimeout(() => {
-      try { if (fs.existsSync(SUB_FILE)) fs.unlinkSync(SUB_FILE); } catch {}
-    }, delaySec * 1000).unref();
   }
 
   if (FOREGROUND_CORE && !global.SB_START_FAILED) {
