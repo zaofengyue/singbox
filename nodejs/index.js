@@ -347,7 +347,8 @@ function existingBinaryIsHealthy(filePath, kind, minSize = 1 << 20, testArgs = n
       }
       try {
         const res = spawnSync(filePath, testArgs, { timeout: 5000, stdio: 'ignore' });
-        if (res.error || (typeof res.status === 'number' && res.status !== 0)) {
+        if (res.error) return false;
+        if (typeof res.status === 'number' && ![0, 1, 2].includes(res.status)) {
           return false;
         }
       } catch {
@@ -423,7 +424,7 @@ function launchWithLog(bin, args, opts, logFile) {
   try {
     return spawn(bin, args, { ...opts, stdio: ['ignore', fd, fd] });
   } finally {
-    fs.closeSync(fd);
+    try { fs.closeSync(fd); } catch {}
   }
 }
 
@@ -940,12 +941,9 @@ async function main() {
   const TROJAN_PASS = UUID;
   const SS_PASS     = deriveSSPassword(UUID);
 
-  // 对外端口（伪装页 + 订阅）
-  const INBOUND_PORT = PRESET_PORT
-    ? parseInt(PRESET_PORT)
-    : process.env.PORT
-      ? parseInt(process.env.PORT)
-      : await getFreePort();
+  // 对外端口（伪装页 + 订阅，优先兼容 PaaS 的 PORT 与翼龙面板的 SERVER_PORT）
+  const portEnv = PRESET_PORT || process.env.PORT || process.env.SERVER_PORT || '';
+  const INBOUND_PORT = portEnv ? parseInt(portEnv) : await getFreePort();
 
   const SUB_RAW  = PRESET_SUB || process.env.SUB || 'sub';
   const SUB_PATH = '/' + SUB_RAW.replace(/^\//, '');
@@ -1377,8 +1375,7 @@ async function main() {
 
   const sbEnv = { ...process.env };
   delete sbEnv.PORT;
-  if (!sbEnv.GOMEMLIMIT) sbEnv.GOMEMLIMIT = '15MiB';
-  if (!sbEnv.GOGC) sbEnv.GOGC = '50';
+  delete sbEnv.SERVER_PORT;
 
   if (!global.SB_START_FAILED) {
     if (!FOREGROUND_CORE) {
