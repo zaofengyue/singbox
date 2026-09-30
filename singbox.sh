@@ -911,7 +911,8 @@ do_menu() {
     echo -e "${WHITE}6. 修改配置${RESET}"
     echo -e "${WHITE}7. 出口设置${RESET}"
     echo -e "${WHITE}8. 域名证书${RESET}"
-    echo -e "${WHITE}0. 退出${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}0. 退出脚本${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -ne "${GRAY}请输入选项: ${RESET}"
     read -r opt
@@ -1017,14 +1018,14 @@ menu_config() {
     clear
     echo -e "${GREEN}======= 修改配置 =======${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
-    echo -e "${WHITE}1. 修改UUID${RESET}"
-    echo -e "${WHITE}2. Argo隧道管理${RESET}"
-    echo -e "${WHITE}3. 修改协议端口${RESET}"
-    echo -e "${WHITE}4. 域名证书绑定${RESET}"
-    echo -e "${WHITE}5. 添加多端口${RESET}"
+    echo -e "${WHITE}1. UUID${RESET}"
+    echo -e "${WHITE}2. 隧道管理${RESET}"
+    echo -e "${WHITE}3. 协议端口${RESET}"
+    echo -e "${WHITE}4. 证书绑定${RESET}"
+    echo -e "${WHITE}5. 多端口${RESET}"
     echo -e "${WHITE}6. 端口跳跃${RESET}"
     echo -e "${WHITE}7. Komari探针${RESET}"
-    echo -e "${WHITE}8. 网络与IP设置 (出入站)${RESET}"
+    echo -e "${WHITE}8. 网络与IP设置${RESET}"
     echo -e "${WHITE}0. 返回${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -ne "${GRAY}请输入选项: ${RESET}"
@@ -1051,15 +1052,15 @@ config_ip_domain() {
   cur_v=$(get_val IP_VERSION)
   cur_dom=$(get_val SERVER_DOMAIN)
   cur_pip=$(get_val PUBLIC_IP)
-  echo -e "${GRAY}当前出栈 IP 栈偏好: ${CYAN}${cur_v:-4 (IPv4优先)}${RESET}"
+  echo -e "${GRAY}当前出栈 IP 偏好:   ${CYAN}${cur_v:-4 (IPv4优先)}${RESET}"
   echo -e "${GRAY}当前全局连接域名:   ${CYAN}${cur_dom:-未设置 (使用节点IP)}${RESET}"
   echo -e "${GRAY}自定义入站公网 IP:  ${CYAN}${cur_pip:-自动探测}${RESET}"
   if [ -n "$cur_dom" ]; then
     echo -e "${YELLOW}提示: 当前已配置全局连接域名，直连节点地址优先由该域名接管。${RESET}"
   fi
   echo -e "${GRAY}--------------------------------${RESET}"
-  echo -e "${WHITE}1. 设置 IP 栈出栈偏好 (4: IPv4优先 | 6: IPv6优先 | auto: 自动)${RESET}"
-  echo -e "${WHITE}2. 修改全局连接域名 (最高优先级，输入 0 清除恢复使用 IP)${RESET}"
+  echo -e "${WHITE}1. 设置 IP 出栈偏好 (4: IPv4优先 | 6: IPv6优先 | auto: 自动)${RESET}"
+  echo -e "${WHITE}2. 修改全局连接域名 (输入 0 清除恢复使用 IP)${RESET}"
   echo -e "${WHITE}3. 手动指定入站公网 IP (输入 0 清除恢复自动探测)${RESET}"
   echo -e "${WHITE}0. 返回${RESET}"
   read -p "选项: " opt
@@ -1120,21 +1121,31 @@ config_uuid() {
   cur=$(get_val UUID)
   echo -e "${GRAY}当前: ${CYAN}${cur:-未设置}${RESET}"
   echo -e "${GRAY}--------------------------------${RESET}"
-  echo -e "${WHITE}新 UUID（留空自动生成，回车确认）:${RESET}"
-  read -r new_uuid
-  if [ -z "$new_uuid" ]; then
-    new_uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null || od -x /dev/urandom | head -1 | awk '{print $2$3"-"$4"-"$5"-"$6"-"$7$8$9}')
-  fi
-  echo -e "${YELLOW}⚠ 修改后将删除 reality-keys.txt 并重启服务${RESET}"
-  echo -ne "${GRAY}确认修改为 $new_uuid 并重启? [y/N]: ${RESET}"
-  read -r confirm
-  if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-    set_val UUID "$new_uuid"
-    rm -f "$REALITY_KEY_FILE"
-    do_restart
-    echo -e "${GREEN}UUID 已更新${RESET}"
-    press_any_key
-  fi
+  echo -e "${WHITE}1. 生成/输入新 UUID${RESET}"
+  echo -e "${WHITE}0. 返回${RESET}"
+  echo -e "${GRAY}--------------------------------${RESET}"
+  echo -ne "${GRAY}请输入选项: ${RESET}"
+  read -r opt
+  case "$opt" in
+    1)
+      echo -e "${WHITE}新 UUID（留空自动生成，回车确认）:${RESET}"
+      read -r new_uuid
+      if [ -z "$new_uuid" ]; then
+        new_uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null || od -x /dev/urandom | head -1 | awk '{print $2$3"-"$4"-"$5"-"$6"-"$7$8$9}')
+      fi
+      echo -e "${YELLOW}⚠ 修改后将删除 reality-keys.txt 并重启服务${RESET}"
+      echo -ne "${GRAY}确认修改为 $new_uuid 并重启? [y/N]: ${RESET}"
+      read -r confirm
+      if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        set_val UUID "$new_uuid"
+        rm -f "$REALITY_KEY_FILE"
+        do_restart
+        echo -e "${GREEN}UUID 已更新${RESET}"
+        press_any_key
+      fi
+      ;;
+    0|*) return ;;
+  esac
 }
 
 config_argo() {
@@ -1150,20 +1161,20 @@ config_argo() {
     cur_cf=$(get_val CF_PREFER_HOST)
 
     if [ "$cur_disable" = "true" ]; then
-      echo -e "${GRAY}当前: ${RED}已禁用${RESET}"
+      echo -e "${GRAY}当前模式: ${RED}已禁用${RESET}"
     elif [ -n "$cur_domain" ] && [ -n "$cur_auth" ]; then
-      echo -e "${GRAY}当前: ${CYAN}固定隧道 ($cur_domain)${RESET}"
+      echo -e "${GRAY}当前模式: ${CYAN}固定隧道 ($cur_domain)${RESET}"
     else
-      echo -e "${GRAY}当前: ${CYAN}临时隧道${RESET}"
+      echo -e "${GRAY}当前模式: ${CYAN}临时隧道${RESET}"
     fi
     echo -e "${GRAY}连接协议: ${CYAN}${cur_protocol:-http2(默认)}${RESET}"
     echo -e "${GRAY}CF 优选:  ${CYAN}${cur_cf:-www.visa.com.tw(默认)}${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
-    echo -e "${WHITE}1. 切换为临时隧道${RESET}"
-    echo -e "${WHITE}2. 配置固定隧道${RESET}"
+    echo -e "${WHITE}1. 临时隧道${RESET}"
+    echo -e "${WHITE}2. 固定隧道${RESET}"
     echo -e "${WHITE}3. 禁用 Argo${RESET}"
     echo -e "${WHITE}4. 切换连接协议 (http2/quic/auto)${RESET}"
-    echo -e "${WHITE}5. 修改 CF 优选域名/IP (输入 0 恢复默认)${RESET}"
+    echo -e "${WHITE}5. 优选域名/IP (输入 0 恢复默认)${RESET}"
     echo -e "${WHITE}0. 返回${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -ne "${GRAY}请输入选项: ${RESET}"
@@ -1237,14 +1248,14 @@ config_proto() {
     anytls=$(get_val ANYTLS_PORT)
 
     echo -e "${GRAY}--------------------------------${RESET}"
-    echo -e "${WHITE}1. Hysteria2    (UDP) [${CYAN}${hy2:-未启用}${WHITE}]${RESET}"
-    echo -e "${WHITE}2. TUIC         (UDP) [${CYAN}${tuic:-未启用}${WHITE}]${RESET}"
-    echo -e "${WHITE}3. VLESS Reality(TCP) [${CYAN}${reality:-未启用}${WHITE}]${RESET}"
-    echo -e "${WHITE}4. Reality 伪装域名   [${CYAN}${reality_domain:-www.iij.ad.jp}${WHITE}]${RESET}"
-    echo -e "${WHITE}5. Shadowsocks  (TCP) [${CYAN}${ss:-未启用}${WHITE}]${RESET}"
-    echo -e "${WHITE}6. SOCKS5  (TCP/UDP)  [${CYAN}${socks5:-未启用}${WHITE}]${RESET}"
-    echo -e "${WHITE}7. Trojan       (TCP) [${CYAN}${trojan:-未启用}${WHITE}]${RESET}"
-    echo -e "${WHITE}8. AnyTLS       (TCP) [${CYAN}${anytls:-未启用}${WHITE}]${RESET}"
+    echo -e "${WHITE}1. Hysteria2       (UDP)      [${CYAN}${hy2:-未启用}${WHITE}]${RESET}"
+    echo -e "${WHITE}2. TUIC            (UDP)      [${CYAN}${tuic:-未启用}${WHITE}]${RESET}"
+    echo -e "${WHITE}3. VLESS Reality   (TCP)      [${CYAN}${reality:-未启用}${WHITE}]${RESET}"
+    echo -e "${WHITE}4. Reality 伪装域名           [${CYAN}${reality_domain:-www.iij.ad.jp}${WHITE}]${RESET}"
+    echo -e "${WHITE}5. Shadowsocks     (TCP)      [${CYAN}${ss:-未启用}${WHITE}]${RESET}"
+    echo -e "${WHITE}6. SOCKS5          (TCP/UDP)  [${CYAN}${socks5:-未启用}${WHITE}]${RESET}"
+    echo -e "${WHITE}7. Trojan          (TCP)      [${CYAN}${trojan:-未启用}${WHITE}]${RESET}"
+    echo -e "${WHITE}8. AnyTLS          (TCP)      [${CYAN}${anytls:-未启用}${WHITE}]${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -e "${WHITE}0. 确认并重启${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
@@ -1363,45 +1374,93 @@ config_cert_bind() {
 
 config_extraports() {
   clear
-  echo -e "${GREEN}======= 添加多端口 =======${RESET}"
-  local hy2 tuic
+  echo -e "${GREEN}======= 多端口管理 =======${RESET}"
+  local hy2 tuic cur_hy2_extra cur_tuic_extra
   hy2=$(get_val HY2_PORT); tuic=$(get_val TUIC_PORT)
   if [ -z "$hy2" ] && [ -z "$tuic" ]; then
     echo -e "${YELLOW}当前没有已启用的 HY2/TUIC，请先在「修改协议端口」里开启${RESET}"
     press_any_key; return
   fi
-  if [ -n "$hy2" ]; then
-    echo -ne "Hysteria2 额外端口(逗号分隔，留空清除)[当前: $(get_val HY2_EXTRA_PORTS)]: "
-    read -r val; set_val HY2_EXTRA_PORTS "$val"
-  fi
-  if [ -n "$tuic" ]; then
-    echo -ne "TUIC 额外端口(逗号分隔，留空清除)[当前: $(get_val TUIC_EXTRA_PORTS)]: "
-    read -r val2; set_val TUIC_EXTRA_PORTS "$val2"
-  fi
-  do_restart
-  press_any_key
+  cur_hy2_extra="$(get_val HY2_EXTRA_PORTS)"
+  cur_tuic_extra="$(get_val TUIC_EXTRA_PORTS)"
+  echo -e "${GRAY}Hysteria2 额外端口: ${CYAN}${cur_hy2_extra:-未配置}${RESET}"
+  echo -e "${GRAY}TUIC      额外端口: ${CYAN}${cur_tuic_extra:-未配置}${RESET}"
+  echo -e "${GRAY}--------------------------------${RESET}"
+  echo -e "${WHITE}1. 设置 Hysteria2 额外端口${RESET}"
+  echo -e "${WHITE}2. 设置 TUIC 额外端口${RESET}"
+  echo -e "${WHITE}0. 返回${RESET}"
+  echo -e "${GRAY}--------------------------------${RESET}"
+  echo -ne "${GRAY}请输入选项: ${RESET}"
+  read -r opt
+  case "$opt" in
+    1)
+      if [ -n "$hy2" ]; then
+        echo -ne "Hysteria2 额外端口(逗号分隔，留空清除)[当前: ${cur_hy2_extra:-未配置}]: "
+        read -r val; set_val HY2_EXTRA_PORTS "$val"
+        do_restart; press_any_key
+      else
+        echo -e "${YELLOW}当前未启用 Hysteria2 主端口${RESET}"
+        press_any_key
+      fi
+      ;;
+    2)
+      if [ -n "$tuic" ]; then
+        echo -ne "TUIC 额外端口(逗号分隔，留空清除)[当前: ${cur_tuic_extra:-未配置}]: "
+        read -r val2; set_val TUIC_EXTRA_PORTS "$val2"
+        do_restart; press_any_key
+      else
+        echo -e "${YELLOW}当前未启用 TUIC 主端口${RESET}"
+        press_any_key
+      fi
+      ;;
+    0|*) return ;;
+  esac
 }
 
 config_hop() {
   clear
   echo -e "${GREEN}======= 端口跳跃 =======${RESET}"
-  echo -e "${YELLOW}提示：需 root + nftables/iptables${RESET}"
-  local hy2 tuic
+  echo -e "${YELLOW}提示: 需 root 权限 + nftables/iptables${RESET}"
+  local hy2 tuic cur_hy2_hop cur_tuic_hop
   hy2=$(get_val HY2_PORT); tuic=$(get_val TUIC_PORT)
   if [ -z "$hy2" ] && [ -z "$tuic" ]; then
     echo -e "${YELLOW}当前没有已启用的 HY2/TUIC，请先在「修改协议端口」里开启${RESET}"
     press_any_key; return
   fi
-  if [ -n "$hy2" ]; then
-    echo -ne "Hysteria2 范围(如 20000-30000)[当前: $(get_val HY2_HOP_RANGE)]: "
-    read -r val; set_val HY2_HOP_RANGE "$val"
-  fi
-  if [ -n "$tuic" ]; then
-    echo -ne "TUIC 范围(如 20000-30000)[当前: $(get_val TUIC_HOP_RANGE)]: "
-    read -r val2; set_val TUIC_HOP_RANGE "$val2"
-  fi
-  do_restart
-  press_any_key
+  cur_hy2_hop="$(get_val HY2_HOP_RANGE)"
+  cur_tuic_hop="$(get_val TUIC_HOP_RANGE)"
+  echo -e "${GRAY}Hysteria2 跳跃范围: ${CYAN}${cur_hy2_hop:-未配置}${RESET}"
+  echo -e "${GRAY}TUIC      跳跃范围: ${CYAN}${cur_tuic_hop:-未配置}${RESET}"
+  echo -e "${GRAY}--------------------------------${RESET}"
+  echo -e "${WHITE}1. 设置 Hysteria2 跳跃范围${RESET}"
+  echo -e "${WHITE}2. 设置 TUIC 跳跃范围${RESET}"
+  echo -e "${WHITE}0. 返回${RESET}"
+  echo -e "${GRAY}--------------------------------${RESET}"
+  echo -ne "${GRAY}请输入选项: ${RESET}"
+  read -r opt
+  case "$opt" in
+    1)
+      if [ -n "$hy2" ]; then
+        echo -ne "Hysteria2 范围(如 20000-30000)[当前: ${cur_hy2_hop:-未配置}]: "
+        read -r val; set_val HY2_HOP_RANGE "$val"
+        do_restart; press_any_key
+      else
+        echo -e "${YELLOW}当前未启用 Hysteria2 主端口${RESET}"
+        press_any_key
+      fi
+      ;;
+    2)
+      if [ -n "$tuic" ]; then
+        echo -ne "TUIC 范围(如 20000-30000)[当前: ${cur_tuic_hop:-未配置}]: "
+        read -r val2; set_val TUIC_HOP_RANGE "$val2"
+        do_restart; press_any_key
+      else
+        echo -e "${YELLOW}当前未启用 TUIC 主端口${RESET}"
+        press_any_key
+      fi
+      ;;
+    0|*) return ;;
+  esac
 }
 
 config_komari() {
@@ -1572,11 +1631,12 @@ menu_domain_cert() {
     echo -e "${GRAY}已签发/导入证书:${RESET} ${CYAN}${certs:-无}${RESET}"
     echo -e "${GRAY}当前连接域名:${RESET}   ${CYAN}${_s_dom:-使用公网IP}${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
-    echo -e "${WHITE}1. 申请新域名证书 (HTTP-01)${RESET}"
-    echo -e "${WHITE}2. 手动导入已有证书${RESET}"
+    echo -e "${WHITE}1. 申请域名证书${RESET}"
+    echo -e "${WHITE}2. 导入已有证书${RESET}"
     echo -e "${WHITE}3. 续期指定证书${RESET}"
-    echo -e "${WHITE}4. 删除证书${RESET}"
+    echo -e "${WHITE}4. 删除域名证书${RESET}"
     echo -e "${WHITE}0. 返回${RESET}"
+    echo -e "${GRAY}--------------------------------${RESET}"
     read -p "选项: " opt
     case "$opt" in
       1)
@@ -1691,21 +1751,21 @@ menu_domain_cert() {
 do_edit() {
   load_env_file
   echo -e "${GREEN}========== 修改配置 (直接回车保留原值) ==========${NC}"
-  read -p "UUID         [${UUID:-自动生成}]: "          IN_UUID
-  read -p "NAME         [${NAME:-自动识别}]: "          IN_NAME
-  read -p "ARGO_DOMAIN  [${ARGO_DOMAIN:-临时隧道}]: "   IN_ARGO_DOMAIN
-  read -p "ARGO_AUTH    [${ARGO_AUTH:+已设置}]: "       IN_ARGO_AUTH
-  read -p "DISABLE_ARGO [${DISABLE_ARGO:-false}]: "     IN_DISABLE_ARGO
-  read -p "HY2_PORT     [${HY2_PORT:-未启用}]: "        IN_HY2_PORT
-  read -p "TUIC_PORT    [${TUIC_PORT:-未启用}]: "       IN_TUIC_PORT
-  read -p "REALITY_PORT [${REALITY_PORT:-未启用}]: "    IN_REALITY_PORT
-  read -p "REALITY_DOMAIN [${REALITY_DOMAIN:-www.iij.ad.jp}]: " IN_REALITY_DOMAIN
-  read -p "SS_PORT      [${SS_PORT:-未启用}]: "         IN_SS_PORT
-  read -p "SOCKS5_PORT  [${SOCKS5_PORT:-未启用}]: "     IN_SOCKS5_PORT
-  read -p "TROJAN_PORT  [${TROJAN_PORT:-未启用}]: "     IN_TROJAN_PORT
-  read -p "ANYTLS_PORT  [${ANYTLS_PORT:-未启用}]: "     IN_ANYTLS_PORT
-  read -p "KOMARI_DOMAIN[${KOMARI_DOMAIN:-未启用}]: "   IN_KOMARI_DOMAIN
-  read -p "KOMARI_TOKEN [${KOMARI_TOKEN:+已设置}]: "     IN_KOMARI_TOKEN
+  read -p "UUID            [${UUID:-自动生成}]: "          IN_UUID
+  read -p "NAME            [${NAME:-自动识别}]: "          IN_NAME
+  read -p "ARGO_DOMAIN     [${ARGO_DOMAIN:-临时隧道}]: "   IN_ARGO_DOMAIN
+  read -p "ARGO_AUTH       [${ARGO_AUTH:+已设置}]: "       IN_ARGO_AUTH
+  read -p "DISABLE_ARGO    [${DISABLE_ARGO:-false}]: "     IN_DISABLE_ARGO
+  read -p "HY2_PORT        [${HY2_PORT:-未启用}]: "        IN_HY2_PORT
+  read -p "TUIC_PORT       [${TUIC_PORT:-未启用}]: "       IN_TUIC_PORT
+  read -p "REALITY_PORT    [${REALITY_PORT:-未启用}]: "    IN_REALITY_PORT
+  read -p "REALITY_DOMAIN  [${REALITY_DOMAIN:-www.iij.ad.jp}]: " IN_REALITY_DOMAIN
+  read -p "SS_PORT         [${SS_PORT:-未启用}]: "         IN_SS_PORT
+  read -p "SOCKS5_PORT     [${SOCKS5_PORT:-未启用}]: "     IN_SOCKS5_PORT
+  read -p "TROJAN_PORT     [${TROJAN_PORT:-未启用}]: "     IN_TROJAN_PORT
+  read -p "ANYTLS_PORT     [${ANYTLS_PORT:-未启用}]: "     IN_ANYTLS_PORT
+  read -p "KOMARI_DOMAIN   [${KOMARI_DOMAIN:-未启用}]: "   IN_KOMARI_DOMAIN
+  read -p "KOMARI_TOKEN    [${KOMARI_TOKEN:+已设置}]: "     IN_KOMARI_TOKEN
 
   [ -n "$IN_UUID" ] && set_val UUID "$IN_UUID"
   [ -n "$IN_NAME" ] && set_val NAME "$IN_NAME"
