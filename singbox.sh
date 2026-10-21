@@ -60,6 +60,7 @@ UUID_FILE="$STATE_DIR/uuid.txt"
 CONFIG_FILE="$STATE_DIR/sb-config.json"
 REALITY_KEY_FILE="$STATE_DIR/reality-keys.txt"
 OUTBOUND_FILE="$STATE_DIR/outbound.conf"
+WARP_CONF="$STATE_DIR/warp.conf"
 CERT_DIR="$STATE_DIR/certs"
 DOMAIN_CERT_DIR="$STATE_DIR/domain-certs"
 ACME_HOME="$STATE_DIR/acme.sh"
@@ -70,6 +71,9 @@ SB_DIR="$BIN_DIR/singbox"
 SB_BIN="$SB_DIR/sing-box"
 CF_BIN="$BIN_DIR/cloudflared"
 KM_BIN="$BIN_DIR/komari-agent"
+TURN2SOCKS_BIN="$BIN_DIR/turn2socks"
+TURN2SOCKS_PID="$APP_DIR/turn2socks.pid"
+TURN2SOCKS_LOG="$APP_DIR/turn2socks.log"
 
 USED_PORTS_FILE="$STATE_DIR/used-ports.txt"
 
@@ -352,6 +356,97 @@ download_komari() {
   return 1
 }
 
+download_turn2socks() {
+  detect_arch
+  if ! _ensure_bin_dir_safe "$BIN_DIR" || [ ! -w "$BIN_DIR" ]; then
+    BIN_DIR="$HOME_DIR/sb-bin"
+    TURN2SOCKS_BIN="$BIN_DIR/turn2socks"
+    mkdir -p "$BIN_DIR"
+    chmod 700 "$BIN_DIR" 2>/dev/null || true
+  fi
+  if [ -x "$TURN2SOCKS_BIN" ]; then
+    return 0
+  fi
+  # 优先尝试从本地源码构建（若存在源码且系统装有 go）
+  local _src_dir=""
+  if [ -d "$APP_DIR/turn2socks" ]; then
+    _src_dir="$APP_DIR/turn2socks"
+  elif [ -d "$(dirname "$0")/turn2socks" ]; then
+    _src_dir="$(dirname "$0")/turn2socks"
+  fi
+  if [ -n "$_src_dir" ] && command -v go >/dev/null 2>&1; then
+    log "检测到本地 Go 环境，正在编译 turn2socks..."
+    if (cd "$_src_dir" && CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o "$TURN2SOCKS_BIN" .) >/dev/null 2>&1; then
+      chmod +x "$TURN2SOCKS_BIN" 2>/dev/null || true
+      if [ -x "$TURN2SOCKS_BIN" ]; then
+        log "turn2socks 本地编译成功"
+        return 0
+      fi
+    fi
+  fi
+  local _t2s_arch="amd64"
+  [ "$SB_ARCH" = "arm64" ] && _t2s_arch="arm64"
+  log "正在检查/下载 turn2socks 二进制 (${_t2s_arch})..."
+  if dl "https://github.com/zaofengyue/singbox/releases/latest/download/turn2socks-linux-${_t2s_arch}" "$TURN2SOCKS_BIN"; then
+    chmod +x "$TURN2SOCKS_BIN" 2>/dev/null || true
+    if [ -x "$TURN2SOCKS_BIN" ]; then
+      log "turn2socks 下载完成"
+      return 0
+    fi
+    rm -f "$TURN2SOCKS_BIN"
+  fi
+  warn "turn2socks 下载或编译失败"
+  return 1
+}
+
+stop_turn2socks() {
+  if [ -f "$TURN2SOCKS_PID" ]; then
+    local _p
+    _p="$(cat "$TURN2SOCKS_PID" 2>/dev/null)"
+    [ -n "$_p" ] && kill "$_p" 2>/dev/null || true
+    rm -f "$TURN2SOCKS_PID" 2>/dev/null || true
+  fi
+  pkill -x "turn2socks" 2>/dev/null || true
+}
+
+start_turn2socks() {
+  [ -f "$OUTBOUND_FILE" ] || return 0
+  local _type _addr _port _user _pass _lport
+  _type="$(grep '^TYPE=' "$OUTBOUND_FILE" 2>/dev/null | cut -d'=' -f2-)"
+  [ "$_type" = "turn" ] || return 0
+  _addr="$(grep '^ADDR=' "$OUTBOUND_FILE" 2>/dev/null | cut -d'=' -f2-)"
+  _port="$(grep '^PORT=' "$OUTBOUND_FILE" 2>/dev/null | cut -d'=' -f2-)"
+  _user="$(grep '^USER=' "$OUTBOUND_FILE" 2>/dev/null | cut -d'=' -f2-)"
+  _pass="$(grep '^PASS=' "$OUTBOUND_FILE" 2>/dev/null | cut -d'=' -f2-)"
+  _lport="$(grep '^LOCAL_PORT=' "$OUTBOUND_FILE" 2>/dev/null | cut -d'=' -f2-)"
+  [ -z "$_lport" ] && _lport=10808
+  [ -z "$_addr" ] && return 0
+  [ -z "$_port" ] && _port=3478
+
+  stop_turn2socks
+  if [ ! -x "$TURN2SOCKS_BIN" ]; then
+    download_turn2socks || { warn "无法启动 turn2socks: 二进制不存在"; return 1; }
+  fi
+
+  local _args=(-listen "127.0.0.1:${_lport}" -turn "${_addr}:${_port}")
+  [ -n "$_user" ] && _args+=(-user "$_user")
+  [ -n "$_pass" ] && _args+=(-pass "$_pass")
+
+  nohup "$TURN2SOCKS_BIN" "${_args[@]}" >> "$TURN2SOCKS_LOG" 2>&1 &
+  local _pid=$!
+  echo "$_pid" > "$TURN2SOCKS_PID"
+  sleep 1
+  if kill -0 "$_pid" 2>/dev/null; then
+    log "turn2socks 出口桥接已启动 (PID: $_pid, 监听 127.0.0.1:${_lport})"
+    T2S_PID="$_pid"
+    T2S_ACTIVE=1
+    return 0
+  else
+    warn "turn2socks 启动失败，请检查 $TURN2SOCKS_LOG"
+    return 1
+  fi
+}
+
 b64() {
   printf '%s' "$1" | base64 -w0 2>/dev/null || printf '%s' "$1" | base64 | tr -d '\n'
 }
@@ -567,6 +662,7 @@ do_stop() {
   pkill -x "sing-box"             2>/dev/null || true
   pkill -x "cloudflared"          2>/dev/null || true
   pkill -x "komari-agent"         2>/dev/null || true
+  stop_turn2socks                 2>/dev/null || true
   echo -e "${GREEN}服务已停止${RESET}"
 }
 
@@ -1541,15 +1637,145 @@ menu_update() {
   press_any_key
 }
 
+prompt_route_mode() {
+  echo -e "\n${WHITE}请选择出口分流模式:${RESET}"
+  echo -e "  ${CYAN}1.${RESET} 全局代理 (全部流量走该出口) [默认]"
+  echo -e "  ${CYAN}2.${RESET} 智能分流 (仅 ChatGPT/Claude/Netflix/Disney+/Spotify/TikTok 等 AI 与流媒体域名走该出口，其余直连)"
+  read -p "请选择分流模式 [1-2, 默认 1]: " _rmode_opt
+  case "$_rmode_opt" in
+    2) printf 'split' ;;
+    *) printf 'global' ;;
+  esac
+}
+
+setup_warp_outbound() {
+  clear
+  echo -e "${GREEN}======= 设置 WARP 出口 =======${RESET}"
+  local need_reg=1
+  if [ -f "$WARP_CONF" ]; then
+    local old_v4 old_v6
+    old_v4="$(grep '^IPV4=' "$WARP_CONF" 2>/dev/null | cut -d'=' -f2-)"
+    old_v6="$(grep '^IPV6=' "$WARP_CONF" 2>/dev/null | cut -d'=' -f2-)"
+    echo -e "检测到已保存的 WARP 凭据 (IPv4: ${CYAN}${old_v4:-未知}${RESET}, IPv6: ${CYAN}${old_v6:-未知}${RESET})"
+    echo -e "${WHITE}1. 使用已保存凭据  2. 重新注册生成新账号  0. 取消${RESET}"
+    read -p "选项 [默认 1]: " warp_opt
+    warp_opt="${warp_opt:-1}"
+    case "$warp_opt" in
+      1) need_reg=0 ;;
+      2) need_reg=1 ;;
+      *) return ;;
+    esac
+  fi
+
+  if [ "$need_reg" = "1" ]; then
+    echo -e "${YELLOW}正在生成 WireGuard 密钥对...${RESET}"
+    [ -x "$SB_BIN" ] || download_singbox || { warn "sing-box 二进制未就绪，无法生成密钥"; return 1; }
+    local keypair priv_key pub_key
+    keypair="$("$SB_BIN" generate wg-keypair 2>/dev/null || true)"
+    priv_key="$(echo "$keypair" | grep -i 'PrivateKey:' | head -1 | awk '{print $2}')"
+    pub_key="$(echo "$keypair" | grep -i 'PublicKey:' | head -1 | awk '{print $2}')"
+
+    if [ -z "$priv_key" ] || [ -z "$pub_key" ]; then
+      warn "自动生成密钥失败，请手动输入："
+      read -p "WireGuard 私钥 (PrivateKey): " priv_key
+      read -p "WireGuard 公钥 (PublicKey): " pub_key
+    fi
+    [ -z "$priv_key" ] || [ -z "$pub_key" ] && { warn "私钥或公钥为空，操作取消"; return 1; }
+
+    echo -e "${YELLOW}正在向 Cloudflare 官方 API 注册设备凭据...${RESET}"
+    local reg_url="https://api.cloudflareclient.com/v0a2158/reg"
+    local tos
+    tos="$(date -u +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+    local post_data
+    post_data="{\"key\":\"${pub_key}\",\"install_id\":\"\",\"fcm_token\":\"\",\"tos\":\"${tos}\",\"model\":\"PC\",\"type\":\"Android\",\"locale\":\"zh_CN\"}"
+    local resp
+    if command -v curl >/dev/null 2>&1; then
+      resp="$(curl -s -X POST "$reg_url" \
+        -H "Content-Type: application/json; charset=UTF-8" \
+        -H "User-Agent: okhttp/3.12.1" \
+        -d "$post_data" 2>/dev/null || true)"
+    else
+      resp="$(wget -q -O- --header="Content-Type: application/json; charset=UTF-8" \
+        --header="User-Agent: okhttp/3.12.1" \
+        --post-data="$post_data" "$reg_url" 2>/dev/null || true)"
+    fi
+
+    local v4 v6 peer_pub client_id
+    v4="$(echo "$resp" | grep -o '"v4": *"[^"]*"' | head -1 | cut -d'"' -f4)"
+    v6="$(echo "$resp" | grep -o '"v6": *"[^"]*"' | head -1 | cut -d'"' -f4)"
+    peer_pub="$(echo "$resp" | grep -o '"public_key": *"[^"]*"' | head -1 | cut -d'"' -f4)"
+    client_id="$(echo "$resp" | grep -o '"client_id": *"[^"]*"' | head -1 | cut -d'"' -f4)"
+
+    if [ -z "$v4" ]; then
+      warn "Cloudflare API 注册失败，返回内容："
+      echo "$resp" | head -n 5
+      return 1
+    fi
+
+    local reserved="0, 0, 0"
+    if [ -n "$client_id" ]; then
+      local _dec=""
+      if command -v python3 >/dev/null 2>&1; then
+        _dec="$(python3 -c "import base64,sys; b=base64.b64decode(sys.argv[1]); print(f'{b[0]}, {b[1]}, {b[2]}')" "$client_id" 2>/dev/null || true)"
+      fi
+      if [ -z "$_dec" ]; then
+        _dec="$(printf '%s' "$client_id" | base64 -d 2>/dev/null | head -c 3 | od -An -vtu1 2>/dev/null | awk '{if (NF>=3) print $1", "$2", "$3; else if (NF==2) print $1", "$2", 0"; else if (NF==1) print $1", 0, 0"}')"
+      fi
+      case "$_dec" in
+        [0-9]*,*[0-9]*,*[0-9]*) reserved="$_dec" ;;
+      esac
+    fi
+
+    cat > "$WARP_CONF" << EOF
+PRIV_KEY=${priv_key}
+PEER_PUB_KEY=${peer_pub:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}
+IPV4=${v4}
+IPV6=${v6}
+RESERVED=${reserved}
+ENDPOINT=engage.cloudflareclient.com:2408
+EOF
+    chmod 600 "$WARP_CONF"
+    echo -e "${GREEN}WARP 凭据生成成功！${RESET} (分配 IPv4: ${CYAN}${v4}${RESET}, IPv6: ${CYAN}${v6:-无}${RESET})"
+  fi
+
+  local rmode
+  rmode="$(prompt_route_mode)"
+  stop_turn2socks 2>/dev/null || true
+  cat > "$OUTBOUND_FILE" << EOF
+TYPE=warp
+ADDR=engage.cloudflareclient.com
+PORT=2408
+ROUTE_MODE=${rmode}
+EOF
+  chmod 600 "$OUTBOUND_FILE"
+  echo -e "${GREEN}WARP 出口配置已保存，正在重启服务生效...${RESET}"
+  do_restart
+}
+
 menu_outbound() {
   clear
   echo -e "${GREEN}======= 出口设置 =======${RESET}"
-  local cur_type cur_addr cur_port
+  local cur_type cur_addr cur_port cur_rmode
   cur_type=$(grep '^TYPE=' "$OUTBOUND_FILE" 2>/dev/null | cut -d'=' -f2-)
   cur_addr=$(grep '^ADDR=' "$OUTBOUND_FILE" 2>/dev/null | cut -d'=' -f2-)
   cur_port=$(grep '^PORT=' "$OUTBOUND_FILE" 2>/dev/null | cut -d'=' -f2-)
-  echo -e "当前出口: ${CYAN}${cur_type:-直连}${cur_addr:+://$cur_addr:$cur_port}${RESET}"
-  echo -e "${WHITE}1. 设置 SOCKS5 出口  2. 设置 HTTP 出口  3. 恢复直连  0. 返回${RESET}"
+  cur_rmode=$(grep '^ROUTE_MODE=' "$OUTBOUND_FILE" 2>/dev/null | cut -d'=' -f2-)
+  local mode_desc="全局代理"
+  [ "$cur_rmode" = "split" ] && mode_desc="智能分流"
+  if [ -n "$cur_type" ]; then
+    echo -e "当前出口: ${CYAN}${cur_type}${RESET} -> ${CYAN}${cur_addr}:${cur_port}${RESET} [模式: ${GREEN}${mode_desc}${RESET}]"
+  else
+    echo -e "当前出口: ${CYAN}直连 (默认)${RESET}"
+  fi
+  echo -e "${GRAY}--------------------------------${RESET}"
+  echo -e "${WHITE}1. 设置 SOCKS5 出口${RESET}"
+  echo -e "${WHITE}2. 设置 HTTP 出口${RESET}"
+  echo -e "${WHITE}3. 设置 TURN 出口${RESET}"
+  echo -e "${WHITE}4. 设置 WARP 出口${RESET}"
+  echo -e "${WHITE}5. 分流模式${RESET}"
+  echo -e "${WHITE}6. 恢复直连${RESET}"
+  echo -e "${WHITE}0. 返回${RESET}"
+  echo -e "${GRAY}--------------------------------${RESET}"
   read -p "选项: " opt
   case "$opt" in
     1|2)
@@ -1561,21 +1787,73 @@ menu_outbound() {
       local pass=""
       [ -n "$u" ] && read -p "密码: " pass
       if [ -n "$a" ] && [ -n "$p" ]; then
+        local rmode
+        rmode="$(prompt_route_mode)"
+        stop_turn2socks 2>/dev/null || true
         cat > "$OUTBOUND_FILE" << EOF
 TYPE=${t}
 ADDR=${a}
 PORT=${p}
 USER=${u}
 PASS=${pass}
+ROUTE_MODE=${rmode}
 EOF
         chmod 600 "$OUTBOUND_FILE"
         do_restart
       fi
       ;;
     3)
+      read -p "TURN 服务器地址: " a
+      read -p "TURN 服务器端口 [默认 3478]: " p
+      p="${p:-3478}"
+      read -p "用户名（留空无认证）: " u
+      local pass=""
+      [ -n "$u" ] && read -p "密码: " pass
+      read -p "本地转接监听端口 [默认 10808]: " lp
+      lp="${lp:-10808}"
+      if [ -n "$a" ] && [ -n "$p" ]; then
+        local rmode
+        rmode="$(prompt_route_mode)"
+        cat > "$OUTBOUND_FILE" << EOF
+TYPE=turn
+ADDR=${a}
+PORT=${p}
+USER=${u}
+PASS=${pass}
+LOCAL_PORT=${lp}
+ROUTE_MODE=${rmode}
+EOF
+        chmod 600 "$OUTBOUND_FILE"
+        echo -e "${GREEN}TURN 出口配置已保存，正在重启服务生效...${RESET}"
+        do_restart
+      fi
+      ;;
+    4)
+      setup_warp_outbound
+      ;;
+    5)
+      if [ ! -f "$OUTBOUND_FILE" ]; then
+        warn "当前未设置任何出口，无法切换分流模式"
+      else
+        local new_mode
+        new_mode="$(prompt_route_mode)"
+        if grep -q '^ROUTE_MODE=' "$OUTBOUND_FILE" 2>/dev/null; then
+          sed -i "s/^ROUTE_MODE=.*/ROUTE_MODE=${new_mode}/" "$OUTBOUND_FILE"
+        else
+          echo "ROUTE_MODE=${new_mode}" >> "$OUTBOUND_FILE"
+        fi
+        local m_name="全局代理"
+        [ "$new_mode" = "split" ] && m_name="智能分流"
+        echo -e "${GREEN}分流模式已切换为: ${m_name}，正在重启服务生效...${RESET}"
+        do_restart
+      fi
+      ;;
+    6)
       rm -f "$OUTBOUND_FILE"
+      stop_turn2socks 2>/dev/null || true
       do_restart
       ;;
+    0) return ;;
   esac
   press_any_key
 }
@@ -2332,12 +2610,54 @@ CERTEOF
   CUSTOM_OUT_TYPE=""
   if [ -f "$OUTBOUND_FILE" ]; then
     CUSTOM_OUT_TYPE="$(grep '^TYPE=' "$OUTBOUND_FILE" | cut -d'=' -f2-)"
-    local o_addr o_port o_user o_pass
+    local o_addr o_port o_user o_pass o_lport
     o_addr="$(grep '^ADDR=' "$OUTBOUND_FILE" | cut -d'=' -f2-)"
     o_port="$(grep '^PORT=' "$OUTBOUND_FILE" | cut -d'=' -f2-)"
     o_user="$(grep '^USER=' "$OUTBOUND_FILE" | cut -d'=' -f2-)"
     o_pass="$(grep '^PASS=' "$OUTBOUND_FILE" | cut -d'=' -f2-)"
-    if [ -n "$o_addr" ] && [ -n "$o_port" ]; then
+    o_lport="$(grep '^LOCAL_PORT=' "$OUTBOUND_FILE" | cut -d'=' -f2-)"
+    [ -z "$o_lport" ] && o_lport=10808
+    if [ "$CUSTOM_OUT_TYPE" = "turn" ]; then
+      EXTRA_OUTBOUND_JSON=",
+    {
+      \"type\": \"socks\",
+      \"tag\": \"custom-out\",
+      \"server\": \"127.0.0.1\",
+      \"server_port\": ${o_lport}
+    }"
+    elif [ "$CUSTOM_OUT_TYPE" = "warp" ] && [ -f "$WARP_CONF" ]; then
+      local w_priv w_peer w_v4 w_v6 w_res w_ep w_host w_port
+      w_priv="$(grep '^PRIV_KEY=' "$WARP_CONF" | cut -d'=' -f2-)"
+      w_peer="$(grep '^PEER_PUB_KEY=' "$WARP_CONF" | cut -d'=' -f2-)"
+      w_v4="$(grep '^IPV4=' "$WARP_CONF" | cut -d'=' -f2-)"
+      w_v6="$(grep '^IPV6=' "$WARP_CONF" | cut -d'=' -f2-)"
+      w_res="$(grep '^RESERVED=' "$WARP_CONF" | cut -d'=' -f2-)"
+      w_ep="$(grep '^ENDPOINT=' "$WARP_CONF" | cut -d'=' -f2-)"
+      [ -z "$w_peer" ] && w_peer="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+      [ -z "$w_res" ] && w_res="0, 0, 0"
+      [ -z "$w_ep" ] && w_ep="engage.cloudflareclient.com:2408"
+      w_host="${w_ep%:*}"
+      w_port="${w_ep##*:}"
+      [ -z "$w_port" ] && w_port=2408
+      w_host="$(json_escape "$w_host")"
+      w_priv="$(json_escape "$w_priv")"
+      w_peer="$(json_escape "$w_peer")"
+
+      local local_addrs="\"${w_v4}/32\""
+      [ -n "$w_v6" ] && local_addrs="\"${w_v4}/32\", \"${w_v6}/128\""
+
+      EXTRA_OUTBOUND_JSON=",
+    {
+      \"type\": \"wireguard\",
+      \"tag\": \"custom-out\",
+      \"server\": \"${w_host}\",
+      \"server_port\": ${w_port},
+      \"local_address\": [ ${local_addrs} ],
+      \"private_key\": \"${w_priv}\",
+      \"peer_public_key\": \"${w_peer}\",
+      \"reserved\": [ ${w_res} ]
+    }"
+    elif [ -n "$o_addr" ] && [ -n "$o_port" ]; then
       CUSTOM_OUT_TYPE="$(json_escape "$CUSTOM_OUT_TYPE")"
       o_addr="$(json_escape "$o_addr")"
       o_user="$(json_escape "$o_user")"
@@ -2546,12 +2866,49 @@ CERTEOF
   [ -z "$_inbounds" ] && die "所有协议均校验失败，无法启动"
 
   local ROUTE_JSON=""
-  [ -n "$EXTRA_OUTBOUND_JSON" ] && ROUTE_JSON=',
+  if [ -n "$EXTRA_OUTBOUND_JSON" ]; then
+    local _rmode="global"
+    [ -f "$OUTBOUND_FILE" ] && _rmode="$(grep '^ROUTE_MODE=' "$OUTBOUND_FILE" 2>/dev/null | cut -d'=' -f2-)"
+    if [ "$_rmode" = "split" ]; then
+      ROUTE_JSON=',
+  "route": {
+    "rules": [
+      {
+        "domain_suffix": [
+          "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
+          "anthropic.com", "claude.ai",
+          "gemini.google.com", "generativelanguage.googleapis.com",
+          "netflix.com", "netflix.net", "nflximg.net", "nflxvideo.net", "nflxext.com", "nflxso.net",
+          "disneyplus.com", "disney-plus.net", "dssott.com", "bamgrid.com",
+          "spotify.com", "scdn.co",
+          "tiktok.com", "byteoversea.com", "ibytedtos.com"
+        ],
+        "outbound": "custom-out"
+      },
+      {
+        "domain_keyword": [
+          "openai", "chatgpt", "anthropic", "claude"
+        ],
+        "outbound": "custom-out"
+      }
+    ],
+    "final": "direct"
+  }'
+    else
+      ROUTE_JSON=',
   "route": { "final": "custom-out" }'
+    fi
+  fi
 
   printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct"}%s]%s\n}\n' \
     "$_inbounds" "$EXTRA_OUTBOUND_JSON" "$ROUTE_JSON" > "$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
+
+  if ! "$SB_BIN" check -c "$CONFIG_FILE" >/dev/null 2>&1; then
+    warn "生成的 sing-box 配置文件校验失败，输出错误详情："
+    "$SB_BIN" check -c "$CONFIG_FILE" 2>&1 | head -n 10
+    die "配置校验未通过，请检查参数设置"
+  fi
 
   start_singbox() {
     "$SB_BIN" run -c "$CONFIG_FILE" &
@@ -2563,6 +2920,12 @@ CERTEOF
     log "sing-box 已启动 (PID: $SB_PID)"
     return 0
   }
+
+  T2S_PID=""
+  T2S_ACTIVE=0
+  if [ "$CUSTOM_OUT_TYPE" = "turn" ]; then
+    start_turn2socks || true
+  fi
 
   start_singbox || die "sing-box 启动失败"
   setup_port_hop
@@ -2760,6 +3123,14 @@ CERTEOF
         warn "Komari 探针异常退出，正在重启..."
         sleep 2
         start_komari || true
+      fi
+    fi
+
+    if [ "${T2S_ACTIVE}" = "1" ]; then
+      if [ -z "$T2S_PID" ] || ! kill -0 "$T2S_PID" 2>/dev/null; then
+        warn "turn2socks 桥接异常退出，正在重启..."
+        sleep 2
+        start_turn2socks || true
       fi
     fi
 
