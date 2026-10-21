@@ -236,7 +236,37 @@ ensure_cron() {
   return 1
 }
 
+ensure_ipv6_nat64() {
+  [ -w /etc/resolv.conf ] || return 0
+
+  # 1. 检测系统是否有全局 IPv4 默认路由；若存在则为 IPv4/双栈机器，无需干预
+  local _has_v4=0
+  if command -v ip >/dev/null 2>&1; then
+    ip -4 route show default 2>/dev/null | grep -q default && _has_v4=1
+  elif command -v route >/dev/null 2>&1; then
+    route -n 2>/dev/null | grep -q '^0.0.0.0' && _has_v4=1
+  fi
+  [ "$_has_v4" = "1" ] && return 0
+
+  # 2. 如果纯 IPv6 机器已经具备访问 GitHub 的能力（已配 NAT64 或 WARP），无需干预
+  if command -v curl >/dev/null 2>&1; then
+    curl -s --connect-timeout 3 -m 4 https://api.github.com >/dev/null 2>&1 && return 0
+  fi
+
+  # 3. 确认处于纯 IPv6 且无法连接 GitHub，注入权威公共 NAT64/DNS64
+  log "检测到纯 IPv6 环境且无法直连 GitHub，正在自动配置公共 NAT64/DNS64..."
+  [ -f /etc/resolv.conf.bak-sb ] || cp -f /etc/resolv.conf /etc/resolv.conf.bak-sb 2>/dev/null || true
+
+  local _nat64_dns=("2a01:4f8:c2c:123f::1" "2a00:1098:2b::1" "2a00:1098:2c::1")
+  for _dns in "${_nat64_dns[@]}"; do
+    if ! grep -q "$_dns" /etc/resolv.conf 2>/dev/null; then
+      sed -i "1i nameserver ${_dns}" /etc/resolv.conf 2>/dev/null || echo "nameserver ${_dns}" >> /etc/resolv.conf 2>/dev/null || true
+    fi
+  done
+}
+
 ensure_basic_deps() {
+  ensure_ipv6_nat64
   local _missing=""
   command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || _missing="$_missing curl"
   command -v tar     >/dev/null 2>&1 || _missing="$_missing tar"
@@ -274,15 +304,15 @@ dl() {
   # 默认直连官方源；若明确允许或配置环境变量 SB_ALLOW_MIRRORS=true 时才回退第三方加速镜像
   local _mirrors=("")
   if [ "$_allow_mirrors" = "true" ] || [ "${SB_ALLOW_MIRRORS:-}" = "true" ]; then
-    _mirrors+=("https://ghfast.top/" "https://ghproxy.net/" "https://github.moeyy.xyz/" "https://mirror.ghproxy.com/")
+    _mirrors+=("https://ghfast.top/" "https://ghproxy.net/")
   fi
   for _prefix in "${_mirrors[@]}"; do
     local _target="${_prefix}${_url}"
     rm -f "$_out"
     if command -v curl >/dev/null 2>&1; then
-      curl -sL --fail --max-time 90 "$_target" -o "$_out" 2>/dev/null || true
+      curl -sL --fail --connect-timeout 8 --max-time 90 "$_target" -o "$_out" 2>/dev/null || true
     else
-      wget -q --timeout=90 "$_target" -O "$_out" 2>/dev/null || true
+      wget -q --connect-timeout=8 --timeout=90 "$_target" -O "$_out" 2>/dev/null || true
     fi
     if [ -s "$_out" ]; then
       # 简单检查是否被拦截下载为 HTML 错误页面
@@ -2410,6 +2440,7 @@ do_run() {
   pkill -f "$CF_BIN" 2>/dev/null || true
   pkill -f "$KM_BIN" 2>/dev/null || true
 
+  ensure_ipv6_nat64
   [ -x "$SB_BIN" ] && ! "$SB_BIN" version >/dev/null 2>&1 && { warn "已存在的 sing-box 无法运行，重新下载"; rm -f "$SB_BIN"; }
   [ -x "$SB_BIN" ] || download_singbox || die "sing-box 下载失败"
   if [ "${DISABLE_ARGO:-}" != "true" ]; then
