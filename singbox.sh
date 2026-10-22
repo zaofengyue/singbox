@@ -1669,15 +1669,18 @@ menu_update() {
 }
 
 prompt_route_mode() {
-  echo -e "\n${WHITE}请选择出口分流模式:${RESET}" >&2
-  echo -e "  ${CYAN}1.${RESET} 全局代理 (全部流量走该出口) [默认]" >&2
-  echo -e "  ${CYAN}2.${RESET} 智能分流 (仅 ChatGPT/Claude/Netflix/Disney+/Spotify/TikTok 等 AI 与流媒体域名走该出口，其余直连)" >&2
-  local _rmode_opt
-  read -p "请选择分流模式 [1-2, 默认 1]: " _rmode_opt
-  case "$_rmode_opt" in
-    2) printf 'split' ;;
-    *) printf 'global' ;;
-  esac
+  echo -e "${GRAY}--------------------------------${RESET}" >&2
+  echo -e "请选择分流模式:" >&2
+  echo -e "${WHITE}1. 全局代理${RESET}" >&2
+  echo -e "${WHITE}2. 智能分流${RESET}" >&2
+  echo -e "${GRAY}--------------------------------${RESET}" >&2
+  local rm_opt
+  read -p "选项 [默认 1]: " rm_opt
+  if [ "$rm_opt" = "2" ]; then
+    printf 'split'
+  else
+    printf 'global'
+  fi
 }
 
 setup_warp_outbound() {
