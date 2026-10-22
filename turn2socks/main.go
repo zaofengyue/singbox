@@ -549,7 +549,20 @@ func main() {
 	turnUser := flag.String("user", "", "TURN username (optional)")
 	turnPass := flag.String("pass", "", "TURN password (optional)")
 	timeoutSec := flag.Int("timeout", 10, "Relay connection timeout in seconds")
+	showVersion := flag.Bool("v", false, "Show version")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("turn2socks v1.0.0 (RFC 6062 TCP Relay)")
+		return
+	}
+
+	if *turnUser == "" {
+		*turnUser = os.Getenv("TURN_USER")
+	}
+	if *turnPass == "" {
+		*turnPass = os.Getenv("TURN_PASS")
+	}
 
 	if *turnServer == "" {
 		fmt.Fprintf(os.Stderr, "Usage: turn2socks -turn <host:port> [-listen <addr:port>] [-user <user>] [-pass <pass>]\n")

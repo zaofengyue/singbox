@@ -6,6 +6,7 @@ on:
       - 'nodejs/**'
       - 'Dockerfile'
       - 'singbox.sh'
+      - 'turn2socks/**'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 jobs:
@@ -48,6 +49,18 @@ jobs:
           cp nodejs/index.html   release/index.html
           cd release && zip -r ../sbx.zip .
 
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build turn2socks
+        run: |
+          cd turn2socks
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -trimpath -o ../turn2socks-linux-amd64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -trimpath -o ../turn2socks-linux-arm64 .
+          cd ..
+
       - name: Login to ghcr.io
         uses: docker/login-action@v3
         with:
@@ -85,7 +98,10 @@ jobs:
           tag_name: latest
           name: Latest Release
           make_latest: true
-          files: sbx.zip
+          files: |
+            sbx.zip
+            turn2socks-linux-amd64
+            turn2socks-linux-arm64
           body: |
             ## sbx
             下载 `sbx.zip` 解压后上传到平台即可使用。

@@ -254,7 +254,7 @@ ensure_ipv6_nat64() {
   fi
 
   # 3. 确认处于纯 IPv6 且无法连接 GitHub，注入权威公共 NAT64/DNS64
-  log "检测到纯 IPv6 环境且无法直连 GitHub，正在自动配置公共 NAT64/DNS64..."
+  log "检测到纯 IPv6 环境且无法直连 GitHub，正在自动配置公共 NAT64/DNS64 兜底（已备份原配置，卸载时将自动还原）..."
   [ -f /etc/resolv.conf.bak-sb ] || cp -f /etc/resolv.conf /etc/resolv.conf.bak-sb 2>/dev/null || true
 
   local _nat64_dns=("2a01:4f8:c2c:123f::1" "2a00:1098:2b::1" "2a00:1098:2c::1")
@@ -394,9 +394,10 @@ download_turn2socks() {
     mkdir -p "$BIN_DIR"
     chmod 700 "$BIN_DIR" 2>/dev/null || true
   fi
-  if [ -x "$TURN2SOCKS_BIN" ]; then
+  if [ -x "$TURN2SOCKS_BIN" ] && "$TURN2SOCKS_BIN" -v >/dev/null 2>&1; then
     return 0
   fi
+  [ -x "$TURN2SOCKS_BIN" ] && rm -f "$TURN2SOCKS_BIN"
   # 优先尝试从本地源码构建（若存在源码且系统装有 go）
   local _src_dir=""
   if [ -d "$APP_DIR/turn2socks" ]; then
@@ -408,10 +409,11 @@ download_turn2socks() {
     log "检测到本地 Go 环境，正在编译 turn2socks..."
     if (cd "$_src_dir" && CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o "$TURN2SOCKS_BIN" .) >/dev/null 2>&1; then
       chmod +x "$TURN2SOCKS_BIN" 2>/dev/null || true
-      if [ -x "$TURN2SOCKS_BIN" ]; then
+      if [ -x "$TURN2SOCKS_BIN" ] && "$TURN2SOCKS_BIN" -v >/dev/null 2>&1; then
         log "turn2socks 本地编译成功"
         return 0
       fi
+      rm -f "$TURN2SOCKS_BIN"
     fi
   fi
   local _t2s_arch="amd64"
@@ -419,7 +421,7 @@ download_turn2socks() {
   log "正在检查/下载 turn2socks 二进制 (${_t2s_arch})..."
   if dl "https://github.com/zaofengyue/singbox/releases/latest/download/turn2socks-linux-${_t2s_arch}" "$TURN2SOCKS_BIN"; then
     chmod +x "$TURN2SOCKS_BIN" 2>/dev/null || true
-    if [ -x "$TURN2SOCKS_BIN" ]; then
+    if [ -x "$TURN2SOCKS_BIN" ] && "$TURN2SOCKS_BIN" -v >/dev/null 2>&1; then
       log "turn2socks 下载完成"
       return 0
     fi
@@ -460,9 +462,8 @@ start_turn2socks() {
 
   local _args=(-listen "127.0.0.1:${_lport}" -turn "${_addr}:${_port}")
   [ -n "$_user" ] && _args+=(-user "$_user")
-  [ -n "$_pass" ] && _args+=(-pass "$_pass")
 
-  nohup "$TURN2SOCKS_BIN" "${_args[@]}" >> "$TURN2SOCKS_LOG" 2>&1 &
+  TURN_PASS="$_pass" nohup "$TURN2SOCKS_BIN" "${_args[@]}" >> "$TURN2SOCKS_LOG" 2>&1 &
   local _pid=$!
   echo "$_pid" > "$TURN2SOCKS_PID"
   sleep 1
@@ -1668,9 +1669,10 @@ menu_update() {
 }
 
 prompt_route_mode() {
-  echo -e "\n${WHITE}请选择出口分流模式:${RESET}"
-  echo -e "  ${CYAN}1.${RESET} 全局代理 (全部流量走该出口) [默认]"
-  echo -e "  ${CYAN}2.${RESET} 智能分流 (仅 ChatGPT/Claude/Netflix/Disney+/Spotify/TikTok 等 AI 与流媒体域名走该出口，其余直连)"
+  echo -e "\n${WHITE}请选择出口分流模式:${RESET}" >&2
+  echo -e "  ${CYAN}1.${RESET} 全局代理 (全部流量走该出口) [默认]" >&2
+  echo -e "  ${CYAN}2.${RESET} 智能分流 (仅 ChatGPT/Claude/Netflix/Disney+/Spotify/TikTok 等 AI 与流媒体域名走该出口，其余直连)" >&2
+  local _rmode_opt
   read -p "请选择分流模式 [1-2, 默认 1]: " _rmode_opt
   case "$_rmode_opt" in
     2) printf 'split' ;;
@@ -1836,11 +1838,15 @@ EOF
       read -p "TURN 服务器地址: " a
       read -p "TURN 服务器端口 [默认 3478]: " p
       p="${p:-3478}"
+      case "$p" in ''|*[!0-9]*) p=3478 ;; esac
+      [ "$p" -lt 1 ] 2>/dev/null || [ "$p" -gt 65535 ] 2>/dev/null && p=3478
       read -p "用户名（留空无认证）: " u
       local pass=""
       [ -n "$u" ] && read -p "密码: " pass
       read -p "本地转接监听端口 [默认 10808]: " lp
       lp="${lp:-10808}"
+      case "$lp" in ''|*[!0-9]*) lp=10808 ;; esac
+      [ "$lp" -lt 1 ] 2>/dev/null || [ "$lp" -gt 65535 ] 2>/dev/null && lp=10808
       if [ -n "$a" ] && [ -n "$p" ]; then
         local rmode
         rmode="$(prompt_route_mode)"
@@ -2131,8 +2137,14 @@ do_uninstall() {
     ip6tables -t nat -X SINGBOX_HOP 2>/dev/null || true
   fi
 
+  # 恢复被 NAT64 注入的原始 resolv.conf
+  if [ -f /etc/resolv.conf.bak-sb ]; then
+    cp -f /etc/resolv.conf.bak-sb /etc/resolv.conf 2>/dev/null || true
+    rm -f /etc/resolv.conf.bak-sb 2>/dev/null || true
+  fi
+
   rm -rf "$APP_DIR"
-  rm -rf /tmp/sb-bin
+  rm -rf "$BIN_DIR" "$HOME_DIR/sb-bin" /tmp/sb-bin 2>/dev/null || true
   rm -f "$LOCAL_BIN/sb" "$LOCAL_BIN/sb-sub" "$LOCAL_BIN/sb-log" "$LOCAL_BIN/sb-del" "$LOCAL_BIN/sb-edit"
   rm -f /usr/local/bin/sb /usr/local/bin/sb-sub /usr/local/bin/sb-log /usr/local/bin/sb-del /usr/local/bin/sb-edit 2>/dev/null || true
 
@@ -2638,6 +2650,7 @@ CERTEOF
   fi
 
   EXTRA_OUTBOUND_JSON=""
+  ENDPOINTS_JSON=""
   CUSTOM_OUT_TYPE=""
   if [ -f "$OUTBOUND_FILE" ]; then
     CUSTOM_OUT_TYPE="$(grep '^TYPE=' "$OUTBOUND_FILE" | cut -d'=' -f2-)"
@@ -2677,17 +2690,25 @@ CERTEOF
       local local_addrs="\"${w_v4}/32\""
       [ -n "$w_v6" ] && local_addrs="\"${w_v4}/32\", \"${w_v6}/128\""
 
-      EXTRA_OUTBOUND_JSON=",
+      ENDPOINTS_JSON=',
+  "endpoints": [
     {
-      \"type\": \"wireguard\",
-      \"tag\": \"custom-out\",
-      \"server\": \"${w_host}\",
-      \"server_port\": ${w_port},
-      \"local_address\": [ ${local_addrs} ],
-      \"private_key\": \"${w_priv}\",
-      \"peer_public_key\": \"${w_peer}\",
-      \"reserved\": [ ${w_res} ]
-    }"
+      "type": "wireguard",
+      "tag": "custom-out",
+      "system": false,
+      "address": [ '"${local_addrs}"' ],
+      "private_key": "'"${w_priv}"'",
+      "peers": [
+        {
+          "address": "'"${w_host}"'",
+          "port": '"${w_port}"',
+          "public_key": "'"${w_peer}"'",
+          "allowed_ips": [ "0.0.0.0/0", "::/0" ],
+          "reserved": [ '"${w_res}"' ]
+        }
+      ]
+    }
+  ]'
     elif [ -n "$o_addr" ] && [ -n "$o_port" ]; then
       CUSTOM_OUT_TYPE="$(json_escape "$CUSTOM_OUT_TYPE")"
       o_addr="$(json_escape "$o_addr")"
@@ -2931,8 +2952,8 @@ CERTEOF
     fi
   fi
 
-  printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct"}%s]%s\n}\n' \
-    "$_inbounds" "$EXTRA_OUTBOUND_JSON" "$ROUTE_JSON" > "$CONFIG_FILE"
+  printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct"}%s]%s%s\n}\n' \
+    "$_inbounds" "$EXTRA_OUTBOUND_JSON" "$ENDPOINTS_JSON" "$ROUTE_JSON" > "$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
 
   if ! "$SB_BIN" check -c "$CONFIG_FILE" >/dev/null 2>&1; then
