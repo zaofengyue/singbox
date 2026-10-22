@@ -1690,6 +1690,10 @@ setup_warp_outbound() {
   if [ -f "$WARP_CONF" ]; then
     local old_v4 old_v6
     old_v4="$(grep '^IPV4=' "$WARP_CONF" 2>/dev/null | cut -d'=' -f2-)"
+    old_v4="${old_v4%:*}"
+    case "$old_v4" in
+      162.159.*|"") old_v4="172.16.0.2" ;;
+    esac
     old_v6="$(grep '^IPV6=' "$WARP_CONF" 2>/dev/null | cut -d'=' -f2-)"
     echo -e "检测到已保存的 WARP 凭据 (IPv4: ${CYAN}${old_v4:-未知}${RESET}, IPv6: ${CYAN}${old_v6:-未知}${RESET})"
     echo -e "${WHITE}1. 使用已保存凭据  2. 重新注册生成新账号  0. 取消${RESET}"
@@ -1735,17 +1739,24 @@ setup_warp_outbound() {
         --post-data="$post_data" "$reg_url" 2>/dev/null || true)"
     fi
 
-    local v4 v6 peer_pub client_id
-    v4="$(echo "$resp" | grep -o '"v4": *"[^"]*"' | head -1 | cut -d'"' -f4)"
-    v6="$(echo "$resp" | grep -o '"v6": *"[^"]*"' | head -1 | cut -d'"' -f4)"
+    local v4="172.16.0.2"
+    local v6 peer_pub client_id
     peer_pub="$(echo "$resp" | grep -o '"public_key": *"[^"]*"' | head -1 | cut -d'"' -f4)"
     client_id="$(echo "$resp" | grep -o '"client_id": *"[^"]*"' | head -1 | cut -d'"' -f4)"
 
-    if [ -z "$v4" ]; then
+    if [ -z "$peer_pub" ]; then
       warn "Cloudflare API 注册失败，返回内容："
       echo "$resp" | head -n 5
       return 1
     fi
+
+    v6="$(echo "$resp" | grep -o '"v6": *"[^"]*"' | tail -1 | cut -d'"' -f4)"
+    v6="${v6#\[}"
+    v6="${v6%\]*}"
+    v6="${v6%:*}"
+    case "$v6" in
+      2606:4700:d0*) v6="" ;;
+    esac
 
     local reserved="0, 0, 0"
     if [ -n "$client_id" ]; then
@@ -2677,7 +2688,17 @@ CERTEOF
       w_priv="$(grep '^PRIV_KEY=' "$WARP_CONF" | cut -d'=' -f2-)"
       w_peer="$(grep '^PEER_PUB_KEY=' "$WARP_CONF" | cut -d'=' -f2-)"
       w_v4="$(grep '^IPV4=' "$WARP_CONF" | cut -d'=' -f2-)"
+      w_v4="${w_v4%:*}"
+      case "$w_v4" in
+        162.159.*|"") w_v4="172.16.0.2" ;;
+      esac
       w_v6="$(grep '^IPV6=' "$WARP_CONF" | cut -d'=' -f2-)"
+      w_v6="${w_v6#\[}"
+      w_v6="${w_v6%\]*}"
+      w_v6="${w_v6%:*}"
+      case "$w_v6" in
+        2606:4700:d0*) w_v6="" ;;
+      esac
       w_res="$(grep '^RESERVED=' "$WARP_CONF" | cut -d'=' -f2-)"
       w_ep="$(grep '^ENDPOINT=' "$WARP_CONF" | cut -d'=' -f2-)"
       [ -z "$w_peer" ] && w_peer="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
