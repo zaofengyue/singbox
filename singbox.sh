@@ -460,7 +460,15 @@ start_turn2socks() {
     download_turn2socks || { warn "无法启动 turn2socks: 二进制不存在"; return 1; }
   fi
 
-  local _args=(-listen "127.0.0.1:${_lport}" -turn "${_addr}:${_port}")
+  local _turn_host="$_addr"
+  case "$_turn_host" in
+    *:*)
+      _turn_host="${_turn_host#\[}"
+      _turn_host="${_turn_host%\]*}"
+      _turn_host="[${_turn_host}]"
+      ;;
+  esac
+  local _args=(-listen "127.0.0.1:${_lport}" -turn "${_turn_host}:${_port}")
   [ -n "$_user" ] && _args+=(-user "$_user")
 
   TURN_PASS="$_pass" nohup "$TURN2SOCKS_BIN" "${_args[@]}" >> "$TURN2SOCKS_LOG" 2>&1 &
@@ -1695,6 +1703,9 @@ setup_warp_outbound() {
       162.159.*|"") old_v4="172.16.0.2" ;;
     esac
     old_v6="$(grep '^IPV6=' "$WARP_CONF" 2>/dev/null | cut -d'=' -f2-)"
+    old_v6="${old_v6%%/*}"
+    old_v6="${old_v6#\[}"
+    old_v6="${old_v6%%\]*}"
     echo -e "检测到已保存的 WARP 凭据 (IPv4: ${CYAN}${old_v4:-未知}${RESET}, IPv6: ${CYAN}${old_v6:-未知}${RESET})"
     echo -e "${WHITE}1. 使用已保存凭据  2. 重新注册生成新账号  0. 取消${RESET}"
     read -p "选项 [默认 1]: " warp_opt
@@ -1751,12 +1762,19 @@ setup_warp_outbound() {
     fi
 
     v6="$(echo "$resp" | grep -o '"v6": *"[^"]*"' | tail -1 | cut -d'"' -f4)"
+    v6="${v6%%/*}"
     v6="${v6#\[}"
-    v6="${v6%\]*}"
-    v6="${v6%:*}"
+    v6="${v6%%\]*}"
     case "$v6" in
       2606:4700:d0*) v6="" ;;
     esac
+    if [ -n "$v6" ]; then
+      case "$v6" in
+        *::*) ;;
+        *:*:*:*:*:*:*:*) ;;
+        *) v6="" ;;
+      esac
+    fi
 
     local reserved="0, 0, 0"
     if [ -n "$client_id" ]; then
@@ -2693,12 +2711,19 @@ CERTEOF
         162.159.*|"") w_v4="172.16.0.2" ;;
       esac
       w_v6="$(grep '^IPV6=' "$WARP_CONF" | cut -d'=' -f2-)"
+      w_v6="${w_v6%%/*}"
       w_v6="${w_v6#\[}"
-      w_v6="${w_v6%\]*}"
-      w_v6="${w_v6%:*}"
+      w_v6="${w_v6%%\]*}"
       case "$w_v6" in
         2606:4700:d0*) w_v6="" ;;
       esac
+      if [ -n "$w_v6" ]; then
+        case "$w_v6" in
+          *::*) ;;
+          *:*:*:*:*:*:*:*) ;;
+          *) w_v6="" ;;
+        esac
+      fi
       w_res="$(grep '^RESERVED=' "$WARP_CONF" | cut -d'=' -f2-)"
       w_ep="$(grep '^ENDPOINT=' "$WARP_CONF" | cut -d'=' -f2-)"
       [ -z "$w_peer" ] && w_peer="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
@@ -2979,6 +3004,20 @@ CERTEOF
   printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct"}%s]%s%s\n}\n' \
     "$_inbounds" "$EXTRA_OUTBOUND_JSON" "$ENDPOINTS_JSON" "$ROUTE_JSON" > "$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
+
+  if ! "$SB_BIN" check -c "$CONFIG_FILE" >/dev/null 2>&1; then
+    if [ -n "$ENDPOINTS_JSON" ] || [ -n "$EXTRA_OUTBOUND_JSON" ]; then
+      warn "检测到自定义出口 (${CUSTOM_OUT_TYPE:-未知}) 导致配置校验失败，输出错误详情："
+      "$SB_BIN" check -c "$CONFIG_FILE" 2>&1 | head -n 10
+      warn "为保障节点核心服务正常运行，已自动熔断回退该出口（保持直连），其它协议正常启动"
+      EXTRA_OUTBOUND_JSON=""
+      ENDPOINTS_JSON=""
+      ROUTE_JSON=""
+      printf '{\n  "log": { "level": "warn", "timestamp": false },\n  "inbounds": [\n    %s\n  ],\n  "outbounds": [{ "type": "direct", "tag": "direct"}]\n}\n' \
+        "$_inbounds" > "$CONFIG_FILE"
+      chmod 600 "$CONFIG_FILE"
+    fi
+  fi
 
   if ! "$SB_BIN" check -c "$CONFIG_FILE" >/dev/null 2>&1; then
     warn "生成的 sing-box 配置文件校验失败，输出错误详情："
