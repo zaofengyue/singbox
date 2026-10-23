@@ -1030,6 +1030,34 @@ SVCEOF
 # ==============================================================================
 # 模块 2: 交互管理控制面板 (do_menu - 原 sb)
 # ==============================================================================
+do_update_script() {
+  clear
+  echo -e "${GREEN}======= 更新 singbox 管理脚本 =======${RESET}"
+  local SCRIPT_RAW="https://raw.githubusercontent.com/zaofengyue/singbox/${BRANCH:-main}/singbox.sh"
+  echo -e "${YELLOW}正在从 GitHub 检查并拉取最新脚本...${RESET}"
+  local _tmp_sh="/tmp/sb-update-$$.sh"
+  rm -f "$_tmp_sh"
+
+  if ! dl "$SCRIPT_RAW" "$_tmp_sh" false; then
+    curl -fsSL "$SCRIPT_RAW" -o "$_tmp_sh" 2>/dev/null || \
+    wget -qO "$_tmp_sh" "$SCRIPT_RAW" 2>/dev/null || true
+  fi
+
+  if [ -s "$_tmp_sh" ] && grep -q 'do_menu' "$_tmp_sh" 2>/dev/null; then
+    mkdir -p "$APP_DIR"
+    cp -f "$_tmp_sh" "$APP_DIR/singbox.sh"
+    chmod +x "$APP_DIR/singbox.sh"
+    rm -f "$_tmp_sh"
+    echo -e "${GREEN}脚本更新成功！正在自动重新载入管理面板...${RESET}"
+    sleep 1
+    exec bash "$APP_DIR/singbox.sh" menu
+  else
+    rm -f "$_tmp_sh"
+    echo -e "${RED}更新失败：下载内容为空或校验不通过，请检查网络连接${RESET}"
+    press_any_key
+  fi
+}
+
 do_menu() {
   while true; do
     clear
@@ -1047,6 +1075,7 @@ do_menu() {
     echo -e "${WHITE}7. 出口设置${RESET}"
     echo -e "${WHITE}8. 域名证书${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
+    echo -e "${WHITE}9. 更新脚本${RESET}"
     echo -e "${WHITE}0. 退出脚本${RESET}"
     echo -e "${GRAY}--------------------------------${RESET}"
     echo -ne "${GRAY}请输入选项: ${RESET}"
@@ -1060,6 +1089,7 @@ do_menu() {
       6) menu_config ;;
       7) menu_outbound ;;
       8) menu_domain_cert ;;
+      9) do_update_script ;;
       0) exit 0 ;;
       *) ;;
     esac
@@ -3287,6 +3317,9 @@ case "$CMD" in
     ;;
   stop)
     do_stop
+    ;;
+  update-script|upgrade-script)
+    do_update_script
     ;;
   renew-cron|cron-renew)
     do_cron_renew
