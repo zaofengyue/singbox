@@ -236,10 +236,12 @@ ensure_cron() {
   return 1
 }
 
-ensure_ipv6_nat64() {
-  [ -w /etc/resolv.conf ] || return 0
+_NAT64_APPLIED=0
+_NAT64_TARGET_CONF=""
+_NAT64_ORIG_CONTENT=""
 
-  # 1. 检测系统是否有全局 IPv4 默认路由；若存在则为 IPv4/双栈机器，无需干预
+nat64_enable_temp() {
+  [ "$(id -u)" = "0" ] || return 0
   local _has_v4=0
   if command -v ip >/dev/null 2>&1; then
     ip -4 route show default 2>/dev/null | grep -q default && _has_v4=1
@@ -248,25 +250,47 @@ ensure_ipv6_nat64() {
   fi
   [ "$_has_v4" = "1" ] && return 0
 
-  # 2. 如果纯 IPv6 机器已经具备访问 GitHub 的能力（已配 NAT64 或 WARP），无需干预
   if command -v curl >/dev/null 2>&1; then
-    curl -s --connect-timeout 3 -m 4 https://api.github.com >/dev/null 2>&1 && return 0
+    curl -s --connect-timeout 2 -m 3 https://api.github.com >/dev/null 2>&1 && return 0
   fi
 
-  # 3. 确认处于纯 IPv6 且无法连接 GitHub，注入权威公共 NAT64/DNS64
-  log "检测到纯 IPv6 环境且无法直连 GitHub，正在自动配置公共 NAT64/DNS64 兜底（已备份原配置，卸载时将自动还原）..."
-  [ -f /etc/resolv.conf.bak-sb ] || cp -f /etc/resolv.conf /etc/resolv.conf.bak-sb 2>/dev/null || true
+  local _rc="/etc/resolv.conf"
+  [ -e "$_rc" ] || return 0
+  if [ -L "$_rc" ]; then
+    _rc="$(readlink -f "$_rc" 2>/dev/null || echo "/etc/resolv.conf")"
+  fi
+  [ -w "$_rc" ] || return 0
 
-  local _nat64_dns=("2a01:4f8:c2c:123f::1" "2a00:1098:2b::1" "2a00:1098:2c::1")
-  for _dns in "${_nat64_dns[@]}"; do
-    if ! grep -q "$_dns" /etc/resolv.conf 2>/dev/null; then
-      sed -i "1i nameserver ${_dns}" /etc/resolv.conf 2>/dev/null || echo "nameserver ${_dns}" >> /etc/resolv.conf 2>/dev/null || true
+  _NAT64_TARGET_CONF="$_rc"
+  _NAT64_ORIG_CONTENT="$(cat "$_rc" 2>/dev/null)"
+
+  local _n1="2a01:4f8:c2c:123f::1" _n2="2001:67c:2b0::4"
+  if ! grep -q "$_n1" "$_rc" 2>/dev/null && ! grep -q "$_n2" "$_rc" 2>/dev/null; then
+    log "检测到纯 IPv6 环境无法直连 GitHub，正在临时挂载公共 NAT64/DNS64 辅助下载..."
+    printf '\nnameserver %s\nnameserver %s\n' "$_n1" "$_n2" >> "$_rc" 2>/dev/null || true
+    _NAT64_APPLIED=1
+  fi
+}
+
+nat64_restore_temp() {
+  if [ "$_NAT64_APPLIED" = "1" ] && [ -n "$_NAT64_TARGET_CONF" ] && [ -n "$_NAT64_ORIG_CONTENT" ] && [ -w "$_NAT64_TARGET_CONF" ]; then
+    printf '%s\n' "$_NAT64_ORIG_CONTENT" > "$_NAT64_TARGET_CONF" 2>/dev/null || true
+  fi
+  if [ -f /etc/resolv.conf.bak-sb ]; then
+    local _rc="/etc/resolv.conf"
+    [ -L "$_rc" ] && _rc="$(readlink -f "$_rc" 2>/dev/null || echo "/etc/resolv.conf")"
+    if [ -w "$_rc" ]; then
+      cat /etc/resolv.conf.bak-sb > "$_rc" 2>/dev/null || true
     fi
-  done
+    rm -f /etc/resolv.conf.bak-sb 2>/dev/null || true
+  fi
+  _NAT64_APPLIED=0
+  _NAT64_TARGET_CONF=""
+  _NAT64_ORIG_CONTENT=""
 }
 
 ensure_basic_deps() {
-  ensure_ipv6_nat64
+  nat64_enable_temp
   local _missing=""
   command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || _missing="$_missing curl"
   command -v tar     >/dev/null 2>&1 || _missing="$_missing tar"
@@ -277,13 +301,16 @@ ensure_basic_deps() {
     warn "检测到缺少基础工具:${_missing}，尝试自动安装..."
     try_install_pkg "$_missing"
     if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+      nat64_restore_temp
       die "缺少 curl/wget 且自动安装失败。Alpine: apk add --no-cache curl；Debian/Ubuntu: apt-get install -y curl"
     fi
     if ! command -v tar >/dev/null 2>&1; then
+      nat64_restore_temp
       die "缺少 tar 且自动安装失败。Alpine: apk add --no-cache tar"
     fi
   fi
   ensure_cron || true
+  nat64_restore_temp
 }
 
 # ── 通用工具函数 ──────────────────────────────────────────────────────────────
@@ -301,11 +328,21 @@ http_get() {
 
 dl() {
   local _url="$1" _out="$2" _allow_mirrors="${3:-true}"
+  local _nat64_activated=0
+  case "$_url" in
+    *github.com*|*githubusercontent.com*)
+      if [ "$(id -u)" = "0" ] && ! curl -s --connect-timeout 2 -m 3 https://api.github.com >/dev/null 2>&1; then
+        nat64_enable_temp && _nat64_activated=1
+      fi
+      ;;
+  esac
+
   # 默认直连官方源；若明确允许或配置环境变量 SB_ALLOW_MIRRORS=true 时才回退第三方加速镜像
   local _mirrors=("")
   if [ "$_allow_mirrors" = "true" ] || [ "${SB_ALLOW_MIRRORS:-}" = "true" ]; then
     _mirrors+=("https://ghfast.top/" "https://ghproxy.net/")
   fi
+  local _success=false
   for _prefix in "${_mirrors[@]}"; do
     local _target="${_prefix}${_url}"
     rm -f "$_out"
@@ -320,10 +357,17 @@ dl() {
         rm -f "$_out"
         continue
       fi
-      return 0
+      _success=true
+      break
     fi
   done
-  return 1
+
+  [ "$_nat64_activated" = "1" ] && nat64_restore_temp
+  if $_success; then
+    return 0
+  else
+    return 1
+  fi
 }
 
 detect_arch() {
@@ -1035,7 +1079,9 @@ do_update_script() {
   echo -e "${GREEN}======= 更新 singbox 管理脚本 =======${RESET}"
   local SCRIPT_RAW="https://raw.githubusercontent.com/zaofengyue/singbox/${BRANCH:-main}/singbox.sh"
   echo -e "${YELLOW}正在从 GitHub 检查并拉取最新脚本...${RESET}"
-  local _tmp_sh="/tmp/sb-update-$$.sh"
+  mkdir -p "$APP_DIR"
+  local _tmp_sh
+  _tmp_sh="$(mktemp "$APP_DIR/sb-update.XXXXXX" 2>/dev/null || echo "$APP_DIR/sb-update-$$.sh")"
   rm -f "$_tmp_sh"
 
   if ! dl "$SCRIPT_RAW" "$_tmp_sh" false; then
@@ -1043,17 +1089,23 @@ do_update_script() {
     wget -qO "$_tmp_sh" "$SCRIPT_RAW" 2>/dev/null || true
   fi
 
-  if [ -s "$_tmp_sh" ] && grep -q 'do_menu' "$_tmp_sh" 2>/dev/null; then
-    mkdir -p "$APP_DIR"
-    cp -f "$_tmp_sh" "$APP_DIR/singbox.sh"
+  local _fsize=0
+  [ -f "$_tmp_sh" ] && _fsize=$(wc -c < "$_tmp_sh" 2>/dev/null || stat -c %s "$_tmp_sh" 2>/dev/null || echo 0)
+
+  if [ "$_fsize" -gt 40000 ] && \
+     bash -n "$_tmp_sh" >/dev/null 2>&1 && \
+     grep -q 'do_menu' "$_tmp_sh" 2>/dev/null && \
+     tail -n 30 "$_tmp_sh" 2>/dev/null | grep -q 'esac'; then
+    cp -f "$APP_DIR/singbox.sh" "$APP_DIR/singbox.sh.bak" 2>/dev/null || true
+    mv -f "$_tmp_sh" "$APP_DIR/singbox.sh"
     chmod +x "$APP_DIR/singbox.sh"
-    rm -f "$_tmp_sh"
     echo -e "${GREEN}脚本更新成功！正在自动重新载入管理面板...${RESET}"
-    sleep 1
+    echo -e "${YELLOW}提示：若后台有正在运行的 sing-box 节点，建议在面板选择 3【重启sing-box】以载入新版守护逻辑。${RESET}"
+    sleep 2
     exec bash "$APP_DIR/singbox.sh" menu
   else
     rm -f "$_tmp_sh"
-    echo -e "${RED}更新失败：下载内容为空或校验不通过，请检查网络连接${RESET}"
+    echo -e "${RED}更新失败：下载脚本内容不完整或语法校验未通过（现有脚本已受保护未被修改）${RESET}"
     press_any_key
   fi
 }
@@ -2514,7 +2566,6 @@ do_run() {
   pkill -f "$CF_BIN" 2>/dev/null || true
   pkill -f "$KM_BIN" 2>/dev/null || true
 
-  ensure_ipv6_nat64
   [ -x "$SB_BIN" ] && ! "$SB_BIN" version >/dev/null 2>&1 && { warn "已存在的 sing-box 无法运行，重新下载"; rm -f "$SB_BIN"; }
   [ -x "$SB_BIN" ] || download_singbox || die "sing-box 下载失败"
   if [ "${DISABLE_ARGO:-}" != "true" ]; then
