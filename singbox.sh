@@ -261,29 +261,30 @@ nat64_enable_temp() {
   fi
   [ -w "$_rc" ] || return 0
 
+  cp -f "$_rc" /etc/resolv.conf.sb-orig 2>/dev/null || return 0
+  trap 'nat64_restore_temp' EXIT INT TERM HUP
+
   _NAT64_TARGET_CONF="$_rc"
   _NAT64_ORIG_CONTENT="$(cat "$_rc" 2>/dev/null)"
 
   local _n1="2a01:4f8:c2c:123f::1" _n2="2001:67c:2b0::4"
   if ! grep -q "$_n1" "$_rc" 2>/dev/null && ! grep -q "$_n2" "$_rc" 2>/dev/null; then
     log "检测到纯 IPv6 环境无法直连 GitHub，正在临时挂载公共 NAT64/DNS64 辅助下载..."
-    printf '\nnameserver %s\nnameserver %s\n' "$_n1" "$_n2" >> "$_rc" 2>/dev/null || true
+    printf 'nameserver %s\nnameserver %s\n%s\n' "$_n1" "$_n2" "$_NAT64_ORIG_CONTENT" > "$_rc" 2>/dev/null || true
     _NAT64_APPLIED=1
   fi
 }
 
 nat64_restore_temp() {
-  if [ "$_NAT64_APPLIED" = "1" ] && [ -n "$_NAT64_TARGET_CONF" ] && [ -n "$_NAT64_ORIG_CONTENT" ] && [ -w "$_NAT64_TARGET_CONF" ]; then
-    printf '%s\n' "$_NAT64_ORIG_CONTENT" > "$_NAT64_TARGET_CONF" 2>/dev/null || true
-  fi
-  if [ -f /etc/resolv.conf.bak-sb ]; then
-    local _rc="/etc/resolv.conf"
-    [ -L "$_rc" ] && _rc="$(readlink -f "$_rc" 2>/dev/null || echo "/etc/resolv.conf")"
-    if [ -w "$_rc" ]; then
-      cat /etc/resolv.conf.bak-sb > "$_rc" 2>/dev/null || true
+  if [ "$_NAT64_APPLIED" = "1" ] && [ -n "$_NAT64_TARGET_CONF" ] && [ -w "$_NAT64_TARGET_CONF" ]; then
+    if [ -f /etc/resolv.conf.sb-orig ]; then
+      cat /etc/resolv.conf.sb-orig > "$_NAT64_TARGET_CONF" 2>/dev/null || true
+    elif [ -n "$_NAT64_ORIG_CONTENT" ]; then
+      printf '%s\n' "$_NAT64_ORIG_CONTENT" > "$_NAT64_TARGET_CONF" 2>/dev/null || true
     fi
-    rm -f /etc/resolv.conf.bak-sb 2>/dev/null || true
   fi
+  rm -f /etc/resolv.conf.sb-orig 2>/dev/null || true
+  trap - EXIT INT TERM HUP
   _NAT64_APPLIED=0
   _NAT64_TARGET_CONF=""
   _NAT64_ORIG_CONTENT=""
@@ -1747,8 +1748,10 @@ menu_update() {
   clear
   echo -e "${GREEN}======= 更新 sing-box =======${RESET}"
   local latest_ver
+  nat64_enable_temp
   latest_ver=$(curl -sL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" \
     | grep '"tag_name"' | sed 's/.*"tag_name": *"v\([^"]*\)".*/\1/' | head -1)
+  nat64_restore_temp
   echo -e "最新版本: ${GREEN}${latest_ver:+v}${latest_ver:-获取失败}${RESET}"
   read -p "确认下载并覆盖更新? [y/N]: " confirm
   if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
@@ -2024,12 +2027,12 @@ ensure_acme() {
   [ -x "$ACME_HOME/acme.sh" ] && return 0
   echo -e "${YELLOW}正在安装 acme.sh...${RESET}"
   mkdir -p "$STATE_DIR"
-  local tmp_acme="/tmp/acme-install-$$"
+  local tmp_acme="$STATE_DIR/acme-install-$$"
   rm -rf "$tmp_acme" && mkdir -p "$tmp_acme"
-  if command -v curl >/dev/null 2>&1; then
-    curl -sL https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh -o "$tmp_acme/acme.sh"
-  else
-    wget -q https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh -O "$tmp_acme/acme.sh"
+  if ! dl "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh" "$tmp_acme/acme.sh" false; then
+    warn "下载 acme.sh 失败，请检查网络连接"
+    rm -rf "$tmp_acme"
+    return 1
   fi
   chmod +x "$tmp_acme/acme.sh"
   ensure_cron || true
@@ -2251,9 +2254,15 @@ do_uninstall() {
     ip6tables -t nat -X SINGBOX_HOP 2>/dev/null || true
   fi
 
-  # 恢复被 NAT64 注入的原始 resolv.conf
+  # 恢复被 NAT64 注入的原始 resolv.conf (P2 & P4 兼容)
+  local _rc="/etc/resolv.conf"
+  [ -L "$_rc" ] && _rc="$(readlink -f "$_rc" 2>/dev/null || echo "/etc/resolv.conf")"
+  if [ -f /etc/resolv.conf.sb-orig ]; then
+    [ -w "$_rc" ] && cat /etc/resolv.conf.sb-orig > "$_rc" 2>/dev/null || true
+    rm -f /etc/resolv.conf.sb-orig 2>/dev/null || true
+  fi
   if [ -f /etc/resolv.conf.bak-sb ]; then
-    cp -f /etc/resolv.conf.bak-sb /etc/resolv.conf 2>/dev/null || true
+    [ -w "$_rc" ] && cat /etc/resolv.conf.bak-sb > "$_rc" 2>/dev/null || true
     rm -f /etc/resolv.conf.bak-sb 2>/dev/null || true
   fi
 
