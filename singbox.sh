@@ -241,6 +241,7 @@ _NAT64_TARGET_CONF=""
 _NAT64_ORIG_CONTENT=""
 
 nat64_enable_temp() {
+  local _probed="${1:-0}"
   [ "$(id -u)" = "0" ] || return 0
   local _has_v4=0
   if command -v ip >/dev/null 2>&1; then
@@ -250,7 +251,7 @@ nat64_enable_temp() {
   fi
   [ "$_has_v4" = "1" ] && return 0
 
-  if command -v curl >/dev/null 2>&1; then
+  if [ "$_probed" != "1" ] && command -v curl >/dev/null 2>&1; then
     curl -s --connect-timeout 2 -m 3 https://api.github.com >/dev/null 2>&1 && return 0
   fi
 
@@ -333,7 +334,7 @@ dl() {
   case "$_url" in
     *github.com*|*githubusercontent.com*)
       if [ "$(id -u)" = "0" ] && ! curl -s --connect-timeout 2 -m 3 https://api.github.com >/dev/null 2>&1; then
-        nat64_enable_temp && _nat64_activated=1
+        nat64_enable_temp 1 && _nat64_activated=1
       fi
       ;;
   esac
@@ -1096,7 +1097,7 @@ do_update_script() {
   if [ "$_fsize" -gt 40000 ] && \
      bash -n "$_tmp_sh" >/dev/null 2>&1 && \
      grep -q 'do_menu' "$_tmp_sh" 2>/dev/null && \
-     tail -n 30 "$_tmp_sh" 2>/dev/null | grep -q 'esac'; then
+     tail -n 30 "$_tmp_sh" 2>/dev/null | grep -qE '__SINGBOX_SH_EOF__|esac'; then
     cp -f "$APP_DIR/singbox.sh" "$APP_DIR/singbox.sh.bak" 2>/dev/null || true
     mv -f "$_tmp_sh" "$APP_DIR/singbox.sh"
     chmod +x "$APP_DIR/singbox.sh"
@@ -1747,17 +1748,53 @@ config_komari() {
 menu_update() {
   clear
   echo -e "${GREEN}======= 更新 sing-box =======${RESET}"
-  local latest_ver
-  nat64_enable_temp
-  latest_ver=$(curl -sL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" \
-    | grep '"tag_name"' | sed 's/.*"tag_name": *"v\([^"]*\)".*/\1/' | head -1)
-  nat64_restore_temp
-  echo -e "最新版本: ${GREEN}${latest_ver:+v}${latest_ver:-获取失败}${RESET}"
-  read -p "确认下载并覆盖更新? [y/N]: " confirm
-  if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-    rm -rf "$SB_DIR"
-    do_restart
-  fi
+  local cur_raw="$("$SB_BIN" version 2>/dev/null | head -1 | awk '{print $3}')"
+  local cur_ver="未安装"
+  [ -n "$cur_raw" ] && cur_ver="v${cur_raw#v}"
+  echo -e "当前版本: ${CYAN}${cur_ver}${RESET}"
+  echo -e "${GRAY}--------------------------------${RESET}"
+  echo -e "${WHITE}1. 安装 sing-box 稳定版(v1.14.4)${RESET}"
+  echo -e "${WHITE}2. 检查并升级 sing-box 最新版本${RESET}"
+  echo -e "${WHITE}0. 取消${RESET}"
+  echo -e "${GRAY}--------------------------------${RESET}"
+  local up_opt
+  read -p "请选择: " up_opt
+  case "$up_opt" in
+    1)
+      echo -e "${YELLOW}正在安装 sing-box 稳定版 (v1.14.4)...${RESET}"
+      rm -rf "$SB_DIR"
+      if download_singbox "v1.14.4"; then
+        do_restart
+      else
+        echo -e "${RED}安装失败${RESET}"
+      fi
+      ;;
+    2)
+      echo -e "${YELLOW}正在检查 GitHub 最新版本...${RESET}"
+      nat64_enable_temp
+      local latest_ver
+      latest_ver=$(curl -sL --max-time 10 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" \
+        | grep '"tag_name"' | sed 's/.*"tag_name": *"v\([^"]*\)".*/\1/' | head -1)
+      nat64_restore_temp
+      if [ -z "$latest_ver" ]; then
+        echo -e "${RED}获取最新版本号失败，请检查网络连接${RESET}"
+      else
+        echo -e "检测到 GitHub 最新版本: ${GREEN}v${latest_ver}${RESET}"
+        read -p "确认下载并覆盖安装最新版? [y/N]: " confirm
+        if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+          rm -rf "$SB_DIR"
+          if download_singbox "v${latest_ver}"; then
+            do_restart
+          else
+            echo -e "${RED}升级失败，将保留或回退稳定版本${RESET}"
+          fi
+        fi
+      fi
+      ;;
+    *)
+      return
+      ;;
+  esac
   press_any_key
 }
 
@@ -2521,11 +2558,8 @@ do_run() {
 
   download_singbox() {
     mkdir -p "$SB_DIR"
-    log "正在检查/获取 sing-box..."
-    local SB_VER SB_FALLBACK_VER="v1.14.1"
-    SB_VER="$(http_get 'https://api.github.com/repos/SagerNet/sing-box/releases/latest' \
-      | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
-    [ -z "$SB_VER" ] && { warn "获取最新版本号失败，直接使用保底版本 ${SB_FALLBACK_VER}"; SB_VER="$SB_FALLBACK_VER"; }
+    local SB_VER="${1:-v1.14.4}" SB_FALLBACK_VER="v1.14.4"
+    log "正在检查/获取 sing-box (${SB_VER})..."
 
     _try_fetch_singbox() {
       local _v="$1" _vnum="${1#v}"
@@ -3399,3 +3433,4 @@ case "$CMD" in
     fi
     ;;
 esac
+# __SINGBOX_SH_EOF__
