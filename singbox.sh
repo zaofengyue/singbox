@@ -69,6 +69,7 @@ ACME_HOME="$STATE_DIR/acme.sh"
 BIN_DIR="/tmp/sb-bin-$(id -u 2>/dev/null || echo 0)"
 SB_DIR="$BIN_DIR/singbox"
 SB_BIN="$SB_DIR/sing-box"
+SB_STABLE_VER="v1.14.4"   # 默认固定的 sing-box 稳定版本（只改这一处）
 CF_BIN="$BIN_DIR/cloudflared"
 KM_BIN="$BIN_DIR/komari-agent"
 TURN2SOCKS_BIN="$BIN_DIR/turn2socks"
@@ -240,9 +241,21 @@ _NAT64_APPLIED=0
 _NAT64_TARGET_CONF=""
 _NAT64_ORIG_CONTENT=""
 
+# 上次被 SIGKILL / 断电打断时，会遗留 .sb-orig 和被改动的 resolv.conf；下次运行先还原
+nat64_recover_leftover() {
+  [ -f /etc/resolv.conf.sb-orig ] || return 0
+  local _rc="/etc/resolv.conf"
+  [ -L "$_rc" ] && _rc="$(readlink -f "$_rc" 2>/dev/null || echo "/etc/resolv.conf")"
+  if [ -w "$_rc" ] && grep -q "2a01:4f8:c2c:123f::1" "$_rc" 2>/dev/null; then
+    cat /etc/resolv.conf.sb-orig > "$_rc" 2>/dev/null || true
+  fi
+  rm -f /etc/resolv.conf.sb-orig 2>/dev/null || true
+}
+
 nat64_enable_temp() {
   local _probed="${1:-0}"
   [ "$(id -u)" = "0" ] || return 0
+  nat64_recover_leftover
   local _has_v4=0
   if command -v ip >/dev/null 2>&1; then
     ip -4 route show default 2>/dev/null | grep -q default && _has_v4=1
@@ -262,14 +275,16 @@ nat64_enable_temp() {
   fi
   [ -w "$_rc" ] || return 0
 
-  cp -f "$_rc" /etc/resolv.conf.sb-orig 2>/dev/null || return 0
-  trap 'nat64_restore_temp' EXIT INT TERM HUP
-
-  _NAT64_TARGET_CONF="$_rc"
-  _NAT64_ORIG_CONTENT="$(cat "$_rc" 2>/dev/null)"
-
   local _n1="2a01:4f8:c2c:123f::1" _n2="2001:67c:2b0::4"
   if ! grep -q "$_n1" "$_rc" 2>/dev/null && ! grep -q "$_n2" "$_rc" 2>/dev/null; then
+    # 只有确定要修改时才备份并注册 trap
+    cp -f "$_rc" /etc/resolv.conf.sb-orig 2>/dev/null || return 0
+    trap 'nat64_restore_temp' EXIT
+    trap 'nat64_restore_temp; exit 130' INT
+    trap 'nat64_restore_temp; exit 143' TERM
+    trap 'nat64_restore_temp; exit 129' HUP
+    _NAT64_TARGET_CONF="$_rc"
+    _NAT64_ORIG_CONTENT="$(cat "$_rc" 2>/dev/null)"
     log "检测到纯 IPv6 环境无法直连 GitHub，正在临时挂载公共 NAT64/DNS64 辅助下载..."
     printf 'nameserver %s\nnameserver %s\n%s\n' "$_n1" "$_n2" "$_NAT64_ORIG_CONTENT" > "$_rc" 2>/dev/null || true
     _NAT64_APPLIED=1
@@ -283,9 +298,10 @@ nat64_restore_temp() {
     elif [ -n "$_NAT64_ORIG_CONTENT" ]; then
       printf '%s\n' "$_NAT64_ORIG_CONTENT" > "$_NAT64_TARGET_CONF" 2>/dev/null || true
     fi
+    # 只在确实改过的情况下才删备份；未改动时遗留的备份留给 recover 处理
+    rm -f /etc/resolv.conf.sb-orig 2>/dev/null || true
+    trap - EXIT INT TERM HUP
   fi
-  rm -f /etc/resolv.conf.sb-orig 2>/dev/null || true
-  trap - EXIT INT TERM HUP
   _NAT64_APPLIED=0
   _NAT64_TARGET_CONF=""
   _NAT64_ORIG_CONTENT=""
@@ -1748,12 +1764,13 @@ config_komari() {
 menu_update() {
   clear
   echo -e "${GREEN}======= 更新 sing-box =======${RESET}"
-  local cur_raw="$("$SB_BIN" version 2>/dev/null | head -1 | awk '{print $3}')"
+  local cur_raw
+  cur_raw="$("$SB_BIN" version 2>/dev/null | head -1 | awk '{print $3}')"
   local cur_ver="未安装"
   [ -n "$cur_raw" ] && cur_ver="v${cur_raw#v}"
   echo -e "当前版本: ${CYAN}${cur_ver}${RESET}"
   echo -e "${GRAY}--------------------------------${RESET}"
-  echo -e "${WHITE}1. 安装 sing-box 稳定版(v1.14.4)${RESET}"
+  echo -e "${WHITE}1. 安装 sing-box 稳定版(${SB_STABLE_VER})${RESET}"
   echo -e "${WHITE}2. 检查并升级 sing-box 最新版本${RESET}"
   echo -e "${WHITE}0. 取消${RESET}"
   echo -e "${GRAY}--------------------------------${RESET}"
@@ -1761,9 +1778,8 @@ menu_update() {
   read -p "请选择: " up_opt
   case "$up_opt" in
     1)
-      echo -e "${YELLOW}正在安装 sing-box 稳定版 (v1.14.4)...${RESET}"
-      rm -rf "$SB_DIR"
-      if download_singbox "v1.14.4"; then
+      echo -e "${YELLOW}正在安装 sing-box 稳定版 (${SB_STABLE_VER})...${RESET}"
+      if download_singbox "$SB_STABLE_VER"; then
         do_restart
       else
         echo -e "${RED}安装失败${RESET}"
@@ -1782,11 +1798,10 @@ menu_update() {
         echo -e "检测到 GitHub 最新版本: ${GREEN}v${latest_ver}${RESET}"
         read -p "确认下载并覆盖安装最新版? [y/N]: " confirm
         if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-          rm -rf "$SB_DIR"
           if download_singbox "v${latest_ver}"; then
             do_restart
           else
-            echo -e "${RED}升级失败，将保留或回退稳定版本${RESET}"
+            echo -e "${RED}升级失败，请检查网络后重试${RESET}"
           fi
         fi
       fi
@@ -2558,7 +2573,7 @@ do_run() {
 
   download_singbox() {
     mkdir -p "$SB_DIR"
-    local SB_VER="${1:-v1.14.4}" SB_FALLBACK_VER="v1.14.4"
+    local SB_VER="${1:-$SB_STABLE_VER}" SB_FALLBACK_VER="$SB_STABLE_VER"
     log "正在检查/获取 sing-box (${SB_VER})..."
 
     _try_fetch_singbox() {
