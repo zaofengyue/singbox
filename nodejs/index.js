@@ -671,21 +671,8 @@ async function downloadSingBox() {
   if (!arch) throw new Error(`核心组件暂不支持当前 CPU 架构: ${os.arch()}`);
   const platform = detectOS();
 
-  console.log(`正在获取核心组件最新版本 (${platform}-${arch})...`);
-  let version = 'v1.12.0';
-  const fallbackVersion = 'v1.12.0';
-  try {
-    const data = await httpGet('https://api.github.com/repos/SagerNet/sing-box/releases', 10000);
-    if (data) {
-      const releases = JSON.parse(data);
-      const stable = releases.find(r => !r.prerelease && !r.draft);
-      if (stable && stable.tag_name) version = stable.tag_name;
-    }
-  } catch (e) {
-    console.warn(`获取最新版本失败（${e.message}），使用兜底版本 ${version}`);
-  }
-
-  console.log(`核心组件版本: ${version}`);
+  const version = 'v1.14.4';
+  console.log(`核心组件锁定稳定版本: ${version} (${platform}-${arch})`);
   const ext = platform === 'windows' ? 'zip' : 'tar.gz';
   const suffixes = platform === 'linux'
     ? (isMuslLinux() ? ['-musl', ''] : ['', '-musl'])
@@ -734,13 +721,6 @@ async function downloadSingBox() {
 
   if (await tryFetch(version)) {
     return SB_BIN_PATH;
-  }
-
-  if (version !== fallbackVersion) {
-    console.warn(`最新版本 ${version} 不可用，回退尝试保底版本 ${fallbackVersion}...`);
-    if (await tryFetch(fallbackVersion)) {
-      return SB_BIN_PATH;
-    }
   }
 
   throw new Error('无法获取并执行兼容当前系统环境的核心组件');

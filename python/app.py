@@ -806,17 +806,8 @@ def download_singbox() -> str:
 
     os_type = detect_os()
     arch = detect_arch()
-    fallback_version = "v1.12.0"
-    version = fallback_version
-    try:
-        data = _http_get_text("https://api.github.com/repos/SagerNet/sing-box/releases")
-        if data:
-            releases = json.loads(data)
-            stable = next((r for r in releases if not r.get("prerelease") and not r.get("draft")), None)
-            if stable and stable.get("tag_name"):
-                version = stable["tag_name"]
-    except Exception:
-        pass
+    version = "v1.14.4"
+    log.info("sing-box 锁定稳定版本: %s (%s-%s)", version, os_type, arch)
 
     is_zip = (os_type == "windows")
     pkg_ext = "zip" if is_zip else "tar.gz"
@@ -873,11 +864,6 @@ def download_singbox() -> str:
 
     if _try_fetch(version):
         return str(SB_BIN_PATH)
-
-    if version != fallback_version:
-        log.warning("最新版本 %s 不可用，回退尝试保底版本 %s...", version, fallback_version)
-        if _try_fetch(fallback_version):
-            return str(SB_BIN_PATH)
 
     raise RuntimeError("无法获取并执行兼容当前系统环境的 sing-box 二进制文件")
 

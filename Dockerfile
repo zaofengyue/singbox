@@ -20,7 +20,7 @@ RUN set -eux; \
         SB_ARCH="amd64"; CF_ARCH="linux-amd64"; KM_ARCH="linux-amd64" ;; \
     esac; \
     # 下载核心 worker 并脱敏重命名
-    curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v1.12.0/sing-box-1.12.0-linux-${SB_ARCH}.tar.gz" -o /tmp/sb.tar.gz; \
+    curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-${SB_ARCH}.tar.gz" -o /tmp/sb.tar.gz; \
     tar -xzf /tmp/sb.tar.gz -C /root/.cache/node-core --strip-components=1; \
     mv /root/.cache/node-core/sing-box /root/.cache/node-core/node-worker; \
     rm -rf /tmp/sb.tar.gz /root/.cache/node-core/LICENSE; \
