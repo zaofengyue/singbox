@@ -756,7 +756,7 @@ do_stop() {
     rm -f "$PID_FILE"
   fi
   # 停止由 nohup 守护的 singbox.sh run 实例，严格排除当前脚本命令自身
-  pgrep -f "singbox\.sh run\b" 2>/dev/null | grep -v "^$$\$" | while read -r p; do
+  pgrep -f "singbox\.sh run([[:space:]]|$)" 2>/dev/null | grep -v "^$$\$" | while read -r p; do
     [ -n "$p" ] && kill "$p" 2>/dev/null || true
   done
   # 仅根据进程二进制名称精确定位杀死 (-x)，杜绝匹配脚本路径中包含的 sing-box 导致自身闪退
@@ -2336,14 +2336,16 @@ do_cron_renew() {
     [ -d "$d" ] || continue
     local dom
     dom="$(basename "$d")"
-    if "$ACME_HOME/acme.sh" --home "$ACME_HOME" --renew -d "$dom" --standalone --httpport 80 >/dev/null 2>&1; then
+    local _res=0
+    "$ACME_HOME/acme.sh" --home "$ACME_HOME" --renew -d "$dom" --standalone --httpport 80 >/dev/null 2>&1 || _res=$?
+    if [ "$_res" = "0" ]; then
       "$ACME_HOME/acme.sh" --home "$ACME_HOME" --install-cert -d "$dom" \
         --key-file "$DOMAIN_CERT_DIR/$dom/key.pem" \
         --fullchain-file "$DOMAIN_CERT_DIR/$dom/cert.pem" >/dev/null 2>&1
       chmod 600 "$DOMAIN_CERT_DIR/$dom/key.pem" 2>/dev/null || true
       renewed=1
-    else
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] 域名 ${dom} 证书续期失败，请手动检查（Token是否过期、80端口是否被占用）" >> "$LOG_FILE"
+    elif [ "$_res" != "2" ]; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] 域名 ${dom} 证书续期失败 (错误码 ${_res})，请手动检查（80端口是否被占用）" >> "$LOG_FILE"
     fi
   done
   [ "$renewed" = "1" ] && do_restart
@@ -3106,7 +3108,7 @@ CERTEOF
   [ -z "$_inbounds" ] && die "所有协议均校验失败，无法启动"
 
   local ROUTE_JSON=""
-  if [ -n "$EXTRA_OUTBOUND_JSON" ]; then
+  if [ -n "$EXTRA_OUTBOUND_JSON" ] || [ -n "$ENDPOINTS_JSON" ]; then
     local _rmode="global"
     [ -f "$OUTBOUND_FILE" ] && _rmode="$(grep '^ROUTE_MODE=' "$OUTBOUND_FILE" 2>/dev/null | cut -d'=' -f2-)"
     if [ "$_rmode" = "split" ]; then
@@ -3198,7 +3200,7 @@ CERTEOF
     fi
     pkill -x "komari-agent" 2>/dev/null || true
     AGENT_IGNORE_UNSAFE_CERT=true AGENT_ENDPOINT="$_endpoint" AGENT_TOKEN="$KOMARI_TOKEN" \
-      nohup "$KM_BIN" -e "$_endpoint" -t "$KOMARI_TOKEN" >> "$KM_LOG" 2>&1 &
+      nohup "$KM_BIN" -e "$_endpoint" >> "$KM_LOG" 2>&1 &
     KM_PID=$!
     KM_ACTIVE=1
     log "Komari 监控探针已启动 (PID: $KM_PID)"
@@ -3210,8 +3212,8 @@ CERTEOF
   CF_PID=""
   start_cloudflared() {
     if [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_AUTH" ]; then
-      "$CF_BIN" tunnel --edge-ip-version auto --protocol "$ARGO_PROTOCOL" --no-autoupdate \
-        run --token "$ARGO_AUTH" >/dev/null 2>&1 &
+      TUNNEL_TOKEN="$ARGO_AUTH" "$CF_BIN" tunnel --edge-ip-version auto --protocol "$ARGO_PROTOCOL" --no-autoupdate \
+        run >/dev/null 2>&1 &
       CF_PID=$!
       sleep 3
       ARGO_HOST="$ARGO_DOMAIN"

@@ -1006,6 +1006,7 @@ async function main() {
 
   function handleHttp(req, res) {
     const url = req.url.split('?')[0];
+    const cleanPath = url.replace(/[/.\u3002]+$/, '') || '/';
 
     const baseHeaders = {
       'Server': 'nginx/1.24.0',
@@ -1024,13 +1025,13 @@ async function main() {
       return;
     }
 
-    if (url === '/health' || url === '/healthz') {
+    if (url === '/health' || url === '/healthz' || cleanPath === '/health' || cleanPath === '/healthz') {
       res.writeHead(200, { ...baseHeaders, 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('ok');
       return;
     }
 
-    if (url === SUB_PATH) {
+    if (url === SUB_PATH || cleanPath === SUB_PATH) {
       if (!global.SUB_CONTENT) {
         res.writeHead(503, { ...baseHeaders, 'Retry-After': '5', 'Content-Type': 'text/plain; charset=utf-8' });
         return res.end('starting');
@@ -1760,7 +1761,7 @@ async function main() {
         console.log('====================================================');
         console.log(`[系统提示] 初始化阶段已完成（已运行 ${LOG_CLEAR_MINUTES} 分钟），控制台已转入静默模式。`);
         console.log(`启动临时缓存已释放完毕，服务在后台持续稳定运行。`);
-        console.log(`若需获取订阅链接，可访问订阅路径 ${subDisplayUrl}。`);
+        console.log(`若需获取订阅链接，可访问订阅地址: ${subDisplayUrl}`);
         console.log('====================================================');
       }, LOG_CLEAR_MINUTES * 60 * 1000).unref();
     }

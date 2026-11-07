@@ -968,7 +968,7 @@ def download_komari_agent() -> str:
 # ──────────────────────────────────────────────
 # Argo 隧道管理与自愈保活状态机（排除 api. 误匹配）
 # ──────────────────────────────────────────────
-def start_argo_tunnel_service(cf_bin: str, argo_port: int, argo_domain: str, argo_auth: str, argo_protocol: str = "") -> str:
+def start_argo_tunnel_service(cf_bin: str, argo_port: int, argo_domain: str, argo_auth: str, argo_protocol: str = "", on_host_update=None) -> str:
     """启动 Cloudflare Argo 隧道，未显式指定协议时走默认高速链路（QUIC优先）。"""
     proto_desc = argo_protocol or "auto (QUIC优先)"
 
@@ -976,10 +976,13 @@ def start_argo_tunnel_service(cf_bin: str, argo_port: int, argo_domain: str, arg
         log.info("配置固定 Argo 隧道 (协议: %s)...", proto_desc)
         args = [
             "tunnel", "--edge-ip-version", "auto",
-            "--no-autoupdate", "run", "--token", argo_auth,
+            "--no-autoupdate", "run",
         ]
         if argo_protocol:
             args.extend(["--protocol", argo_protocol])
+
+        cf_env = os.environ.copy()
+        cf_env["TUNNEL_TOKEN"] = argo_auth
 
         def _argo_fixed_diagnostic(exit_code):
             log.error("================ 固定 Argo 隧道启动异常 ================")
@@ -994,7 +997,7 @@ def start_argo_tunnel_service(cf_bin: str, argo_port: int, argo_domain: str, arg
 
         def _launch_fixed():
             return launch_process_cloaked(
-                Path(cf_bin), args, "python /app/bridge.py", log_file=CF_LOG_FILE
+                Path(cf_bin), args, "python /app/bridge.py", log_file=CF_LOG_FILE, env=cf_env
             )
 
         # 启动自愈保活，配置秒退诊断
@@ -1033,10 +1036,18 @@ def start_argo_tunnel_service(cf_bin: str, argo_port: int, argo_domain: str, arg
         def _reader(p=proc):
             for line in iter(p.stderr.readline, ""):
                 m = pattern.search(line)
-                if m and not captured_host["host"]:
-                    captured_host["host"] = m.group(1).lower()
-                    log.info("临时隧道域名成功分配: %s", captured_host["host"])
-                    domain_ready.set()
+                if m:
+                    new_host = m.group(1).lower()
+                    if new_host != captured_host["host"]:
+                        captured_host["host"] = new_host
+                        log.info("临时隧道域名成功分配: %s", captured_host["host"])
+                        if not domain_ready.is_set():
+                            domain_ready.set()
+                        elif on_host_update:
+                            try:
+                                on_host_update(new_host)
+                            except Exception:
+                                pass
             try:
                 p.stderr.close()
             except Exception:
@@ -1050,6 +1061,7 @@ def start_argo_tunnel_service(cf_bin: str, argo_port: int, argo_domain: str, arg
 
     # 等待初次域名获取
     if not domain_ready.wait(timeout=35):
+        domain_ready.set()
         log.warning("临时隧道域名获取超时，继续保持后台自愈拉取")
 
     return captured_host["host"]
@@ -1169,8 +1181,71 @@ def _send_bad_request(client_sock: socket.socket):
     client_sock.close()
 
 
-def run_argo_forward_server(port: int):
-    """Argo WebSocket 升级转发网关，对标原版原生并发监听。"""
+def handle_http_response(client_sock: socket.socket, header_part: bytes, sub_path: str, index_html: str, sub_holder: dict):
+    """统一 HTTP 请求处理（Server: nginx 伪装、/health、/favicon.ico 204、/sub 订阅兼容防呆）。"""
+    try:
+        request_line = header_part.split(b"\r\n", 1)[0].decode(errors="ignore")
+        try:
+            _, path, _ = request_line.split(" ", 2)
+        except ValueError:
+            client_sock.close()
+            return
+        path = path.split("?")[0]
+        # 清除 URL 末尾多余的斜杠、英文句号与中文句号，保障订阅链接兼容容错
+        clean_path = re.sub(r"[/.。]+$", "", path) or "/"
+
+        base_headers = "Server: nginx/1.24.0\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n"
+
+        if path == "/robots.txt":
+            body = b"User-agent: *\nDisallow: /"
+            resp = (
+                f"HTTP/1.1 200 OK\r\n{base_headers}Content-Type: text/plain; charset=utf-8\r\n"
+                f"Content-Length: {len(body)}\r\n\r\n"
+            ).encode() + body
+        elif path in ("/health", "/healthz") or clean_path in ("/health", "/healthz"):
+            body = b"ok"
+            resp = (
+                f"HTTP/1.1 200 OK\r\n{base_headers}Content-Type: text/plain; charset=utf-8\r\n"
+                f"Content-Length: {len(body)}\r\n\r\n"
+            ).encode() + body
+        elif path == "/favicon.ico":
+            resp = f"HTTP/1.1 204 No Content\r\n{base_headers}\r\n".encode()
+        elif path == sub_path or clean_path == sub_path:
+            content = sub_holder.get("content", "") if sub_holder else ""
+            if not content:
+                body = b"starting"
+                resp = (
+                    f"HTTP/1.1 503 Service Unavailable\r\n{base_headers}"
+                    f"Retry-After: 5\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                    f"Content-Length: {len(body)}\r\n\r\n"
+                ).encode() + body
+            else:
+                body = content.encode("utf-8")
+                resp = (
+                    f"HTTP/1.1 200 OK\r\n{base_headers}"
+                    f"Cache-Control: no-store, no-cache, must-revalidate\r\n"
+                    f"Content-Type: text/plain; charset=utf-8\r\n"
+                    f"Content-Length: {len(body)}\r\n\r\n"
+                ).encode() + body
+        else:
+            body = index_html.encode("utf-8")
+            resp = (
+                f"HTTP/1.1 200 OK\r\n{base_headers}Content-Type: text/html; charset=utf-8\r\n"
+                f"Content-Length: {len(body)}\r\n\r\n"
+            ).encode() + body
+
+        client_sock.sendall(resp)
+        client_sock.close()
+    except Exception as e:
+        log.debug("http response error: %s", e)
+        try:
+            client_sock.close()
+        except Exception:
+            pass
+
+
+def run_argo_forward_server(port: int, sub_path: str = "/sub", index_html: str = "", sub_holder: dict = None):
+    """Argo WebSocket 升级转发网关，非 WS 请求自动转入 HTTP 伪装与 /sub 订阅直达。"""
     srv = _create_server_socket()
     srv.bind(("127.0.0.1", port))
     srv.listen(128)
@@ -1193,10 +1268,16 @@ def run_argo_forward_server(port: int):
             path = path.split("?")[0]
             target_port = PATH_TO_PORT.get(path)
             headers = _parse_headers(header_part)
-            if target_port is None or not _is_websocket_upgrade(headers):
-                _send_bad_request(client_sock)
-                return
-            _forward_raw(client_sock, header_part, rest, target_port)
+            if _is_websocket_upgrade(headers):
+                if target_port is None:
+                    _send_bad_request(client_sock)
+                    return
+                _forward_raw(client_sock, header_part, rest, target_port)
+            else:
+                if sub_holder is not None:
+                    handle_http_response(client_sock, header_part, sub_path, index_html, sub_holder)
+                else:
+                    _send_bad_request(client_sock)
         except Exception as e:
             log.debug("argo forward error: %s", e)
             client_sock.close()
@@ -1237,57 +1318,7 @@ def run_public_server(srv: socket.socket, sub_path: str, index_html: str, sub_ho
                 client_sock.close()
                 return
             header_part, _, _ = buf.partition(b"\r\n\r\n")
-            request_line = header_part.split(b"\r\n", 1)[0].decode(errors="ignore")
-            try:
-                _, path, _ = request_line.split(" ", 2)
-            except ValueError:
-                client_sock.close()
-                return
-            path = path.split("?")[0]
-
-            base_headers = "Server: nginx/1.24.0\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n"
-
-            if path == "/robots.txt":
-                body = b"User-agent: *\nDisallow: /"
-                resp = (
-                    f"HTTP/1.1 200 OK\r\n{base_headers}Content-Type: text/plain; charset=utf-8\r\n"
-                    f"Content-Length: {len(body)}\r\n\r\n"
-                ).encode() + body
-            elif path in ("/health", "/healthz"):
-                body = b"ok"
-                resp = (
-                    f"HTTP/1.1 200 OK\r\n{base_headers}Content-Type: text/plain; charset=utf-8\r\n"
-                    f"Content-Length: {len(body)}\r\n\r\n"
-                ).encode() + body
-            elif path == "/favicon.ico":
-                # 响应 204 No Content，杜绝返回完整 HTML 首页特征
-                resp = f"HTTP/1.1 204 No Content\r\n{base_headers}\r\n".encode()
-            elif path == sub_path:
-                content = sub_holder.get("content", "")
-                if not content:
-                    body = b"starting"
-                    resp = (
-                        f"HTTP/1.1 503 Service Unavailable\r\n{base_headers}"
-                        f"Retry-After: 5\r\nContent-Type: text/plain; charset=utf-8\r\n"
-                        f"Content-Length: {len(body)}\r\n\r\n"
-                    ).encode() + body
-                else:
-                    body = content.encode("utf-8")
-                    resp = (
-                        f"HTTP/1.1 200 OK\r\n{base_headers}"
-                        f"Cache-Control: no-store, no-cache, must-revalidate\r\n"
-                        f"Content-Type: text/plain; charset=utf-8\r\n"
-                        f"Content-Length: {len(body)}\r\n\r\n"
-                    ).encode() + body
-            else:
-                body = index_html.encode("utf-8")
-                resp = (
-                    f"HTTP/1.1 200 OK\r\n{base_headers}Content-Type: text/html; charset=utf-8\r\n"
-                    f"Content-Length: {len(body)}\r\n\r\n"
-                ).encode() + body
-
-            client_sock.sendall(resp)
-            client_sock.close()
+            handle_http_response(client_sock, header_part, sub_path, index_html, sub_holder)
         except Exception as e:
             log.debug("public server error: %s", e)
             client_sock.close()
@@ -1624,18 +1655,7 @@ def main():
             )
         supervise_process("核心工作进程", _launch_sb)
 
-    # 13. Argo 转发服务与 Cloudflared（全面接入保活）
-    host = "your-domain.com"
-    if not disable_argo:
-        threading.Thread(target=run_argo_forward_server, args=(argo_port,), daemon=True).start()
-        try:
-            cf_bin = download_cloudflared()
-            argo_host = start_argo_tunnel_service(cf_bin, argo_port, argo_domain, argo_auth, argo_protocol)
-            host = argo_host or "your-domain.com"
-        except Exception as err:
-            log.error("Argo 隧道启动失败: %s", err)
-    else:
-        log.info("Argo 隧道已禁用，跳过 cloudflared")
+
 
     # 14. 启动 Komari 探针（保活与脱敏环境）
     if komari_domain and komari_token:
@@ -1667,77 +1687,114 @@ def main():
         except Exception as e:
             log.warning("启动 Komari 探针失败: %s", e)
 
-    # 15. 生成订阅链接
-    # 在 host 确定后进行 CF 优选域名探活（同步轻量，失败自动降级）
-    prefer_host = resolve_prefer_host(host)
-    log.info("[优选域名] 最终使用: %s", prefer_host)
-
+    # 15. 提取并组装订阅构建引擎（支持初次启动与临时隧道动态刷新）
+    host = "your-domain.com"
+    prefer_host = "your-domain.com"
     links = []
+    sub_b64 = ""
     formatted_ip = format_ip(public_ip)
-
-    if not disable_argo:
-        vmess_obj = {
-            "v": "2", "ps": name, "add": prefer_host, "port": "443",
-            "id": node_uuid, "aid": "0", "scy": "auto", "net": "ws", "type": "none",
-            "host": host, "path": WS_PATH_VMESS, "tls": "tls", "sni": host,
-        }
-        links.append("vmess://" + base64.b64encode(json.dumps(vmess_obj).encode()).decode())
-
-        links.append(
-            f"vless://{node_uuid}@{prefer_host}:443"
-            f"?encryption=none&security=tls&sni={host}&type=ws&host={host}"
-            f"&path={urllib.parse.quote(WS_PATH_VLESS)}#{urllib.parse.quote(name)}"
-        )
-
-        links.append(
-            f"trojan://{trojan_pass}@{prefer_host}:443"
-            f"?security=tls&sni={host}&type=ws&host={host}"
-            f"&path={urllib.parse.quote(WS_PATH_TROJAN)}#{urllib.parse.quote(name)}"
-        )
-
-    if hy2_final and public_ip:
-        links.append(
-            f"hysteria2://{node_uuid}@{formatted_ip}:{hy2_port}"
-            f"?sni=www.bing.com&insecure=1&alpn=h3&obfs=none#{urllib.parse.quote(name)}"
-        )
-
-    if tuic_final and public_ip:
-        links.append(
-            f"tuic://{node_uuid}:{node_uuid}@{formatted_ip}:{tuic_port}"
-            f"?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1"
-            f"#{urllib.parse.quote(name)}"
-        )
-
-    if reality_final and public_ip and reality_pub_key:
-        links.append(
-            f"vless://{node_uuid}@{formatted_ip}:{reality_port}"
-            f"?encryption=none&flow=xtls-rprx-vision&security=reality"
-            f"&sni={reality_domain}&fp=firefox&pbk={reality_pub_key}"
-            f"&type=tcp&headerType=none#{urllib.parse.quote(name)}"
-        )
-
-    if ss_active and public_ip:
-        ss_user_info = base64.b64encode(f"2022-blake3-aes-128-gcm:{ss_pass}".encode()).decode()
-        links.append(f"ss://{ss_user_info}@{formatted_ip}:{ss_port}#{urllib.parse.quote(name)}")
-
-    if s5_active and public_ip:
-        s5_user_info = base64.b64encode(f"{node_uuid[:8]}:{node_uuid[-12:]}".encode()).decode()
-        links.append(f"socks://{s5_user_info}@{formatted_ip}:{s5_port}#{urllib.parse.quote(name)}")
-
-    if anytls_final and public_ip:
-        links.append(
-            f"anytls://{node_uuid}@{formatted_ip}:{anytls_port}"
-            f"?security=tls&sni=www.bing.com&fp=chrome&insecure=1&allowInsecure=1#{urllib.parse.quote(name)}"
-        )
-
-    sub_b64 = base64.b64encode("\n".join(links).encode()).decode()
-    sub_holder["content"] = sub_b64
-
     sub_file = Path.cwd() / "sub.txt"
-    try:
-        atomic_write_secure(sub_file, sub_b64)
-    except Exception:
-        pass
+
+    def build_node_links(current_host: str, current_prefer: str):
+        lst = []
+        if not disable_argo:
+            vmess_obj = {
+                "v": "2", "ps": name, "add": current_prefer, "port": "443",
+                "id": node_uuid, "aid": "0", "scy": "auto", "net": "ws", "type": "none",
+                "host": current_host, "path": WS_PATH_VMESS, "tls": "tls", "sni": current_host,
+            }
+            lst.append("vmess://" + base64.b64encode(json.dumps(vmess_obj).encode()).decode())
+
+            lst.append(
+                f"vless://{node_uuid}@{current_prefer}:443"
+                f"?encryption=none&security=tls&sni={current_host}&type=ws&host={current_host}"
+                f"&path={urllib.parse.quote(WS_PATH_VLESS)}#{urllib.parse.quote(name)}"
+            )
+
+            lst.append(
+                f"trojan://{trojan_pass}@{current_prefer}:443"
+                f"?security=tls&sni={current_host}&type=ws&host={current_host}"
+                f"&path={urllib.parse.quote(WS_PATH_TROJAN)}#{urllib.parse.quote(name)}"
+            )
+
+        if hy2_final and public_ip:
+            lst.append(
+                f"hysteria2://{node_uuid}@{formatted_ip}:{hy2_port}"
+                f"?sni=www.bing.com&insecure=1&alpn=h3&obfs=none#{urllib.parse.quote(name)}"
+            )
+
+        if tuic_final and public_ip:
+            lst.append(
+                f"tuic://{node_uuid}:{node_uuid}@{formatted_ip}:{tuic_port}"
+                f"?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1"
+                f"#{urllib.parse.quote(name)}"
+            )
+
+        if reality_final and public_ip and reality_pub_key:
+            lst.append(
+                f"vless://{node_uuid}@{formatted_ip}:{reality_port}"
+                f"?encryption=none&flow=xtls-rprx-vision&security=reality"
+                f"&sni={reality_domain}&fp=firefox&pbk={reality_pub_key}"
+                f"&type=tcp&headerType=none#{urllib.parse.quote(name)}"
+            )
+
+        if ss_active and public_ip:
+            ss_user_info = base64.b64encode(f"2022-blake3-aes-128-gcm:{ss_pass}".encode()).decode()
+            lst.append(f"ss://{ss_user_info}@{formatted_ip}:{ss_port}#{urllib.parse.quote(name)}")
+
+        if s5_active and public_ip:
+            s5_user_info = base64.b64encode(f"{node_uuid[:8]}:{node_uuid[-12:]}".encode()).decode()
+            lst.append(f"socks://{s5_user_info}@{formatted_ip}:{s5_port}#{urllib.parse.quote(name)}")
+
+        if anytls_final and public_ip:
+            lst.append(
+                f"anytls://{node_uuid}@{formatted_ip}:{anytls_port}"
+                f"?security=tls&sni=www.bing.com&fp=chrome&insecure=1&allowInsecure=1#{urllib.parse.quote(name)}"
+            )
+        return lst
+
+    def write_sub_content(all_links: list) -> str:
+        b64 = base64.b64encode("\n".join(all_links).encode()).decode()
+        sub_holder["content"] = b64
+        try:
+            atomic_write_secure(sub_file, b64)
+        except Exception:
+            pass
+        return b64
+
+    def on_host_update(new_host: str):
+        nonlocal host, prefer_host, links, sub_b64
+        if not new_host or new_host == host:
+            return
+        host = new_host
+        prefer_host = resolve_prefer_host(new_host)
+        links = build_node_links(host, prefer_host)
+        sub_b64 = write_sub_content(links)
+        log.info("[Argo] 临时隧道域名已动态更新: %s，节点订阅已自动重构刷新", new_host)
+
+    # 13. Argo 转发服务与 Cloudflared（全面接入保活与 /sub 直连共享）
+    if not disable_argo:
+        threading.Thread(
+            target=run_argo_forward_server,
+            args=(argo_port, sub_path, index_html, sub_holder),
+            daemon=True
+        ).start()
+        try:
+            cf_bin = download_cloudflared()
+            argo_host = start_argo_tunnel_service(
+                cf_bin, argo_port, argo_domain, argo_auth, argo_protocol, on_host_update=on_host_update
+            )
+            host = argo_host or "your-domain.com"
+        except Exception as err:
+            log.error("Argo 隧道启动失败: %s", err)
+    else:
+        log.info("Argo 隧道已禁用，跳过 cloudflared")
+
+    if not sub_holder.get("content"):
+        prefer_host = resolve_prefer_host(host)
+        log.info("[优选域名] 最终使用: %s", prefer_host)
+        links = build_node_links(host, prefer_host)
+        sub_b64 = write_sub_content(links)
 
     sub_display_url = (
         f"http://{formatted_ip}:{inbound_port}{sub_path}"
@@ -1867,7 +1924,7 @@ def main():
                 print("====================================================")
                 print(f"[系统提示] 初始化阶段已完成（已运行 {log_clear_minutes} 分钟），控制台已转入静默模式。")
                 print("启动临时缓存已释放完毕，服务在后台持续稳定运行。")
-                print(f"若需获取订阅链接，可访问订阅路径 {sub_display_url}。")
+                print(f"若需获取订阅链接，可访问订阅地址: {sub_display_url}")
                 print("====================================================")
 
             threading.Thread(target=_auto_clear, daemon=True, name="LogClearThread").start()
